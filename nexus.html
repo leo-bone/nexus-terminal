@@ -200,6 +200,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
 /* Backtest Results */
 .btres{background:var(--bg);border:1px solid var(--border);border-radius:8px;margin-top:8px;overflow:hidden;display:none}
 .btres.show{display:block}
+.synth-warn{display:none;padding:8px 12px;font-size:11px;font-weight:600;color:#ffce54;background:rgba(255,180,0,0.12);border-bottom:1px solid rgba(255,180,0,0.35);text-align:center;letter-spacing:.3px}
 .bthead{display:flex;align-items:center;gap:8px;padding:8px 12px;background:rgba(0,0,0,.2);border-bottom:1px solid var(--border);font-size:10px;font-weight:600;color:var(--text2)}
 .btgrid{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--border)}
 .btmet{background:var(--bg1);padding:9px 10px}
@@ -848,6 +849,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
 
             <!-- Backtest Results -->
             <div class="btres" id="btRes">
+              <div class="synth-warn" id="btSynthWarn" style="display:none">&#x26a0; 回测使用合成数据（非真实行情）</div>
               <div class="bthead">&#x1f3c1; Backtest Results <span style="margin-left:auto;font-size:9px;color:var(--dim)" id="btPeriod">—</span></div>
               <div class="btgrid">
                 <div class="btmet"><div class="btmet-name" data-i18n="btRet_lbl">Total Return</div><div class="btmet-val" id="btRet">—</div></div>
@@ -1168,6 +1170,7 @@ var BIN='https://api.binance.com';
 var isLoading=false;
 var tvData=[];
 var currentInterval='1h';
+var usingSynthetic=false;
 var currentStrategy='ma';
 var cx=-1,cy=-1;
 var lang='en';
@@ -1579,9 +1582,10 @@ function loadKline(interval){
 
   fetch(apiUrl)
     .then(function(r){return r.json();})
-    .then(function(d){
+      .then(function(d){
       var raw=d.Data&&d.Data.Data?d.Data.Data:[];
       if(raw.length===0){loadKlineFallback();return;}
+      usingSynthetic=false;
 
       if(currentInterval==='4h'){
         // Aggregate hourly into 4h candles
@@ -1616,6 +1620,7 @@ function loadKline(interval){
       fetch(BIN+'/api/v3/klines?symbol=BTCUSDT&interval='+currentInterval+'&limit=200')
         .then(function(r){return r.json();})
         .then(function(data){
+          usingSynthetic=false;
           tvData=data.map(function(d){
             return{open:parseFloat(d[1]),high:parseFloat(d[2]),low:parseFloat(d[3]),close:parseFloat(d[4]),time:parseInt(d[0])/1000,vol:parseFloat(d[5])};
           });
@@ -1634,6 +1639,7 @@ function loadKline(interval){
 
 function loadKlineFallback(){
   // Synthetic BTC data fallback if Binance unreachable
+  usingSynthetic=true;
   var basePrice=94000,t=Date.now()-200*3600000;
   tvData=[];
   for(var i=0;i<200;i++){
@@ -2471,6 +2477,7 @@ function loadKlineForQT(cb){
     .then(function(d){
       var raw=d.Data&&d.Data.Data?d.Data.Data:[];
       if(raw.length===0){loadKlineFallback();if(cb)cb();return;}
+      usingSynthetic=false;
       if(iv==='4h'){
         tvData=[];
         for(var i=0;i<raw.length;i+=4){
@@ -2618,8 +2625,18 @@ function simulateStrat(strat,closes){
     var mult=parseFloat($('vbMult').value)||2.0;
     var stopPct=parseFloat($('vbStop').value)||2.0;
     var atrVals=[];
+    var tvOff=Math.max(0,tvData.length-limit);
     for(var ai=1;ai<data.length;ai++){
-      var tr=Math.max(Math.abs(data[ai]-data[ai-1]),Math.abs(data[ai]-data[ai]),Math.abs(data[ai-1]-data[ai]));
+      // 真 TR = max(high-low, |high-prevClose|, |low-prevClose|)。
+      // 原实现写成 Math.abs(data[ai]-data[ai]) —— 恒等于 0，且只统计收盘价之差，
+      // 完全忽略 high/low，会系统性低估真实波幅，使突破阈值失真。
+      var cur=tvData[tvOff+ai],prev=tvData[tvOff+ai-1];
+      var tr;
+      if(cur&&prev&&cur.high!==undefined&&cur.low!==undefined){
+        tr=Math.max(cur.high-cur.low,Math.abs(cur.high-prev.close),Math.abs(cur.low-prev.close));
+      }else{
+        tr=Math.abs(data[ai]-data[ai-1]);
+      }
       atrVals.push(tr);
       if(ai>=atrP){
         var s=0;
@@ -2706,11 +2723,14 @@ function showSignal(strat,closes){
   }else if(strat==='volbreak'){
     var atrP=parseInt($('vbATR').value)||14;
     var mult=parseFloat($('vbMult').value)||2.0;
-    var atr=0;
-    for(var vi=1;vi<atrP+1&&vi<closes.length;vi++){
-      atr+=Math.abs(closes[vi]-closes[vi-1]);
+    // 真 ATR（取 tvData 的 high/low/close 计算），而不是只用收盘价之差的均值 ——
+    // 后者忽略真实波幅，会让突破带过窄、信号失真。
+    var atr=calcATR((tvData&&tvData.length>atrP)?tvData:[],atrP);
+    if(!isFinite(atr)||atr<=0){
+      atr=0;
+      for(var vi=1;vi<atrP+1&&vi<closes.length;vi++){atr+=Math.abs(closes[vi]-closes[vi-1]);}
+      atr=atr/Math.max(1,Math.min(atrP,closes.length-1));
     }
-    atr=atr/Math.min(atrP,closes.length-1);
     var last=closes[closes.length-1];
     var breakoutUp=last+mult*atr;
     var breakoutDn=last-mult*atr;
@@ -2750,6 +2770,7 @@ function showResults(strat,result,closes){
   if(trades.length===0){
     $('btRet').textContent='No trades';$('btRet').className='btmet-val n';
     ['btTrades','btWR','btDD','btPF','btSR','btSort','btCal'].forEach(function(id){$(id).textContent='—';});
+    $('btSynthWarn').style.display=usingSynthetic?'block':'none';
     $('btRes').classList.add('show');
     return;
   }
@@ -2773,12 +2794,15 @@ function showResults(strat,result,closes){
     if(dd>maxDD)maxDD=dd;
   });
 
-  // Sharpe & Sortino
+  // Sharpe & Sortino (annualized; NOT a t-statistic)
   var avgR=rets.reduce(function(a,b){return a+b;},0)/rets.length;
   var vari=rets.reduce(function(a,b){return a+Math.pow(b-avgR,2);},0)/rets.length;
   var downRisk=rets.filter(function(r){return r<0;}).reduce(function(a,b){return a+Math.pow(b,2);},0)/rets.length;
-  var sharpe=(Math.sqrt(Math.max(1,rets.length))*avgR/Math.max(0.01,Math.sqrt(vari))).toFixed(2);
-  var sortino=(Math.sqrt(Math.max(1,rets.length))*avgR/Math.max(0.01,Math.sqrt(downRisk))).toFixed(2);
+  // Annualization factor derived from bar interval
+  var intervalToPeriods={'1m':525600,'5m':175200,'15m':35040,'30m':17520,'1h':8760,'2h':4380,'4h':2190,'6h':1460,'12h':730,'1d':252,'1w':52};
+  var periodsPerYear=intervalToPeriods[currentInterval]||252;
+  var sharpe=(avgR/Math.max(1e-9,Math.sqrt(vari))*Math.sqrt(periodsPerYear)).toFixed(2);
+  var sortino=(avgR/Math.max(1e-9,Math.sqrt(downRisk))*Math.sqrt(periodsPerYear)).toFixed(2);
   var calmar=(totalRet/Math.max(0.01,maxDD)).toFixed(2);
 
   $('btRet').textContent=(totalRet>=0?'+':'')+totalRet.toFixed(2)+'%';
@@ -2791,6 +2815,8 @@ function showResults(strat,result,closes){
   $('btSort').textContent=sortino;
   $('btCal').textContent=calmar;
 
+  $('btSynthWarn').style.display=usingSynthetic?'block':'none';
+  if(usingSynthetic)$('btPeriod').textContent=limit+' Klines · '+currentInterval+' · ⚠合成';
   $('btRes').classList.add('show');
 
   // Draw equity curve with trade markers
