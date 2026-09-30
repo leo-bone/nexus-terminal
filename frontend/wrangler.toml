@@ -1,0 +1,12 @@
+name = "nexus-frontend"
+main = "worker.js"
+compatibility_date = "2024-09-23"
+account_id = "72450e08e207045ce0dc313447dcb5e3"
+
+# 用 Workers Assets 直接托管静态前端（替代 GitHub Pages）
+assets = { directory = "./public" }
+
+# 绑定自定义域名 nexus.uichain.org（走 Cloudflare 代理，免 DNS 手动配置）
+routes = [
+  { pattern = "nexus.uichain.org", custom_domain = true }
+]

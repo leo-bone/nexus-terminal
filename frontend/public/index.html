@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Nexus Terminal · 加密货币因子关系终端 v3</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#060c18;--bg1:#08111f;--bg2:#0d1828;--bg3:#132035;--bg4:#1a2b45;--border:#1a2e50;--border2:#243d60;--dim:#3a5070;--text:#7a94b8;--text2:#a8bfd6;--text3:#d0e2f5;--text4:#fff;--green:#00e5a0;--red:#ff3d6e;--blue:#00b4ff;--yellow:#ffc107;--orange:#ff9100;--purple:#b388ff;--gold:#ffb300}
+html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains Mono',monospace;font-size:13px;min-height:100vh;overflow-x:hidden}
+.wrap{max-width:1720px;margin:0 auto;padding:0 16px}
+.header{display:flex;align-items:center;gap:14px;padding:13px 0 11px;border-bottom:1px solid var(--border);margin-bottom:10px}
+.logo{font-size:18px;font-weight:800;color:var(--text4);letter-spacing:-.5px}.logo em{color:var(--green);font-style:normal}
+.tagline{font-size:10px;color:var(--dim);border:1px solid var(--border);padding:3px 8px;border-radius:12px;letter-spacing:1px}
+.live-badge{display:flex;align-items:center;gap:6px;font-size:10px;color:var(--green);font-weight:600;background:rgba(0,229,160,.07);border:1px solid rgba(0,229,160,.18);padding:3px 10px;border-radius:12px}
+.live-dot{width:6px;height:6px;background:var(--green);border-radius:50%;animation:lp 2s infinite}
+@keyframes lp{0%,100%{opacity:1}50%{opacity:.3}}
+.hdr-right{margin-left:auto;display:flex;align-items:center;gap:12px}
+.net-dot{width:5px;height:5px;border-radius:50%;background:var(--dim)}.net-dot.ok{background:var(--green)}
+.net-lbl{font-size:10px;color:var(--dim)}.last-upd{font-size:11px;color:var(--dim)}
+.refresh-btn{background:rgba(0,180,255,.08);border:1px solid rgba(0,180,255,.25);color:var(--blue);padding:4px 12px;border-radius:6px;font-size:11px;font-weight:700;cursor:pointer}
+.refresh-btn:hover{background:rgba(0,180,255,.18)}
+.ticker-strip{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin-bottom:10px}
+.ticker{background:var(--bg1);border:1px solid var(--border);border-radius:8px;padding:11px 14px;transition:border-color .2s,box-shadow .2s}
+.ticker:hover{border-color:var(--border2);box-shadow:0 0 16px rgba(0,180,255,.08)}
+.ticker .sym{font-size:9px;color:var(--dim);letter-spacing:2px;text-transform:uppercase;margin-bottom:4px;font-weight:500}
+.ticker .price{font-size:20px;font-weight:800;color:var(--text4);line-height:1;font-family:'JetBrains Mono',monospace}
+.ticker .chg{font-size:11px;margin-top:4px;font-weight:600;font-family:'JetBrains Mono',monospace}
+.ticker .vol{font-size:9px;color:var(--dim);margin-top:4px}.up{color:var(--green)}.dn{color:var(--red)}.n{color:var(--blue)}
+.panel{background:rgba(8,17,31,.9);border:1px solid var(--border);border-radius:10px;overflow:hidden;margin-bottom:10px}
+.phdr{display:flex;align-items:center;gap:8px;padding:9px 14px;border-bottom:1px solid var(--border);font-size:11px;font-weight:600;color:var(--text2);background:rgba(13,24,40,.4)}
+.phdr .icon{font-size:13px}.phdr .lbl{flex:1}.phdr .hint{font-size:9px;color:var(--dim);font-weight:400}
+.badge{font-size:9px;padding:2px 7px;border-radius:10px;font-weight:600}
+.bg-green{background:rgba(0,229,160,.1);color:var(--green);border:1px solid rgba(0,229,160,.18)}
+.bg-red{background:rgba(255,61,110,.1);color:var(--red);border:1px solid rgba(255,61,110,.18)}
+.bg-blue{background:rgba(0,180,255,.1);color:var(--blue);border:1px solid rgba(0,180,255,.18)}
+.bg-gold{background:rgba(255,179,0,.1);color:var(--gold);border:1px solid rgba(255,179,0,.18)}
+.bg-purple{background:rgba(179,136,255,.1);color:var(--purple);border:1px solid rgba(179,136,255,.18)}
+.main-grid{display:grid;grid-template-columns:1fr 320px;gap:10px}
+@media(max-width:1100px){.main-grid{grid-template-columns:1fr}.ticker-strip{grid-template-columns:repeat(3,1fr)}}
+.chart-wrap{background:var(--bg)}
+.chart-tabs{display:flex;gap:3px;padding:8px 12px;background:rgba(0,0,0,.2);border-bottom:1px solid var(--border)}
+.tbtn{padding:5px 14px;border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;border:1px solid transparent;color:var(--text);background:transparent;font-family:inherit}
+.tbtn:hover{background:var(--bg3);color:var(--text2)}.tbtn.active{background:var(--green);color:#000}
+.int-btns{display:flex;gap:3px;margin-left:auto}
+.ibtn{padding:3px 8px;border-radius:4px;font-size:10px;cursor:pointer;border:1px solid var(--border);color:var(--dim);background:transparent;font-family:inherit}
+.ibtn:hover{border-color:var(--blue);color:var(--blue)}.ibtn.active{background:var(--blue);color:#000;border-color:var(--blue)}
+.chart-split{position:relative;background:var(--bg);min-height:440px}
+#mainCanvas{display:block;width:100%;height:440px;cursor:crosshair}
+.ctt{position:absolute;pointer-events:none;z-index:100;background:rgba(8,17,31,.97);border:1px solid var(--border2);border-radius:8px;padding:10px 12px;font-size:11px;color:var(--text2);min-width:150px;display:none;box-shadow:0 4px 20px rgba(0,0,0,.4)}
+.ctt-time{font-size:9px;color:var(--dim);margin-bottom:6px}.ctt-row{display:flex;justify-content:space-between;gap:12px;padding:2px 0;font-family:'JetBrains Mono',monospace;font-size:10px}.ctt-lbl{color:var(--dim)}
+.rstk{display:flex;flex-direction:column;gap:10px}
+.fg-outer{display:flex;align-items:center;gap:14px;padding:14px}
+.fg-svg{position:relative;width:88px;height:88px;flex-shrink:0}.fg-svg svg{transform:rotate(-90deg)}
+.fg-info{flex:1}.fg-val{font-size:34px;font-weight:800;color:var(--text4);font-family:'JetBrains Mono',monospace;line-height:1}
+.fg-lbl{font-size:11px;font-weight:600;color:var(--text2);margin-top:2px}
+.mgrid{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:10px}
+.mcard{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px;text-align:center}
+.mname{font-size:9px;color:var(--dim);letter-spacing:1px;text-transform:uppercase;margin-bottom:6px}
+.mval{font-size:18px;font-weight:800;color:var(--text4);font-family:'JetBrains Mono',monospace}
+.msub{font-size:9px;color:var(--dim);margin-top:3px}
+.ta-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;padding:10px}
+.ta-card{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px 8px}
+.ta-ttl{font-size:8px;color:var(--dim);letter-spacing:1px;text-transform:uppercase;margin-bottom:6px}
+.ta-val{font-size:18px;font-weight:800;color:var(--text4);font-family:'JetBrains Mono',monospace}
+.ta-sub{font-size:9px;color:var(--dim);margin-top:3px}
+.fpanel{background:var(--bg1);border-top:1px solid var(--border);padding:12px}
+.fhdr{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.fttl{font-size:10px;color:var(--text);font-weight:600;letter-spacing:1px}
+.fscore-ring{position:relative;width:52px;height:52px;margin-left:auto}.fscore-ring svg{transform:rotate(-90deg)}
+.fscore-center{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center}
+.fscore-n{font-size:15px;font-weight:800;color:var(--text4);line-height:1}.fscore-l{font-size:7px;color:var(--dim)}
+.fgrid{display:grid;grid-template-columns:repeat(5,1fr);gap:6px}
+@media(max-width:1100px){.fgrid{grid-template-columns:repeat(4,1fr)}.ta-grid{grid-template-columns:repeat(3,1fr)}}
+.fcard{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 6px;text-align:center}
+.fc-name{font-size:8px;color:var(--dim);letter-spacing:.5px;margin-bottom:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fc-z{font-size:15px;font-weight:700;font-family:'JetBrains Mono',monospace;margin-bottom:3px}
+.fc-str{height:2px;background:var(--bg4);border-radius:1px;margin-top:5px;overflow:hidden}
+.fc-strbar{height:100%;border-radius:1px}.fc-sig{font-size:8px;margin-top:5px;font-weight:600}
+.net-wrap{display:grid;grid-template-columns:1fr 360px;gap:10px}
+@media(max-width:1100px){.net-wrap{grid-template-columns:1fr}}
+#netCanvas{display:block;width:100%;height:420px;background:radial-gradient(circle at 50% 45%,#0d1828,#060c18)}
+.heat{overflow:auto;padding:10px}.heat-grid{display:grid;gap:2px}
+.hm-h{font-size:8px;color:var(--dim);display:flex;align-items:center;justify-content:center;padding:2px;text-align:center}
+.hm-cell{font-size:9px;font-family:'JetBrains Mono',monospace;display:flex;align-items:center;justify-content:center;border-radius:3px;padding:6px 2px;font-weight:600}
+.bt-sec{padding:12px}.bt-tabs{display:flex;gap:3px;margin-bottom:10px;background:var(--bg);border-radius:8px;padding:4px;border:1px solid var(--border)}
+.bt-tab{flex:1;padding:6px 8px;border-radius:6px;font-size:10px;font-weight:600;cursor:pointer;border:none;color:var(--text);background:transparent;font-family:inherit}
+.bt-tab.on{background:var(--green);color:#000}
+.bt-params{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:8px}
+.bt-fld{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px}
+.bt-lbl{font-size:8px;color:var(--dim);letter-spacing:1px;text-transform:uppercase;margin-bottom:4px}
+.bt-fld input,.bt-fld select{width:100%;background:rgba(0,180,255,.04);border:1px solid rgba(0,180,255,.15);color:var(--text3);font-size:12px;font-family:'JetBrains Mono',monospace;outline:none;padding:4px 6px;border-radius:4px}
+.bt-btn{width:100%;padding:9px;background:var(--green);color:#000;border:none;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer;font-family:inherit}
+.bt-btn:hover{filter:brightness(1.1)}
+.btres{background:var(--bg);border:1px solid var(--border);border-radius:8px;margin-top:8px;overflow:hidden;display:none}
+.btres.show{display:block}
+.bthead{display:flex;align-items:center;gap:8px;padding:8px 12px;background:rgba(0,0,0,.2);border-bottom:1px solid var(--border);font-size:10px;font-weight:600;color:var(--text2)}
+.btgrid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:1px;background:var(--border)}
+.btmet{background:var(--bg1);padding:9px 10px}.btmet-name{font-size:8px;color:var(--dim);letter-spacing:1px;text-transform:uppercase;margin-bottom:3px}
+.btmet-val{font-size:16px;font-weight:700;font-family:'JetBrains Mono',monospace;color:var(--text3)}
+#btCanvas{display:block;width:100%;height:80px;background:var(--bg)}
+.pt-sec{padding:12px}.pt-row{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:8px}
+.pt-card{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px 10px}
+.pt-ttl{font-size:9px;color:var(--dim);letter-spacing:1px;text-transform:uppercase;margin-bottom:3px}
+.pt-val{font-size:16px;font-weight:800;font-family:'JetBrains Mono',monospace;color:var(--text4)}
+.pt-sub{font-size:9px;color:var(--dim);margin-top:2px}
+.pt-list{margin-top:6px}
+.pt-pos{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-top:6px}
+.pt-pos-row{display:flex;justify-content:space-between;padding:2px 0;font-size:10px;border-bottom:1px solid rgba(255,255,255,.04)}
+.pt-pos-lbl{color:var(--dim);font-family:'JetBrains Mono',monospace}.pt-pos-val{color:var(--text3);font-family:'JetBrains Mono',monospace;font-weight:600}
+.macro-hint{font-size:9px;color:var(--dim);padding:6px 10px;text-align:center}
+.footer{padding:14px 0 30px;color:var(--dim);font-size:10px;text-align:center;line-height:1.8}
+.footer a{color:var(--blue);text-decoration:none}
+.tag-row{display:flex;gap:6px;flex-wrap:wrap;padding:8px 12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="header">
+    <div class="logo">NEXUS <em>TERMINAL</em></div>
+    <div class="tagline">CRYPTO FACTOR TERMINAL</div>
+    <div class="live-badge"><span class="live-dot"></span> LIVE · v3</div>
+    <div class="hdr-right">
+      <span class="net-lbl">数据源</span><span id="netDot" class="net-dot"></span>
+      <span id="lastUpd" class="last-upd">—</span>
+      <button id="refreshBtn" class="refresh-btn">⟳ 刷新</button>
+    </div>
+  </div>
+
+  <div id="ticker" class="ticker-strip"></div>
+
+  <div class="main-grid">
+    <div class="panel">
+      <div class="phdr"><span class="icon">📈</span><span class="lbl">BTC/USDT · K线 & 技术指标</span><span class="hint">Canvas 自绘 · 多周期</span></div>
+      <div class="chart-tabs">
+        <span style="font-size:10px;color:var(--dim);align-self:center">周期</span>
+        <div class="int-btns">
+          <button class="ibtn" data-i="15m">15m</button>
+          <button class="ibtn active" data-i="1h">1H</button>
+          <button class="ibtn" data-i="4h">4H</button>
+          <button class="ibtn" data-i="1d">1D</button>
+        </div>
+      </div>
+      <div class="chart-split">
+        <canvas id="mainCanvas"></canvas>
+        <div id="chartTip" class="ctt"></div>
+      </div>
+    </div>
+
+    <div class="rstk">
+      <div class="panel">
+        <div class="phdr"><span class="icon">😱</span><span class="lbl">恐惧与贪婪</span></div>
+        <div class="fg-outer">
+          <div class="fg-svg">
+            <svg width="88" height="88"><circle cx="44" cy="44" r="40" fill="none" stroke="#132035" stroke-width="8"/><circle id="fgRing" cx="44" cy="44" r="40" fill="none" stroke="#ffc107" stroke-width="8" stroke-linecap="round" stroke-dasharray="0 251"/></svg>
+          </div>
+          <div class="fg-info"><div id="fgVal" class="fg-val">—</div><div id="fgLbl" class="fg-lbl">—</div><div class="fg-scale"><span>0 恐惧</span><span>100 贪婪</span></div></div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="phdr"><span class="icon">📊</span><span class="lbl">技术面板 TA</span></div>
+        <div class="ta-grid">
+          <div class="ta-card"><div class="ta-ttl">RSI 14</div><div id="ta_rsi" class="ta-val">—</div><div id="ta_rsi_s" class="ta-sub">—</div></div>
+          <div class="ta-card"><div class="ta-ttl">MACD</div><div id="ta_macd" class="ta-val">—</div><div id="ta_macd_s" class="ta-sub">—</div></div>
+          <div class="ta-card"><div class="ta-ttl">布林上轨</div><div id="ta_boll" class="ta-val">—</div><div id="ta_boll_s" class="ta-sub">—</div></div>
+          <div class="ta-card"><div class="ta-ttl">ATR</div><div id="ta_atr" class="ta-val">—</div><div id="ta_atr_s" class="ta-sub">—</div></div>
+          <div class="ta-card"><div class="ta-ttl">MA 趋势</div><div id="ta_ma" class="ta-val">—</div><div id="ta_ma_s" class="ta-sub">—</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="phdr"><span class="icon">🧠</span><span class="lbl">因子模型 · Nexus Score（20 维）</span><span class="hint">Z-Score 加权合成 · 实时</span></div>
+    <div class="fpanel">
+      <div class="fhdr">
+        <span class="fttl">综合多空评分</span>
+        <div class="fscore-ring">
+          <svg width="52" height="52"><circle cx="26" cy="26" r="22" fill="none" stroke="#132035" stroke-width="5"/><circle id="nxRing" cx="26" cy="26" r="22" fill="none" stroke="#ffc107" stroke-width="5" stroke-linecap="round" stroke-dasharray="0 138"/></svg>
+          <div class="fscore-center"><div id="nxScore" class="fscore-n">—</div><div id="nxSig" class="fscore-l n">—</div></div>
+        </div>
+      </div>
+      <div id="factorGrid" class="fgrid"></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="phdr"><span class="icon">🕸</span><span class="lbl">因子关系网络 · 实时相关性</span><span id="netCount" class="hint">—</span></div>
+    <div class="net-wrap">
+      <div class="chart-wrap" style="padding:8px"><canvas id="netCanvas"></canvas></div>
+      <div class="heat">
+        <div class="fttl" style="margin-bottom:8px">相关性矩阵 (Pearson r)</div>
+        <div id="heatmap" class="heat-grid"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="phdr"><span class="icon">🏦</span><span class="lbl">宏观仪表盘</span><span class="hint">需 Cloudflare Worker（见 README）</span></div>
+    <div class="mgrid">
+      <div class="mcard"><div class="mname">美元指数 DXY</div><div id="m_DXY" class="mval">需Worker</div><div id="m_DXY_d" class="msub">—</div></div>
+      <div class="mcard"><div class="mname">美债10Y</div><div id="m_US10Y" class="mval">需Worker</div><div id="m_US10Y_d" class="msub">—</div></div>
+      <div class="mcard"><div class="mname">黄金 (USD)</div><div id="m_GOLD" class="mval">需Worker</div><div id="m_GOLD_d" class="msub">—</div></div>
+      <div class="mcard"><div class="mname">标普500</div><div id="m_SPX" class="mval">需Worker</div><div id="m_SPX_d" class="msub">—</div></div>
+      <div class="mcard"><div class="mname">VIX 恐慌</div><div id="m_VIX" class="mval">需Worker</div><div id="m_VIX_d" class="msub">—</div></div>
+      <div class="mcard"><div class="mname">状态</div><div class="mval n" style="font-size:13px">BTC 相关性</div><div class="msub">见上方关系网络</div></div>
+    </div>
+    <div id="macroHint" class="macro-hint">未配置 Cloudflare Worker：宏观数据暂不可用。部署 Worker 后自动启用（详见 README）。</div>
+  </div>
+
+  <div class="main-grid">
+    <div class="panel">
+      <div class="phdr"><span class="icon">⛓</span><span class="lbl">链上数据</span><span class="hint">CryptoCompare</span></div>
+      <div class="mgrid">
+        <div class="mcard"><div class="mname">全网算力</div><div id="oc_hr" class="mval">—</div></div>
+        <div class="mcard"><div class="mname">日交易笔数</div><div id="oc_tx" class="mval">—</div></div>
+        <div class="mcard"><div class="mname">总市值</div><div id="oc_mc" class="mval">—</div></div>
+        <div class="mcard"><div class="mname">BTC 占比</div><div id="oc_dom" class="mval">—</div></div>
+        <div class="mcard"><div class="mname">稳定币市值</div><div id="oc_stable" class="mval">—</div></div>
+        <div class="mcard"><div class="mname">说明</div><div class="mval" style="font-size:11px">流动性/活跃度</div></div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="phdr"><span class="icon">🎯</span><span class="lbl">衍生品</span><span class="hint">Binance FAPI</span></div>
+      <div class="mgrid">
+        <div class="mcard"><div class="mname">资金费率</div><div id="dv_fund" class="mval">—</div></div>
+        <div class="mcard"><div class="mname">持仓量</div><div id="dv_oi" class="mval">—</div></div>
+        <div class="mcard"><div class="mname">多空比</div><div id="dv_ls" class="mval">—</div></div>
+        <div class="mcard"><div class="mname">含义</div><div class="mval" style="font-size:11px">杠杆/情绪</div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="phdr"><span class="icon">⚙️</span><span class="lbl">量化回测</span><span class="hint">历史模拟 · 非实盘</span></div>
+    <div class="bt-sec">
+      <div class="bt-tabs">
+        <button class="bt-tab on" data-s="ma">均线交叉</button>
+        <button class="bt-tab" data-s="rsi">RSI 反转</button>
+        <button class="bt-tab" data-s="brk">突破</button>
+      </div>
+      <div class="bt-params">
+        <div class="bt-fld bt-param" data-s="ma"><div class="bt-lbl">快线周期</div><input id="btF" type="number" value="10"></div>
+        <div class="bt-fld bt-param" data-s="ma"><div class="bt-lbl">慢线周期</div><input id="btS" type="number" value="30"></div>
+        <div class="bt-fld bt-param" data-s="rsi" style="display:none"><div class="bt-lbl">RSI 周期</div><input id="btP" type="number" value="14"></div>
+        <div class="bt-fld bt-param" data-s="rsi" style="display:none"><div class="bt-lbl">超卖阈值</div><input id="btB" type="number" value="35"></div>
+        <div class="bt-fld bt-param" data-s="rsi" style="display:none"><div class="bt-lbl">超买阈值</div><input id="btSell" type="number" value="70"></div>
+        <div class="bt-fld bt-param" data-s="brk" style="display:none"><div class="bt-lbl">回溯K线</div><input id="btN" type="number" value="20"></div>
+        <div class="bt-fld bt-param" data-s="brk" style="display:none"><div class="bt-lbl">突破幅度%</div><input id="btE" type="number" value="1.5"></div>
+      </div>
+      <button id="btRun" class="bt-btn">▶ 运行回测</button>
+      <div id="btRes" class="btres">
+        <div class="bthead"><span>📋 回测结果</span></div>
+        <div class="btgrid">
+          <div class="btmet"><div class="btmet-name">累计收益</div><div id="btRet" class="btmet-val">—</div></div>
+          <div class="btmet"><div class="btmet-name">夏普比率</div><div id="btSharpe" class="btmet-val">—</div></div>
+          <div class="btmet"><div class="btmet-name">最大回撤</div><div id="btDD" class="btmet-val">—</div></div>
+          <div class="btmet"><div class="btmet-name">胜率</div><div id="btWin" class="btmet-val">—</div></div>
+          <div class="btmet"><div class="btmet-name">交易次数</div><div id="btTrades" class="btmet-val">—</div></div>
+          <div class="btmet"><div class="btmet-name">净值曲线</div><div class="btmet-val" style="font-size:10px">↓</div></div>
+        </div>
+        <canvas id="btCanvas"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="phdr"><span class="icon">💼</span><span class="lbl">模拟交易 (Paper)</span><span class="hint">localStorage 本地保存</span></div>
+    <div class="pt-sec">
+      <div class="pt-row">
+        <div class="bt-fld"><div class="bt-lbl">币种</div><select id="ptSym"><option>BTC</option><option>ETH</option><option>SOL</option><option>BNB</option></select></div>
+        <div class="bt-fld"><div class="bt-lbl">金额 (USD)</div><input id="ptAmt" type="number" value="1000"></div>
+      </div>
+      <button id="ptBuy" class="bt-btn">＋ 开仓（按现价）</button>
+      <div class="pt-row" style="margin-top:8px">
+        <div class="pt-card"><div class="pt-ttl">账户净值</div><div id="ptEquity" class="pt-val">—</div></div>
+        <div class="pt-card"><div class="pt-ttl">浮动盈亏</div><div id="ptPL" class="pt-val">—</div></div>
+      </div>
+      <div id="ptList" class="pt-list"></div>
+    </div>
+  </div>
+
+  <div class="footer">
+    NEXUS TERMINAL v3 · 纯前端实时加密终端 · 数据源: Binance / CryptoCompare / CoinGecko / alternative.me / Cloudflare Worker<br>
+    仅供研究与教育，不构成投资建议。加密资产风险极高，请独立判断。
+  </div>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

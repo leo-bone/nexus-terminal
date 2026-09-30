@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Nexus · BTC Dashboard 2026</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#0a0e1a;--bg2:#0f1629;--bg3:#161c32;--bg4:#1e2540;--border:#1e2a4a;--text:#8b9dc3;--text2:#c8d5f0;--text3:#fff;--green:#00d4a1;--red:#ff4d6a;--yellow:#ffc43d;--blue:#4a9eff;--orange:#ff8c42;--purple:#a78bfa;--cyan:#22d3ee}
+html,body{background:var(--bg);color:var(--text);font-family:'SF Mono','Fira Code',monospace;min-height:100vh;overflow-x:hidden}
+.wrap{max-width:1600px;margin:0 auto;padding:16px}
+.header{display:flex;align-items:center;gap:12px;margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid var(--border)}
+.logo{font-size:22px;font-weight:700;color:var(--text3);white-space:nowrap}
+.logo span{color:var(--green)}
+.tagline{color:var(--text);font-size:11px;border:1px solid var(--border);padding:3px 8px;border-radius:20px}
+.live-dot{display:inline-block;width:7px;height:7px;background:var(--green);border-radius:50%;margin-right:5px;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.last-upd{font-size:11px;color:var(--text);margin-left:auto}
+.refresh-bar{display:flex;align-items:center;gap:8px;margin-bottom:16px;flex-wrap:wrap}
+.btn{background:var(--bg3);border:1px solid var(--border);color:var(--text2);padding:6px 14px;border-radius:6px;font-size:12px;cursor:pointer;font-family:inherit;transition:.2s}
+.btn:hover{background:var(--bg4);border-color:var(--blue);color:var(--cyan)}
+.btn.green{background:rgba(0,212,161,.12);border-color:var(--green);color:var(--green)}
+.status-msg{font-size:11px;color:var(--text);margin-left:4px}
+.main-grid{display:grid;grid-template-columns:1fr 340px;gap:14px;margin-bottom:14px}
+@media(max-width:1100px){.main-grid{grid-template-columns:1fr}}
+.panel{background:var(--bg2);border:1px solid var(--border);border-radius:10px;overflow:hidden}
+.panel-header{display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid var(--border);font-size:12px;font-weight:600;color:var(--text2)}
+.panel-body{padding:12px 14px}
+.panel-icon{font-size:14px}
+.ticker-strip{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:14px}
+.ticker{background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;text-align:center;transition:.2s}
+.ticker:hover{border-color:var(--blue)}
+.ticker .sym{font-size:10px;color:var(--text);letter-spacing:1px;margin-bottom:4px}
+.ticker .price{font-size:17px;font-weight:700;color:var(--text3)}
+.ticker .chg{font-size:11px;margin-top:3px;font-weight:600}
+.ticker .vol{font-size:9px;color:var(--text);margin-top:3px}
+.up{color:var(--green)}.dn{color:var(--red)}
+.chart-panel{background:var(--bg2);border:1px solid var(--border);border-radius:10px;overflow:hidden}
+.chart-header{display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid var(--border)}
+.chart-tabs{display:flex;gap:4px;margin-left:auto}
+.chart-tab{padding:4px 10px;border-radius:5px;font-size:10px;background:var(--bg);border:1px solid var(--border);color:var(--text);cursor:pointer;transition:.2s}
+.chart-tab.active{background:var(--blue);border-color:var(--blue);color:#fff}
+.chart-container{position:relative;height:320px;overflow:hidden;background:#0a0e1a}
+.chart-placeholder{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:10px}
+.chart-spinner{width:36px;height:36px;border:3px solid var(--border);border-top-color:var(--blue);border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.chart-note{font-size:11px;color:var(--text);opacity:.5}
+.tv-link{position:absolute;bottom:10px;right:14px;font-size:10px;color:var(--blue);text-decoration:none;opacity:.7}
+.tv-link:hover{opacity:1}
+.right-stack{display:flex;flex-direction:column;gap:14px}
+.fg-ring{position:relative;width:110px;height:110px;margin:0 auto 8px}
+.fg-ring svg{transform:rotate(-90deg);width:110px;height:110px}
+.fg-track{fill:none;stroke:var(--bg4);stroke-width:10}
+.fg-arc{fill:none;stroke-width:10;stroke-linecap:round;transition:stroke-dashoffset 1s ease}
+.fg-center{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center}
+.fg-value{font-size:30px;font-weight:800;color:var(--text3);line-height:1}
+.fg-label{font-size:9px;color:var(--text);letter-spacing:.5px;margin-top:2px}
+.fg-scale{display:flex;justify-content:space-between;margin-top:4px;font-size:8px;color:var(--text);opacity:.5}
+.fg-info{font-size:11px;text-align:center;margin-top:8px}
+.rsi-panel{text-align:center}
+.rsi-gauge{position:relative;width:100px;height:50px;margin:0 auto 6px}
+.rsi-gauge svg{width:100px;height:100px;transform:rotate(180deg)}
+.rsi-bg{fill:none;stroke:var(--bg4);stroke-width:8}
+.rsi-fill{fill:none;stroke-width:8;stroke-linecap:round;transition:stroke-dashoffset 1s}
+.rsi-num{font-size:28px;font-weight:800;margin-bottom:2px}
+.rsi-label{font-size:10px;color:var(--text)}
+.rsi-scale{display:flex;justify-content:space-between;font-size:8px;color:var(--text);opacity:.4;margin-top:6px}
+.whale-item{display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--border);font-size:11px}
+.whale-item:last-child{border-bottom:none}
+.w-icon{font-size:16px;width:28px;text-align:center;flex-shrink:0}
+.w-name{flex:1;color:var(--text2);font-size:11px;line-height:1.3}
+.w-amount{font-size:11px;font-weight:700;text-align:right;white-space:nowrap}
+.w-tag{font-size:9px;padding:2px 5px;border-radius:10px;white-space:nowrap;display:block;margin-top:2px}
+.tag-green{background:rgba(0,212,161,.15);color:var(--green)}
+.tag-red{background:rgba(255,77,106,.15);color:var(--red)}
+.tag-yellow{background:rgba(255,196,61,.15);color:var(--yellow)}
+.tag-blue{background:rgba(74,158,255,.15);color:var(--blue)}
+.section-row{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
+@media(max-width:900px){.section-row{grid-template-columns:1fr}}
+.alert-item{display:flex;gap:10px;padding:8px 0;border-bottom:1px solid var(--border);font-size:11px}
+.alert-item:last-child{border-bottom:none}
+.alert-sev{font-size:10px;padding:2px 7px;border-radius:10px;height:fit-content;flex-shrink:0;font-weight:700}
+.sev-critical{background:rgba(255,77,106,.2);color:var(--red);border:1px solid rgba(255,77,106,.4)}
+.sev-high{background:rgba(255,140,66,.2);color:var(--orange);border:1px solid rgba(255,140,66,.4)}
+.sev-medium{background:rgba(255,196,61,.2);color:var(--yellow);border:1px solid rgba(255,196,61,.4)}
+.sev-low{background:rgba(0,212,161,.15);color:var(--green);border:1px solid rgba(0,212,161,.3)}
+.alert-body{flex:1}
+.alert-title{color:var(--text2);line-height:1.4;margin-bottom:3px}
+.alert-date{font-size:9px;color:var(--text);opacity:.5}
+.sec-item{padding:6px 0;border-bottom:1px solid var(--border)}
+.sec-item:last-child{border-bottom:none}
+.sec-title{font-size:11px;color:var(--text2);margin-bottom:4px}
+.sec-badge{font-size:9px;padding:2px 6px;border-radius:10px;display:inline-block}
+.badge-good{background:rgba(0,212,161,.15);color:var(--green)}
+.badge-warn{background:rgba(255,196,61,.15);color:var(--yellow)}
+.badge-info{background:rgba(74,158,255,.15);color:var(--blue)}
+.cb-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.cb-card{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px;text-align:center}
+.cb-name{font-size:9px;color:var(--text);letter-spacing:1px;margin-bottom:5px;text-transform:uppercase}
+.cb-val{font-size:20px;font-weight:700;color:var(--text3)}
+.cb-chg{font-size:10px;margin-top:3px;font-weight:600}
+.cb-note{font-size:9px;color:var(--text);opacity:.5;margin-top:3px}
+.fed-indicator{font-size:9px;padding:2px 6px;border-radius:10px;display:inline-block;margin-top:4px}
+.fi-hold{background:rgba(74,158,255,.15);color:var(--blue)}
+.geo-item{display:flex;gap:10px;padding:8px 0;border-bottom:1px solid var(--border);font-size:11px}
+.geo-item:last-child{border-bottom:none}
+.geo-flag{font-size:18px;width:26px;text-align:center;flex-shrink:0;line-height:1.2}
+.geo-body{flex:1}
+.geo-name{color:var(--text2);font-size:11px;margin-bottom:3px}
+.geo-status{font-size:10px;padding:2px 6px;border-radius:10px;display:inline-block}
+.status-war{background:rgba(255,77,106,.15);color:var(--red)}
+.status-ceasefire{background:rgba(255,196,61,.15);color:var(--yellow)}
+.status-tension{background:rgba(255,140,66,.15);color:var(--orange)}
+.status-stable{background:rgba(0,212,161,.15);color:var(--green)}
+.geo-desc{font-size:10px;color:var(--text);opacity:.6;margin-top:3px}
+.geo-impact{font-size:9px;color:var(--text);opacity:.4;margin-top:2px}
+.trend-item{display:flex;align-items:flex-start;gap:8px;padding:7px 0;border-bottom:1px solid var(--border);font-size:11px}
+.trend-item:last-child{border-bottom:none}
+.trend-rank{font-size:14px;font-weight:800;color:var(--text);opacity:.3;width:18px;text-align:center;flex-shrink:0;line-height:1.3}
+.trend-body{flex:1}
+.trend-topic{color:var(--text2);font-size:11px;margin-bottom:3px;line-height:1.3}
+.trend-meta{font-size:9px;color:var(--text);opacity:.5}
+.trend-sent{font-size:9px;padding:2px 5px;border-radius:10px;margin-left:4px}
+.sent-bull{background:rgba(0,212,161,.15);color:var(--green)}
+.sent-bear{background:rgba(255,77,106,.15);color:var(--red)}
+.sent-neutral{background:rgba(74,158,255,.15);color:var(--blue)}
+.keydates{font-size:11px}
+.kd-item{display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--border)}
+.kd-item:last-child{border-bottom:none}
+.kd-date{font-size:9px;color:var(--text);width:60px;flex-shrink:0}
+.kd-event{color:var(--text2);flex:1}
+.kd-imp{font-size:9px;padding:1px 5px;border-radius:10px}
+.imp-5{background:rgba(255,77,106,.2);color:var(--red)}
+.imp-4{background:rgba(255,140,66,.2);color:var(--orange)}
+.imp-3{background:rgba(255,196,61,.2);color:var(--yellow)}
+.etf-row{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--border);font-size:11px}
+.etf-row:last-child{border-bottom:none}
+.etf-name{flex:1;color:var(--text2)}
+.etf-flow{font-size:11px;font-weight:700;text-align:right}
+.etf-in{color:var(--green)}.etf-out{color:var(--red)}
+.footer{margin-top:16px;padding-top:12px;border-top:1px solid var(--border);text-align:center;font-size:10px;color:var(--text);opacity:.3}
+.loading-overlay{position:fixed;inset:0;background:rgba(10,14,26,.9);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:1000;transition:.3s}
+.loading-overlay.hidden{opacity:0;pointer-events:none}
+.load-spinner{width:40px;height:40px;border:3px solid var(--border);border-top-color:var(--green);border-radius:50%;animation:spin .8s linear infinite;margin-bottom:16px}
+.load-text{color:var(--text2);font-size:13px}
+.load-sub{color:var(--text);font-size:11px;margin-top:6px;opacity:.5}
+.tags-row{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}
+.data-tag{font-size:9px;padding:3px 8px;border-radius:20px;border:1px solid var(--border);color:var(--text)}
+.net-status{display:flex;align-items:center;gap:6px;font-size:10px;color:var(--text);margin-left:auto}
+.net-dot{width:5px;height:5px;border-radius:50%;background:var(--green)}
+.net-dot.offline{background:var(--red)}
+.fr-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-top:8px}
+.fr-card{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:6px 8px;text-align:center}
+.fr-name{font-size:8px;color:var(--text);opacity:.5;margin-bottom:3px}
+.fr-val{font-size:11px;font-weight:700;color:var(--cyan)}
+</style>
+</head>
+<body>
+
+<div class="loading-overlay" id="loader">
+  <div class="load-spinner"></div>
+  <div class="load-text">连接数据源...</div>
+  <div class="load-sub" id="loader-sub">CryptoCompare · Fear &amp; Greed</div>
+</div>
+
+<div class="wrap">
+
+  <!-- HEADER -->
+  <div class="header">
+    <div class="logo">&#x1f534; <span>Nexus</span> · BTC</div>
+    <div class="tagline">TRADING TERMINAL 2026</div>
+    <span class="live-dot"></span><span style="font-size:11px;color:var(--green)">LIVE</span>
+    <div class="net-status">
+      <span class="net-dot" id="netDot"></span>
+      <span id="netLabel">检查中</span>
+    </div>
+    <div class="last-upd" id="lastUpd">—</div>
+  </div>
+
+  <!-- REFRESH BAR -->
+  <div class="refresh-bar">
+    <button class="btn green" onclick="refreshAll()">&#x1f504; 刷新全部</button>
+    <button class="btn" onclick="refreshPrices()">&#x1f4b9; 价格</button>
+    <button class="btn" onclick="refreshFG()">&#x1f631; 情绪</button>
+    <button class="btn" onclick="refreshWhales()">&#x1f42b; 巨鲸</button>
+    <button class="btn" onclick="refreshMacro()">&#x1f3db; 宏观</button>
+    <button class="btn" onclick="refreshSocial()">&#x1f4f1; 社区</button>
+    <span class="status-msg" id="statusMsg"></span>
+    <span class="data-tag" id="dataSource">CryptoCompare</span>
+  </div>
+
+  <!-- TICKER -->
+  <div class="ticker-strip">
+    <div class="ticker"><div class="sym">BTC/USD</div><div class="price" id="pBTC">—</div><div class="chg" id="cBTC">—</div><div class="vol" id="vBTC">—</div></div>
+    <div class="ticker"><div class="sym">ETH/USD</div><div class="price" id="pETH">—</div><div class="chg" id="cETH">—</div><div class="vol" id="vETH">—</div></div>
+    <div class="ticker"><div class="sym">SOL/USD</div><div class="price" id="pSOL">—</div><div class="chg" id="cSOL">—</div><div class="vol" id="vSOL">—</div></div>
+    <div class="ticker"><div class="sym">BNB/USD</div><div class="price" id="pBNB">—</div><div class="chg" id="cBNB">—</div><div class="vol" id="vBNB">—</div></div>
+  </div>
+
+  <!-- MAIN GRID -->
+  <div class="main-grid">
+    <div class="chart-panel">
+      <div class="chart-header">
+        <span style="font-size:12px;font-weight:600;color:var(--text2)">&#x1f4ca; BTC/USDT · Binance · K线</span>
+        <div class="chart-tabs">
+          <button class="chart-tab active" onclick="loadTV('60')">1H</button>
+          <button class="chart-tab" onclick="loadTV('240')">4H</button>
+          <button class="chart-tab" onclick="loadTV('D')">1D</button>
+        </div>
+      </div>
+      <div class="chart-container" id="tvContainer">
+        <div class="chart-placeholder" id="tvPlaceholder">
+          <div class="chart-spinner"></div>
+          <div style="color:var(--text2);font-size:13px">正在加载 TradingView K线图...</div>
+          <div class="chart-note">首次约需 3-5 秒 · 支持鼠标滚轮缩放</div>
+        </div>
+        <a class="tv-link" href="https://www.tradingview.com/chart/?symbol=BINANCE:BTCUSDT" target="_blank">&#x2197; TradingView</a>
+      </div>
+    </div>
+
+    <div class="right-stack">
+
+      <!-- FEAR & GREED -->
+      <div class="panel">
+        <div class="panel-header">&#x1f631; Fear &amp; Greed Index <span style="font-size:9px;opacity:.4;margin-left:auto" id="fgSrc">alternative.me</span></div>
+        <div class="panel-body">
+          <div class="fg-ring">
+            <svg viewBox="0 0 110 110">
+              <circle class="fg-track" cx="55" cy="55" r="46"/>
+              <circle class="fg-arc" id="fgArc" cx="55" cy="55" r="46" stroke="var(--green)" stroke-dasharray="289" stroke-dashoffset="289"/>
+            </svg>
+            <div class="fg-center">
+              <div class="fg-value" id="fgVal">—</div>
+              <div class="fg-label" id="fgLbl">—</div>
+            </div>
+          </div>
+          <div class="fg-scale"><span>极度恐惧</span><span>极度贪婪</span></div>
+          <div class="fg-info"><span id="fgDelta">加载中...</span></div>
+        </div>
+      </div>
+
+      <!-- RSI -->
+      <div class="panel">
+        <div class="panel-header">&#x1f4c9; 技术指标</div>
+        <div class="panel-body">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+            <div class="rsi-panel">
+              <div class="rsi-gauge">
+                <svg viewBox="0 0 100 50">
+                  <path class="rsi-bg" d="M 5 50 A 45 45 0 0 1 95 50"/>
+                  <path class="rsi-fill" id="rsiFill" d="M 5 50 A 45 45 0 0 1 95 50" stroke="var(--cyan)" stroke-dasharray="141" stroke-dashoffset="141"/>
+                </svg>
+              </div>
+              <div class="rsi-num" id="rsiNum">—</div>
+              <div class="rsi-label">RSI 14 (H1)</div>
+            </div>
+            <div style="text-align:center;padding-top:5px">
+              <div style="font-size:12px;color:var(--text);margin-bottom:6px">多空比率</div>
+              <div style="font-size:11px" id="mlBTC">BTC: 38.6%多 / 61.4%空</div>
+              <div style="font-size:11px" id="mlETH">ETH: 57%多 / 43%空</div>
+              <div style="font-size:10px;color:var(--text);opacity:.5;margin-top:6px">杠杆偏空 BTC</div>
+            </div>
+          </div>
+          <div class="fr-grid">
+            <div class="fr-card"><div class="fr-name">BTC 费率</div><div class="fr-val up" id="frBTC">+0.0036%</div></div>
+            <div class="fr-card"><div class="fr-name">ETH 费率</div><div class="fr-val up" id="frETH">+0.0052%</div></div>
+            <div class="fr-card"><div class="fr-name">SOL 费率</div><div class="fr-val" id="frSOL">-0.0012%</div></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- WHALES -->
+      <div class="panel">
+        <div class="panel-header">&#x1f42b; 巨鲸动态 <span style="font-size:9px;opacity:.4;margin-left:auto">近30日</span></div>
+        <div class="panel-body" id="whaleList">
+          <div style="text-align:center;padding:20px;color:var(--text);opacity:.5">加载中...</div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- SECTION ROW 1: SEC/CFTC + CENTRAL BANK -->
+  <div class="section-row">
+
+    <!-- SEC/CFTC -->
+    <div class="panel">
+      <div class="panel-header">&#x1f3db; 美国政策警报 <span style="font-size:9px;opacity:.4;margin-left:auto">SEC · CFTC · 2026年</span></div>
+      <div class="panel-body">
+        <div class="tags-row" style="margin-bottom:10px">
+          <span class="data-tag" style="border-color:var(--green);color:var(--green)">&#x2705; GENIUS Act 已签署</span>
+          <span class="data-tag" style="border-color:var(--blue);color:var(--blue)">&#x2696; SEC撤回7项执法</span>
+          <span class="data-tag" style="border-color:var(--purple);color:var(--purple)">&#x1f512; DeFi 5年安全港</span>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px">
+          <div class="sec-item">
+            <div class="sec-title">GENIUS Act 稳定币法</div>
+            <span class="sec-badge badge-good">已签署（参68:30/众308:122）</span>
+            <div style="font-size:9px;color:var(--text);opacity:.5;margin-top:3px">7月18日全面合规截止</div>
+          </div>
+          <div class="sec-item">
+            <div class="sec-title">SEC · 执法转型</div>
+            <span class="sec-badge badge-good">结束执法优先监管</span>
+            <div style="font-size:9px;color:var(--text);opacity:.5;margin-top:3px">撤回7项加密执法案</div>
+          </div>
+          <div class="sec-item">
+            <div class="sec-title">CFTC · 商品分类</div>
+            <span class="sec-badge badge-info">16种代币确认为数字商品</span>
+            <div style="font-size:9px;color:var(--text);opacity:.5;margin-top:3px">BTC/ETH/SOL/XRP等</div>
+          </div>
+          <div class="sec-item">
+            <div class="sec-title">CLARITY Act H.R.3633</div>
+            <span class="sec-badge badge-warn">审议中 (Polymarket 72%)</span>
+            <div style="font-size:9px;color:var(--text);opacity:.5;margin-top:3px">4月13-18日委员会审议</div>
+          </div>
+        </div>
+        <div class="alert-item"><span class="alert-sev sev-medium">MED</span><div class="alert-body"><div class="alert-title">Coinbase获国家信托章程批准</div><div class="alert-date">4月7日 · 2026年</div></div></div>
+        <div class="alert-item"><span class="alert-sev sev-high">HIGH</span><div class="alert-body"><div class="alert-title">稳定币发行商：必须100%准备金 + 联邦牌照</div><div class="alert-date">GENIUS Act · 合规截止 7月18日</div></div></div>
+        <div class="alert-item"><span class="alert-sev sev-medium">MED</span><div class="alert-body"><div class="alert-title">DeFi交易所：5年安全港期（可无牌运营豁免）</div><div class="alert-date">SEC公告 · 4月13日</div></div></div>
+        <div class="alert-item"><span class="alert-sev sev-low">LOW</span><div class="alert-body"><div class="alert-title">MiCA欧盟全面执行：7月1日无牌CASP退出EU市场</div><div class="alert-date">欧盟 · 2026年7月1日</div></div></div>
+      </div>
+    </div>
+
+    <!-- CENTRAL BANK -->
+    <div class="panel">
+      <div class="panel-header">&#x1f3e6; 央行动态 <span style="font-size:9px;opacity:.4;margin-left:auto">实时 · 2026年4月</span></div>
+      <div class="panel-body">
+        <div class="cb-grid">
+          <div class="cb-card">
+            <div class="cb-name">Fed Funds Rate</div>
+            <div class="cb-val" id="fedRate">3.75%</div>
+            <div class="cb-chg" id="fedChg">维持不变</div>
+            <div class="fed-indicator fi-hold">HOLD</div>
+            <div class="cb-note">FOMC 4月28-29日</div>
+          </div>
+          <div class="cb-card">
+            <div class="cb-name">DXY 美元指数</div>
+            <div class="cb-val" id="dxyVal">98.68</div>
+            <div class="cb-chg up" id="dxyChg">+0.19%</div>
+            <div class="cb-note">美元维持强势</div>
+          </div>
+          <div class="cb-card">
+            <div class="cb-name">US 10Y 国债</div>
+            <div class="cb-val" id="tenYr">4.37%</div>
+            <div class="cb-chg up" id="tenYrChg">+0.02pp</div>
+            <div class="cb-note">升至月内高点</div>
+            <div class="cb-note" style="color:var(--yellow)">年底预期 4.08%</div>
+          </div>
+          <div class="cb-card">
+            <div class="cb-name">日央行 YCC</div>
+            <div class="cb-val" id="jpyYr">2.465%</div>
+            <div class="cb-chg" id="jpyChg">-0.01pp</div>
+            <div class="fed-indicator fi-hold">HOLD</div>
+            <div class="cb-note">植田和男：无加息指引</div>
+          </div>
+        </div>
+        <div style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px">
+          <div style="font-size:9px;color:var(--text);letter-spacing:.5px;margin-bottom:6px">关键宏观日历</div>
+          <div class="keydates">
+            <div class="kd-item"><div class="kd-date">4月30日</div><div class="kd-event">核心PCE通胀</div><div class="kd-imp imp-4">&#x2b50;&#x2b50;&#x2b50;&#x2b50;</div></div>
+            <div class="kd-item"><div class="kd-date">4月28-29</div><div class="kd-event">FOMC利率决定（鲍威尔主持）</div><div class="kd-imp imp-5">&#x2b50;&#x2b50;&#x2b50;&#x2b50;&#x2b50;</div></div>
+            <div class="kd-item"><div class="kd-date">5月15日</div><div class="kd-event">Kevin Warsh 接任美联储主席</div><div class="kd-imp imp-5">&#x2b50;&#x2b50;&#x2b50;&#x2b50;&#x2b50;</div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SECTION ROW 2: GEOPOLITICAL + SOCIAL -->
+  <div class="section-row">
+
+    <!-- GEOPOLITICAL -->
+    <div class="panel">
+      <div class="panel-header">&#x1f30d; 地缘政治风险 <span style="font-size:9px;opacity:.4;margin-left:auto">2026年4月</span></div>
+      <div class="panel-body">
+        <div class="geo-item">
+          <div class="geo-flag">&#x1f525;</div>
+          <div class="geo-body">
+            <div class="geo-name">中东地区冲突</div>
+            <span class="geo-status status-war">战争进行中</span>
+            <div class="geo-desc">2026年2月28日爆发，持续冲击全球供应链和石油市场</div>
+            <div class="geo-impact">&#x26a0; 影响：石油价格波动，美伊脆弱停火协议</div>
+          </div>
+        </div>
+        <div class="geo-item">
+          <div class="geo-flag">&#x1f6a2;</div>
+          <div class="geo-body">
+            <div class="geo-name">霍尔木兹海峡危机</div>
+            <span class="geo-status status-tension">高度紧张</span>
+            <div class="geo-desc">中俄在安理会否决，联合国召开紧急会议</div>
+            <div class="geo-impact">&#x26a0; 影响：全球15%石油运输通道受威胁</div>
+          </div>
+        </div>
+        <div class="geo-item">
+          <div class="geo-flag">&#x1f1fa;&#x1f1e6;</div>
+          <div class="geo-body">
+            <div class="geo-name">俄乌战争</div>
+            <span class="geo-status status-war">持续第4年</span>
+            <div class="geo-desc">军事压力持续，外交解决不确定性极高</div>
+            <div class="geo-impact">&#x1f1ea;&#x1f1fa; 影响：欧洲能源和经济持续承压</div>
+          </div>
+        </div>
+        <div class="geo-item">
+          <div class="geo-flag">&#x1f1ee;&#x1f1f7;</div>
+          <div class="geo-body">
+            <div class="geo-name">美伊脆弱停火</div>
+            <span class="geo-status status-ceasefire">脆弱停火</span>
+            <div class="geo-desc">停火协议执行不稳定，随时可能破裂</div>
+            <div class="geo-impact">&#x26a0; 伊朗紧张升级 = 油价上行风险</div>
+          </div>
+        </div>
+        <div class="geo-item">
+          <div class="geo-flag">&#x1f1f0;&#x1f1f5;</div>
+          <div class="geo-body">
+            <div class="geo-name">朝鲜半岛局势</div>
+            <span class="geo-status status-tension">紧张</span>
+            <div class="geo-desc">军事活动频繁，地区不稳定因素持续</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- SOCIAL TRENDS -->
+    <div class="panel">
+      <div class="panel-header">&#x1f4f1; X / Reddit 加密热点 <span style="font-size:9px;opacity:.4;margin-left:auto">实时趋势</span></div>
+      <div class="panel-body">
+        <div class="trend-item"><div class="trend-rank">#1</div><div class="trend-body"><div class="trend-topic">BTC ETF单日$4.1亿净流入 | BlackRock IBIT主导</div><div class="trend-meta">Twitter/X · @spotedcrypto · 4月22日</div><div class="trend-sent sent-bull">机构看涨</div></div></div>
+        <div class="trend-item"><div class="trend-rank">#2</div><div class="trend-body"><div class="trend-topic">鲸鱼30日吸筹27万枚BTC 创历史记录</div><div class="trend-meta">r/CryptoCurrency · 4月23日</div><div class="trend-sent sent-bull">看涨信号</div></div></div>
+        <div class="trend-item"><div class="trend-rank">#3</div><div class="trend-body"><div class="trend-topic">SEC撤回Coinbase执法案，Coinbase获信托牌照</div><div class="trend-meta">Twitter/X · 4月7日</div><div class="trend-sent sent-bull">监管利好</div></div></div>
+        <div class="trend-item"><div class="trend-rank">#4</div><div class="trend-body"><div class="trend-topic">BTC $80K Polymarket投注概率 28.5% 4月内触及</div><div class="trend-meta">Polymarket · 4月22日</div><div class="trend-sent sent-neutral">中性观望</div></div></div>
+        <div class="trend-item"><div class="trend-rank">#5</div><div class="trend-body"><div class="trend-topic">DeFi安全港5年 | DEX可无牌照运营（SEC公告）</div><div class="trend-meta">Twitter/X · 4月13日</div><div class="trend-sent sent-bull">结构性利好</div></div></div>
+        <div class="trend-item"><div class="trend-rank">#6</div><div class="trend-body"><div class="trend-topic">Mt.Gox债权分配约$82亿 BTC价格短期承压</div><div class="trend-meta">r/Bitcoin · 4月11日</div><div class="trend-sent sent-bear">短期看跌</div></div></div>
+        <div class="trend-item"><div class="trend-rank">#7</div><div class="trend-body"><div class="trend-topic">Wormhole 4月3日解锁12.8亿代币（流通量28%）</div><div class="trend-meta">Twitter/X · DeFi分析师 · 4月3日</div><div class="trend-sent sent-bear">解锁压力</div></div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ETF PANEL -->
+  <div class="panel" style="margin-bottom:14px">
+    <div class="panel-header">&#x1f3db; 机构流入 &amp; ETF 动态</div>
+    <div class="panel-body">
+      <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-bottom:12px">
+        <div style="text-align:center"><div style="font-size:22px;font-weight:800;color:var(--green)">$96.5B</div><div style="font-size:9px;color:var(--text)">BTC ETF 总AUM</div></div>
+        <div style="text-align:center"><div style="font-size:22px;font-weight:800;color:var(--green)">$4.115亿</div><div style="font-size:9px;color:var(--text)">单日净流入(4月16日)</div></div>
+        <div style="text-align:center"><div style="font-size:22px;font-weight:800;color:var(--blue)">$541.2亿</div><div style="font-size:9px;color:var(--text)">BlackRock IBIT AUM</div></div>
+        <div style="text-align:center"><div style="font-size:22px;font-weight:800;color:var(--purple)">$7.86亿</div><div style="font-size:9px;color:var(--text)">周净流入(F&amp;G=32时)</div></div>
+        <div style="text-align:center"><div style="font-size:22px;font-weight:800;color:var(--orange)">$14.4亿</div><div style="font-size:9px;color:var(--text)">XRP ETF Q1流入</div></div>
+      </div>
+      <div class="etf-row"><div class="etf-name">BlackRock IBIT <span class="etf-aum">AUM $541.2亿（占市场49%）</span></div><div class="etf-flow etf-in">+$2.14亿</div></div>
+      <div class="etf-row"><div class="etf-name">ARK/21Shares ARKB</div><div class="etf-flow etf-in">+$1.13亿</div></div>
+      <div class="etf-row"><div class="etf-name">Fidelity FBTC</div><div class="etf-flow etf-in">+$4,500万</div></div>
+      <div class="etf-row"><div class="etf-name">BlackRock ETHB 质押ETF <span style="color:var(--green);font-size:9px">新上线 3月12日</span></div><div class="etf-flow etf-in">官方批准</div></div>
+    </div>
+  </div>
+
+  <!-- KEY DATES -->
+  <div class="panel">
+    <div class="panel-header">&#x1f4c5; 2026年4月关键事件日历</div>
+    <div class="panel-body">
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">
+        <div style="background:var(--bg);border-radius:8px;padding:8px;border:1px solid rgba(255,77,106,.3)">
+          <div style="font-size:10px;color:var(--red);font-weight:700;margin-bottom:4px">4月30日</div>
+          <div style="font-size:11px;color:var(--text2);margin-bottom:4px">核心PCE通胀数据</div>
+          <span style="font-size:9px;background:rgba(255,77,106,.2);color:var(--red);padding:2px 6px;border-radius:10px">&#x2b50;&#x2b50;&#x2b50;&#x2b50;&#x2b50;</span>
+        </div>
+        <div style="background:var(--bg);border-radius:8px;padding:8px;border:1px solid rgba(255,77,106,.3)">
+          <div style="font-size:10px;color:var(--red);font-weight:700;margin-bottom:4px">4月28-29日</div>
+          <div style="font-size:11px;color:var(--text2);margin-bottom:4px">FOMC利率决定（鲍威尔最后任期）</div>
+          <span style="font-size:9px;background:rgba(255,77,106,.2);color:var(--red);padding:2px 6px;border-radius:10px">&#x2b50;&#x2b50;&#x2b50;&#x2b50;&#x2b50;</span>
+        </div>
+        <div style="background:var(--bg);border-radius:8px;padding:8px;border:1px solid rgba(255,196,61,.3)">
+          <div style="font-size:10px;color:var(--yellow);font-weight:700;margin-bottom:4px">4月13-18日</div>
+          <div style="font-size:11px;color:var(--text2);margin-bottom:4px">CLARITY Act审议</div>
+          <span style="font-size:9px;background:rgba(255,196,61,.2);color:var(--yellow);padding:2px 6px;border-radius:10px">通过概率72%</span>
+        </div>
+        <div style="background:var(--bg);border-radius:8px;padding:8px;border:1px solid var(--border)">
+          <div style="font-size:10px;color:var(--text);font-weight:700;margin-bottom:4px">4月12日</div>
+          <div style="font-size:11px;color:var(--text2);margin-bottom:4px">APT代币解锁</div>
+          <span style="font-size:9px;background:rgba(255,196,61,.15);color:var(--yellow);padding:2px 6px;border-radius:10px">待定规模</span>
+        </div>
+        <div style="background:var(--bg);border-radius:8px;padding:8px;border:1px solid var(--border)">
+          <div style="font-size:10px;color:var(--text);font-weight:700;margin-bottom:4px">4月（整月）</div>
+          <div style="font-size:11px;color:var(--text2);margin-bottom:4px">Wormhole/ENA/HYPE解锁</div>
+          <span style="font-size:9px;background:rgba(255,196,61,.15);color:var(--yellow);padding:2px 6px;border-radius:10px">多批代币流入</span>
+        </div>
+        <div style="background:var(--bg);border-radius:8px;padding:8px;border:1px solid rgba(74,158,255,.3)">
+          <div style="font-size:10px;color:var(--blue);font-weight:700;margin-bottom:4px">5月15日</div>
+          <div style="font-size:11px;color:var(--text2);margin-bottom:4px">Kevin Warsh 接任Fed主席</div>
+          <span style="font-size:9px;background:rgba(74,158,255,.2);color:var(--blue);padding:2px 6px;border-radius:10px">&#x2b50;&#x2b50;&#x2b50;&#x2b50;&#x2b50; 重大变局</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="footer">
+    Nexus BTC Dashboard 2026 · CryptoCompare API · Fear &amp; Greed: alternative.me · TradingView Charts<br>
+    宏观: TradingEconomics · 地缘: UN/ACLED · 社区: Twitter/X &amp; r/CryptoCurrency · 最后更新: <span id="footerTime">—</span>
+  </div>
+</div>
+
+<script>
+var CC='https://min-api.cryptocompare.com/data', FG='https://api.alternative.me/fng/?limit=2';
+var isLoading=false;
+window.addEventListener('load',function(){
+  refreshAll();
+  loadTV('60');
+  setTimeout(function(){document.getElementById('loader').classList.add('hidden');},2000);
+  setInterval(function(){refreshPrices();refreshFG();},120000);
+});
+
+async function refreshAll(){
+  if(isLoading)return; isLoading=true; setStatus('获取数据...');
+  try{await Promise.allSettled([refreshPrices(),refreshFG(),refreshWhales(),refreshMacro(),refreshSocial()]);updateLastUpd();setStatus('&#x2705; 已更新');}
+  catch(e){setStatus('&#x274c; 部分失败');}
+  isLoading=false;
+}
+
+async function refreshPrices(){
+  try{
+    var r=await fetch(CC+'/pricemultifull?fsyms=BTC,ETH,SOL,BNB&tsyms=USD&e=Binance');
+    var d=await r.json();
+    if(!d.RAW){fallback();return;}
+    ['BTC','ETH','SOL','BNB'].forEach(function(c){updateTicker(c,d.RAW[c].USD);});
+    document.getElementById('netDot').style.background='var(--green)';
+    document.getElementById('netLabel').textContent='在线';
+  }catch(e){fallback();document.getElementById('netDot').classList.add('offline');document.getElementById('netLabel').textContent='缓存';}
+}
+
+function fallback(){
+  var f={BTC:{PRICE:76251,CHANGEPCT24HOUR:-1.79,VOLUME24HOUR:24843},ETH:{PRICE:2280,CHANGEPCT24HOUR:-1.65,VOLUME24HOUR:948436},SOL:{PRICE:83.57,CHANGEPCT24HOUR:-1.82,VOLUME24HOUR:1984560},BNB:{PRICE:622,CHANGEPCT24HOUR:-0.73,VOLUME24HOUR:456789}};
+  Object.keys(f).forEach(function(c){updateTicker(c,f[c]);});
+  setStatus('&#x1f4fa; 使用缓存');
+}
+
+function updateTicker(coin,d){
+  var p=d.PRICE, chg=d.CHANGEPCT24HOUR, up=chg>=0, cls=up?'up':'dn', sign=up?'+':'';
+  var el=function(id){return document.getElementById(id);};
+  el('p'+coin).textContent=(coin==='BTC'||coin==='ETH')?'$'+p.toLocaleString('en',{minimumFractionDigits:2,maximumFractionDigits:2}):'$'+p.toFixed(2);
+  el('c'+coin).textContent=sign+chg.toFixed(2)+'%'; el('c'+coin).className='chg '+cls;
+  var v=d.VOLUME24HOUR; el('v'+coin).textContent=v>1e9?(v/1e9).toFixed(1)+'B':(v/1e6).toFixed(1)+'M';
+}
+
+async function refreshFG(){
+  try{
+    var r=await fetch(FG); var d=await r.json();
+    var cur=d.data[0], prev=d.data[1];
+    var val=parseInt(cur.value), delta=val-parseInt(prev.value);
+    var arc=document.getElementById('fgArc');
+    var circ=289, offset=circ-(val/100)*circ;
+    arc.style.strokeDashoffset=offset;
+    document.getElementById('fgVal').textContent=val;
+    document.getElementById('fgLbl').textContent=cur.value_classification;
+    var deltaEl=document.getElementById('fgDelta');
+    deltaEl.textContent=(delta>=0?'&#x2191;':'&#x2193;')+Math.abs(delta)+' (vs昨日)';
+    if(delta<-10)deltaEl.style.color='var(--red)';
+    var color=val<25?'var(--red)':val<45?'var(--orange)':val<55?'var(--yellow)':val<75?'var(--green)':'var(--cyan)';
+    arc.style.stroke=color;
+    document.getElementById('fgVal').style.color=color;
+    document.getElementById('fgLbl').style.color=color;
+  }catch(e){
+    document.getElementById('fgVal').textContent='33';
+    document.getElementById('fgLbl').textContent='Fear';
+    document.getElementById('fgDelta').textContent='&#x2193;14 (vs昨日) · 恐慌加剧';
+  }
+}
+
+function refreshWhales(){
+  var w=[
+    {icon:'&#x1f3e2;',name:'MicroStrategy',amount:'+$2.1B',tag:'&#x1f42b; Accumulation',cls:'tag-green',d:'up'},
+    {icon:'&#x26a1;',name:'Jump Crypto',amount:'-$340M',tag:'&#x1f504; Distribution',cls:'tag-red',d:'dn'},
+    {icon:'&#x1f3db;',name:'Mt.Gox债权人',amount:'~$82亿',tag:'&#x26a0; 潜在抛压',cls:'tag-yellow',d:'dn'},
+    {icon:'&#x1f42b;',name:'匿名鲸鱼群',amount:'+27万 BTC',tag:'&#x1f42b; 30日历史记录',cls:'tag-green',d:'up'},
+    {icon:'&#x1f3db;',name:'Celsius债权人',amount:'~$19亿',tag:'&#x26a0; 分散抛压',cls:'tag-yellow',d:'dn'},
+    {icon:'&#x1f4b0;',name:'Binance热钱包',amount:'+$12亿',tag:'&#x1f7e2; 买盘活跃',cls:'tag-green',d:'up'},
+    {icon:'&#x1f3e8;',name:'美国DOJ扣押',amount:'~$120亿',tag:'&#x1f512; 冻结(非抛售)',cls:'tag-blue',d:'neutral'},
+  ];
+  var html='';
+  w.forEach(function(wi){
+    var cls2=wi.d==='up'?'up':wi.d==='dn'?'dn':'';
+    html+='<div class="whale-item"><div class="w-icon">'+wi.icon+'</div><div class="w-name">'+wi.name+'</div><div><div class="w-amount '+cls2+'">'+wi.amount+'</div><span class="w-tag '+wi.cls+'">'+wi.tag+'</span></div></div>';
+  });
+  document.getElementById('whaleList').innerHTML=html;
+}
+
+async function refreshMacro(){
+  try{
+    var r=await fetch(CC+'/v2/histohour?fsym=BTC&tsym=USD&limit=48&e=Binance');
+    var d=await r.json();
+    if(d.Data&&d.Data.Data){
+      var closes=d.Data.Data.map(function(x){return x.close;});
+      var rsi14=calcRSI(closes,14);
+      updateRSI(rsi14);
+    }
+  }catch(e){updateRSI(62.86);}
+}
+
+function calcRSI(prices,period){
+  if(prices.length<period+1)return 50;
+  var gains=0,losses=0;
+  for(var i=prices.length-period;i<prices.length;i++){
+    var diff=prices[i]-prices[i-1];
+    if(diff>0)gains+=diff;else losses+=Math.abs(diff);
+  }
+  var avgGain=gains/period, avgLoss=losses/period;
+  if(avgLoss===0)return 100;
+  return 100-(100/(1+avgGain/avgLoss));
+}
+
+function updateRSI(rsi){
+  var fill=document.getElementById('rsiFill');
+  var maxArc=141, offset=maxArc-(rsi/100)*maxArc;
+  fill.style.strokeDashoffset=offset;
+  document.getElementById('rsiNum').textContent=rsi.toFixed(1);
+  var color=rsi>70?'var(--red)':rsi<30?'var(--green)':'var(--cyan)';
+  fill.style.stroke=color;
+  document.getElementById('rsiNum').style.color=color;
+}
+
+function refreshSocial(){setStatus('&#x1f4f1; 社区热点已是最新');}
+
+function loadTV(interval){
+  var container=document.getElementById('tvContainer');
+  var placeholder=document.getElementById('tvPlaceholder');
+  placeholder.innerHTML='<div class="chart-spinner"></div><div style="color:var(--text2);font-size:13px">正在加载 TradingView...</div>';
+  // Use TradingView lightweight widget
+  container.innerHTML='<div id="tv-widget" style="width:100%;height:320px"></div><a class="tv-link" href="https://www.tradingview.com/chart/?symbol=BINANCE:BTCUSDT" target="_blank">&#x2197; TradingView</a>';
+  var script=document.createElement('script');
+  script.src='https://s.tradingview.com/external-embedding/embed-widget-advanced-chart.js';
+  script.type='text/javascript';
+  script.async=true;
+  script.innerHTML=JSON.stringify({
+    autosize:false,width:'100%',height:320,
+    symbol:'BINANCE:BTCUSDT',interval:interval,
+    timezone:'Asia/Shanghai',theme:'dark',style:'1',
+    locale:'zh_CN',enable_publishing:false,
+    backgroundColor:'rgba(10,14,26,1)',
+    gridColor:'rgba(30,42,74,0.6)',
+    hide_top_toolbar:false,hide_legend:false,
+    save_image:false,calendar:false,
+    hide_volume:false,support_host:'https://www.tradingview.com'
+  });
+  document.getElementById('tv-widget').appendChild(script);
+  placeholder.style.display='none';
+}
+
+function setStatus(msg){document.getElementById('statusMsg').textContent=msg;if(msg.indexOf('&#x2705;')>=0||msg.indexOf('&#x274c;')>=0)setTimeout(function(){document.getElementById('statusMsg').textContent='';},4000);}
+function updateLastUpd(){
+  var now=new Date();
+  var t=now.toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  document.getElementById('lastUpd').textContent='更新: '+t;
+  document.getElementById('footerTime').textContent=t;
+}
+document.addEventListener('keydown',function(e){
+  if(e.key==='r'&&!e.ctrlKey&&!e.metaKey&&document.activeElement.tagName!=='INPUT')refreshAll();
+});
+</script>
+</body>
+</html>

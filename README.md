@@ -2,9 +2,9 @@
 
 加密货币 **实时监测 + 因子关系终端**。纯前端单页应用，无后端、无构建步骤；同时配套一个 Cloudflare Worker 解决宏观数据的浏览器跨域（CORS）问题。整站托管在 **Cloudflare**（Pages 静态前端 + Worker 边缘代理），并绑定自定义域名。
 
-> 部署形态：**Cloudflare Pages（静态前端）+ Cloudflare Worker（宏观数据代理）**，自定义域名走 `uichain.org`。
+> 部署形态：**Cloudflare Workers（前端用 Workers Assets 托管静态文件 + 宏观数据代理 Worker）**，整站走 `uichain.org` 自定义域名，无需手动配置 DNS（经 `workers_routes` 自动绑定）。
 >
-> - 前端（Cloudflare Pages / 自定义域名）：**https://nexus.uichain.org**
+> - 前端（Cloudflare Worker + Assets / 自定义域名）：**https://nexus.uichain.org**
 > - 宏观数据 Worker（自定义域名）：**https://nexus-api.uichain.org**
 > - GitHub 仓库（源码 + 历史版）：`https://github.com/leo-bone/nexus-terminal`
 > - 备用前端（GitHub Pages）：`https://leo-bone.github.io/nexus-terminal/`
@@ -39,26 +39,34 @@ python3 -m http.server 8899
 
 ---
 
-## 部署（Cloudflare Pages + Worker）
+## 部署（Cloudflare Workers 整站）
 
-### 1) 部署前端到 Cloudflare Pages
+整站由两个 Cloudflare Worker 组成，均通过 `routes.custom_domain` 绑定到 `uichain.org`（无需手动 DNS）。
+
+### 1) 部署前端（Workers Assets 托管静态文件）
 
 ```bash
-# 装 wrangler（隔离环境）
-cd ~/.workbuddy/binaries/node/workspace && npm i wrangler
-# 直接用 wrangler 上传静态目录（无需 GitHub App）
-wrangler pages project create nexus-terminal --production-branch production
-wrangler pages deploy public --project-name nexus-terminal --branch production
+cd frontend
+wrangler deploy          # 自动上传 public/ 并把 nexus.uichain.org 绑为自定义域
 ```
 
-> 也可把 `index.html` / `app.js` / `nexus*.html` 直接推到 GitHub，再在 Cloudflare Pages 控制台用 GitHub 连接（本项目用 `public/` 目录直接上传）。
+`frontend/wrangler.toml`：
 
-### 2) 绑定自定义域名（已做）
+```toml
+name = "nexus-frontend"
+main = "worker.js"
+assets = { directory = "./public" }
+routes = [{ pattern = "nexus.uichain.org", custom_domain = true }]
+```
 
-- 前端：`nexus.uichain.org` → Cloudflare Pages 项目 `nexus-terminal`（控制台或 API 添加自定义域，CF 自动建 CNAME + 代理）。
-- Worker：在 `worker/wrangler.toml` 配置 `routes = [{ pattern = "nexus-api.uichain.org", custom_domain = true }]`，然后 `wrangler deploy`，CF 自动把 Worker 绑到该域名。
+### 2) 部署宏观数据 Worker
 
-### 3) 部署 Cloudflare Worker（宏观数据 + 完整关系网络）
+```bash
+cd worker
+wrangler deploy          # nexus-api.uichain.org 自动绑定
+```
+
+### 3) 源码同步到 GitHub（本机 git 因 xcrun 损坏，走 REST API）
 
 > ✅ **已部署并接入**：Worker `nexus-proxy` 已上线于 **https://nexus-api.uichain.org**，`app.js` 的 `CONFIG.PROXY` 已填写该地址，宏观仪表盘与全量因子相关性已自动解锁。以下为重新部署步骤。
 
@@ -90,9 +98,13 @@ python3 push_to_github.py
 nexus-terminal/
 ├── index.html        # 前端页面（结构 + 样式）
 ├── app.js            # 全部前端逻辑（数据/指标/图表/因子/网络/回测/模拟）
-├── worker/
-│   ├── worker.js     # Cloudflare Worker：宏观数据代理 + 边缘缓存
-│   └── wrangler.toml # Worker 部署配置
+├── frontend/         # 前端 Cloudflare Worker（Workers Assets 托管）
+│   ├── worker.js     # 静态资源 Worker（passthrough 到 ASSETS）
+│   ├── wrangler.toml # 绑定 nexus.uichain.org 自定义域
+│   └── public/       # 静态资源（index.html / app.js / nexus*.html）
+├── worker/           # 宏观数据 Cloudflare Worker（Yahoo 代理 + 边缘缓存）
+│   ├── worker.js     # /api/snapshot 宏观数据接口
+│   └── wrangler.toml # 绑定 nexus-api.uichain.org 自定义域
 ├── nexus.html        # v1 历史版本（保留）
 ├── nexus_v2.html     # v2 历史版本（保留）
 └── README.md
