@@ -14,7 +14,7 @@
  * ===================================================================== */
 
 const CONFIG = {
-  PROXY: 'https://nexus-proxy.57990177.workers.dev', // Cloudflare Worker 已部署，宏观+全量相关性已解锁
+  PROXY: 'https://nexus-api.uichain.org', // Cloudflare Worker 自定义域名，宏观+全量相关性已解锁
   REFRESH_MS: 60000,             // 自动刷新间隔
   COINS: ['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'ADA'],
   SYMBOL_MAP: { BTC: 'BTCUSDT', ETH: 'ETHUSDT', SOL: 'SOLUSDT', BNB: 'BNBUSDT', XRP: 'XRPUSDT', ADA: 'ADAUSDT' },
