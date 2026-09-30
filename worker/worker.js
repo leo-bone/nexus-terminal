@@ -28,15 +28,29 @@ const CORS = {
 };
 
 async function fetchSeries(symbol) {
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=3mo&interval=1d`;
-  const r = await fetch(url, { headers: { 'User-Agent': 'NexusTerminal/3.0' } });
-  if (!r.ok) throw new Error('yahoo ' + r.status);
-  const j = await r.json();
-  const res = j.chart && j.chart.result && j.chart.result[0];
-  if (!res) throw new Error('no result');
-  const closes = (res.indicators.quote[0].close || []).filter(v => v != null);
-  const last = closes[closes.length - 1];
-  return { closes, last };
+  // query1 经常被限流，query2 作兜底；两者都失败才报错
+  const hosts = ['query1.finance.yahoo.com', 'query2.finance.yahoo.com'];
+  let lastErr;
+  for (const host of hosts) {
+    try {
+      const url = `https://${host}/v8/finance/chart/${encodeURIComponent(symbol)}?range=3mo&interval=1d`;
+      const r = await fetch(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+          'Accept': 'application/json',
+        },
+      });
+      if (!r.ok) throw new Error('yahoo ' + r.status);
+      const j = await r.json();
+      const res = j.chart && j.chart.result && j.chart.result[0];
+      if (!res) throw new Error('no result');
+      const closes = (res.indicators.quote[0].close || []).filter(v => v != null);
+      if (!closes.length) throw new Error('empty');
+      const last = closes[closes.length - 1];
+      return { closes, last };
+    } catch (e) { lastErr = e; console.warn('fetchSeries fail', host, symbol, e.message); }
+  }
+  throw lastErr || new Error('all hosts failed');
 }
 
 async function buildSnapshot() {
