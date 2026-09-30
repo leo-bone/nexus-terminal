@@ -1,0 +1,8 @@
+name = "nexus-proxy"
+main = "worker.js"
+compatibility_date = "2024-09-23"
+
+# 如需绑定自定义域名（经 Cloudflare 解析的域名），取消注释并填写:
+# routes = [
+#   { pattern = "nexus.yourdomain.com", custom_domain = true }
+# ]
