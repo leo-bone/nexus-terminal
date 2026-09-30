@@ -42,6 +42,48 @@ const CORS = {
   'Cache-Control': 'public, max-age=300',
 };
 
+// 通用代理白名单：仅允许这些主机，避免变成开放代理（被滥用）
+const PROXY_ALLOW = [
+  'api.bybit.com',        // 行情 / K线 / 资金费率 / 持仓 / 多空比
+  'api.coinpaprika.com',  // 全球市值 / BTC 占比（主源，CF 边缘可用性好）
+  'api.coingecko.com',    // 全球市值 / BTC 占比（备用源，限速，Worker 侧缓存 10min）
+  'api.alternative.me',   // 恐惧贪婪指数
+  'mempool.space',        // 比特币算力
+];
+
+// 代理任意白名单主机的请求，回传时带上 CORS 头。
+// 浏览器只与本 Worker 通信（同源 Cloudflare），由 Worker 从边缘节点抓取
+// 被墙/无 CORS 的数据源（Bybit/CoinGecko/alternative.me/mempool 等）。
+// cacheTtl>0 时对响应做边缘缓存：CoinGecko 等限流严格的源，靠缓存把请求
+// 频率压到很低（CF 边缘出口 IP 被多家数据商共享限流，缓存是关键）。
+async function proxyFetch(target, cacheTtl) {
+  let u;
+  try { u = new URL(target); } catch { throw new Error('invalid url'); }
+  if (!PROXY_ALLOW.includes(u.hostname)) throw new Error('host not allowed: ' + u.hostname);
+  const cacheKey = new Request(u.toString());
+  if (cacheTtl > 0) {
+    const hit = await caches.default.match(cacheKey);
+    if (hit) return hit;
+  }
+  const r = await fetch(u.toString(), {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (compatible; NexusTerminal/3.1)',
+      'Accept': 'application/json, text/plain, */*',
+    },
+  });
+  const body = await r.text();
+  const resp = new Response(body, {
+    status: r.status,
+    headers: {
+      ...CORS,
+      'Content-Type': r.headers.get('content-type') || 'application/json',
+      'Cache-Control': cacheTtl > 0 ? `public, max-age=${cacheTtl}` : 'no-store',
+    },
+  });
+  if (cacheTtl > 0 && r.ok) await caches.default.put(cacheKey, resp.clone());
+  return resp;
+}
+
 // 主源：Stooq 免费日线 CSV（无需密钥）
 async function fetchStooq(symbol) {
   const url = `https://stooq.com/q/d/l/?s=${encodeURIComponent(symbol)}&i=d`;
@@ -143,8 +185,22 @@ export default {
       return resp;
     }
 
+    // 通用数据代理：前端所有外部请求（Bybit/CoinGecko/alternative.me/mempool）
+    // 都经此转发，解决中国大陆无法直连 + 浏览器 CORS 问题。
+    if (url.pathname === '/api/fetch') {
+      const target = url.searchParams.get('url');
+      if (!target) return new Response('missing url param', { status: 400, headers: CORS });
+      // CoinGecko 限流严格（CF 边缘出口 IP 被共享限流），缓存 10 分钟
+      const cacheTtl = /api\.coingecko\.com/.test(target) ? 600 : 0;
+      try {
+        return await proxyFetch(target, cacheTtl);
+      } catch (e) {
+        return new Response(JSON.stringify({ error: e.message }), { status: 502, headers: { ...CORS, 'Content-Type': 'application/json' } });
+      }
+    }
+
     if (url.pathname === '/' || url.pathname === '/health') {
-      return new Response(JSON.stringify({ name: 'nexus-proxy', status: 'ok', source: 'stooq+yahoo', symbols: Object.keys(STOOQ) }), { status: 200, headers: { ...CORS, 'Content-Type': 'application/json' } });
+      return new Response(JSON.stringify({ name: 'nexus-proxy', status: 'ok', source: 'stooq+yahoo+proxy', symbols: Object.keys(STOOQ) }), { status: 200, headers: { ...CORS, 'Content-Type': 'application/json' } });
     }
 
     return new Response('Not Found', { status: 404, headers: CORS });

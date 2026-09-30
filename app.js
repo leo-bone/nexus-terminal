@@ -1,16 +1,15 @@
 /* =====================================================================
  * NEXUS TERMINAL v3 — 加密货币实时监测与因子关系终端
- * 纯前端 / 无后端 / 无构建步骤。可直接 file:// 打开，也可部署到 GitHub Pages。
+ * 纯前端 / 无后端 / 无构建步骤。可直接 file:// 打开，也可部署到 Cloudflare。
  *
- * 数据源（浏览器直连，已验证 CORS）:
- *   - Binance  public API   : 行情 / K线 / 合约资金费率 / 持仓 / 多空比
- *   - CryptoCompare         : 备用行情 / 链上历史 (hashrate, n_tx, totalbc ...)
- *   - CoinGecko             : 全球市值 / BTC 占比 / 稳定币占比
- *   - alternative.me        : 恐惧贪婪指数
- *   - Cloudflare Worker     : 宏观序列 (DXY/US10Y/黄金/标普/VIX) — 见 worker/
+ * 数据源（全经 Cloudflare Worker 代理，解决中国大陆无法直连 + 浏览器 CORS）:
+ *   - Bybit (api.bybit.com) : 行情 / K线 / 合约资金费率 / 持仓 / 多空比
+ *   - CoinPaprika           : 全球市值 / BTC 占比（主源，CF 边缘可用性好）
+ *   - alternative.me        : 恐惧贪婪指数 (F&G)
+ *   - mempool.space         : 比特币全网算力
+ *   - Cloudflare Worker     : 宏观序列 (DXY/US10Y/黄金/标普/VIX, Stooq主+Yahoo兜底) + 上述全部代理
  *
- * 配置: 部署 Cloudflare Worker 后，把下方 PROXY 改成你的 Worker 地址即可解锁
- *       宏观数据与完整「因子关系网络」。
+ * 浏览器只与 nexus-api.uichain.org 通信；真实数据源由 Worker 从边缘节点抓取。
  * ===================================================================== */
 
 const CONFIG = {
@@ -20,16 +19,22 @@ const CONFIG = {
   SYMBOL_MAP: { BTC: 'BTCUSDT', ETH: 'ETHUSDT', SOL: 'SOLUSDT', BNB: 'BNBUSDT', XRP: 'XRPUSDT', ADA: 'ADAUSDT' },
 };
 
+// 所有外部数据经 Cloudflare Worker 代理（解决中国大陆无法直连 + 浏览器跨域 CORS）。
+// 浏览器只与 nexus-api.uichain.org 通信，由 Worker 从边缘节点抓取真实数据源。
+const px = (u) => CONFIG.PROXY ? CONFIG.PROXY + '/api/fetch?url=' + encodeURIComponent(u) : u;
+
+// Bybit K线 interval 映射（UI 用 15m/1h/4h/1d，Bybit 用 15/60/240/D）
+const BYBIT_IV = { '15m': '15', '1h': '60', '4h': '240', '1d': 'D' };
+
 const ENDPOINTS = {
-  binPrice: s => `https://api.binance.com/api/v3/ticker/24hr?symbols=["${s}"]`,
-  binKline: (s, i, l) => `https://api.binance.com/api/v3/klines?symbol=${s}&interval=${i}&limit=${l}`,
-  binFunding: s => `https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${s}`,
-  binOI: s => `https://fapi.binance.com/futures/data/openInterestHist?symbol=${s}&period=5m&limit=96`,
-  binLS: s => `https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=${s}&period=5m&limit=96`,
-  ccPrice: fs => `https://min-api.cryptocompare.com/data/pricemultifull?fsyms=${fs}&tsyms=USD&e=Binance`,
-  ccChainDay: 'https://min-api.cryptocompare.com/data/blockchain/histo/day?fsym=BTC&limit=120',
-  ggGlobal: 'https://api.coingecko.com/api/v3/global',
-  fg: 'https://api.alternative.me/fng/?limit=90',
+  bybitTicker: s => px(`https://api.bybit.com/v5/market/tickers?category=spot&symbol=${s}`),
+  bybitKline: (s, iv, l) => px(`https://api.bybit.com/v5/market/kline?category=spot&symbol=${s}&interval=${iv}&limit=${l}`),
+  bybitLinear: s => px(`https://api.bybit.com/v5/market/tickers?category=linear&symbol=${s}`),
+  bybitOI: s => px(`https://api.bybit.com/v5/market/open-interest?category=linear&symbol=${s}&intervalTime=1h&limit=96`),
+  bybitLS: s => px(`https://api.bybit.com/v5/market/account-ratio?category=linear&symbol=${s}&period=1h&limit=96`),
+  ggGlobal: px('https://api.coinpaprika.com/v1/global'),
+  fg: px('https://api.alternative.me/fng/?limit=90'),
+  mempoolHR: px('https://mempool.space/api/v1/mining/hashrate/3d'),
 };
 
 const state = {
@@ -99,17 +104,29 @@ function zscore(a) { if (!a || a.length < 2) return 0; const m = a.reduce((s, v)
  *  数据拉取
  * ===================================================================== */
 async function fetchPrices() {
-  try {
-    const syms = CONFIG.COINS.map(c => CONFIG.SYMBOL_MAP[c]).map(s => `"${s}"`).join(',');
-    const d = await getJSON(ENDPOINTS.binPrice(syms));
-    d.forEach(t => { const c = CONFIG.COINS.find(k => CONFIG.SYMBOL_MAP[k] === t.symbol); if (c) state.prices[c] = { price: +t.lastPrice, chg: +t.priceChangePercent, high: +t.highPrice, low: +t.lowPrice, vol: +t.quoteVolume }; });
-    return true;
-  } catch (e) { console.warn('prices fail', e); return false; }
+  for (const c of CONFIG.COINS) {
+    try {
+      const d = await getJSON(ENDPOINTS.bybitTicker(CONFIG.SYMBOL_MAP[c]));
+      const t = d && d.result && d.result.list && d.result.list[0];
+      if (!t) continue;
+      state.prices[c] = {
+        price: +t.lastPrice,
+        chg: (+t.price24hPcnt) * 100,           // Bybit 为小数(0.0123=1.23%)，转百分比
+        high: +t.highPrice24h,
+        low: +t.lowPrice24h,
+        vol: +t.turnover24h,
+      };
+    } catch (e) { console.warn('price fail', c, e); }
+  }
+  return true;
 }
 async function fetchKlines(coin, interval) {
   try {
-    const d = await getJSON(ENDPOINTS.binKline(CONFIG.SYMBOL_MAP[coin], interval, 220));
-    const kl = d.map(r => ({ t: r[0], o: +r[1], h: +r[2], l: +r[3], c: +r[4], v: +r[5] }));
+    const iv = BYBIT_IV[interval] || '60';
+    const d = await getJSON(ENDPOINTS.bybitKline(CONFIG.SYMBOL_MAP[coin], iv, 220));
+    const list = (d.result && d.result.list) || [];
+    // Bybit 返回最新在前，反转成时间升序以兼容后续指标计算
+    const kl = list.map(r => ({ t: +r[0], o: +r[1], h: +r[2], l: +r[3], c: +r[4], v: +r[5] })).reverse();
     state.klines[coin + interval] = kl; return true;
   } catch (e) { console.warn('kline fail', e); return false; }
 }
@@ -118,25 +135,43 @@ async function fetchFG() {
   catch (e) { console.warn('fg fail', e); return false; }
 }
 async function fetchGlobal() {
-  try { const d = await getJSON(ENDPOINTS.ggGlobal); state.global = d.data; return true; }
-  catch (e) { console.warn('global fail', e); return false; }
+  try {
+    const d = await getJSON(ENDPOINTS.ggGlobal);
+    // CoinPaprika 全局结构：market_cap_usd / volume_24h_usd / bitcoin_dominance_percentage
+    state.global = {
+      total_market_cap: { usd: d.market_cap_usd },
+      market_cap_percentage: { btc: d.bitcoin_dominance_percentage },
+    };
+    return true;
+  } catch (e) { console.warn('global fail', e); return false; }
 }
 async function fetchChain() {
-  try { const d = await getJSON(ENDPOINTS.ccChainDay); const b = d.BTC; const mk = k => (b[k] || []).map(x => x.value); state.chain = b; state.chainSeries = { hashrate: mk('hashrate'), n_tx: mk('n_tx'), totalbc: mk('totalbc'), vol_usd: mk('estimated_transaction_volume_usd') }; return true; }
-  catch (e) { console.warn('chain fail', e); return false; }
+  try {
+    const d = await getJSON(ENDPOINTS.mempoolHR);
+    const hrs = (d && d.hashrates) || [];
+    // mempool 仅提供算力；日交易数/流通量降级为 null（链上活跃因子显示中性）
+    state.chainSeries = { hashrate: hrs.map(x => x.avgHashrate), n_tx: null, totalbc: null, vol_usd: null };
+    return true;
+  } catch (e) { console.warn('chain fail', e); return false; }
 }
 async function fetchDeriv() {
   try {
-    const f = await getJSON(ENDPOINTS.binFunding('BTCUSDT'));
-    const oi = await getJSON(ENDPOINTS.binOI('BTCUSDT'));
-    const ls = await getJSON(ENDPOINTS.binLS('BTCUSDT'));
-    state.deriv = {
-      funding: +f.fundingRate * 100,
-      oi: oi.length ? +oi[oi.length - 1].sumOpenInterest : null,
-      oiSeries: oi.map(x => +x.sumOpenInterest),
-      ls: ls.length ? +ls[ls.length - 1].longAccount : null,
-      lsSeries: ls.map(x => +x.longAccount),
-    };
+    const f = await getJSON(ENDPOINTS.bybitLinear('BTCUSDT'));
+    const fr = f && f.result && f.result.list && f.result.list[0];
+    const funding = fr ? (+fr.fundingRate) * 100 : null;   // Bybit 为小数，转百分比
+    let oi = null, oiSeries = null;
+    try {
+      const o = await getJSON(ENDPOINTS.bybitOI('BTCUSDT'));
+      const ol = (o.result && o.result.list) || [];
+      if (ol.length) { oiSeries = ol.map(x => +x.openInterest); oi = oiSeries[oiSeries.length - 1]; }
+    } catch (e) { console.warn('oi fail', e); }
+    let ls = null, lsSeries = null;
+    try {
+      const l = await getJSON(ENDPOINTS.bybitLS('BTCUSDT'));
+      const ll = (l.result && l.result.list) || [];
+      if (ll.length) { lsSeries = ll.map(x => +x.buyRatio * 100); ls = lsSeries[lsSeries.length - 1]; }
+    } catch (e) { console.warn('ls fail', e); }
+    state.deriv = { funding, oi, oiSeries, ls, lsSeries };
     return true;
   } catch (e) { console.warn('deriv fail', e); return false; }
 }
@@ -193,7 +228,7 @@ const FACTORS = [
   { id: 'ls', name: '⚖️ 多空比', group: 'deriv', w: 0.8, calc: () => { const l = state.deriv.ls; if (l == null) return { z: 0, sig: 'neu', note: '—' }; return { z: (l - 50) / 12, sig: l > 62 ? 'over' : l < 38 ? 'under' : 'neu', note: `${l.toFixed(1)}%多` }; } },
   { id: 'oi', name: '📊 合约持仓', group: 'deriv', w: 0.7, calc: () => { const z = zscore(state.deriv.oiSeries); return { z, sig: z > 1 ? 'over' : z < -1 ? 'under' : 'neu', note: fmtBig(state.deriv.oi) + ' BTC' }; } },
   { id: 'dom', name: '👑 BTC占比', group: 'market', w: 0.8, calc: () => { const d = state.global ? state.global.market_cap_percentage.btc : 50; return { z: (d - 50) / 8, sig: d > 56 ? 'over' : d < 44 ? 'under' : 'neu', note: `${d.toFixed(1)}%` }; } },
-  { id: 'stable', name: '🏦 稳定币占比', group: 'market', w: 0.7, calc: () => { const g = state.global; const st = g && g.total_market_cap.stablecoin; if (!st) return { z: 0, sig: 'neu', note: '需额外API' }; const r = st / g.total_market_cap.usd * 100; return { z: (r - 7) / 2, sig: r > 8 ? 'over' : 'neu', note: `${r.toFixed(1)}%` }; } },
+  { id: 'stable', name: '🏦 稳定币占比', group: 'market', w: 0.7, calc: () => { const g = state.global; const st = g && g.total_market_cap.stablecoin; if (!st) return { z: 0, sig: 'neu', note: '—' }; const r = st / g.total_market_cap.usd * 100; return { z: (r - 7) / 2, sig: r > 8 ? 'over' : 'neu', note: `${r.toFixed(1)}%` }; } },
   { id: 'hr', name: '⛏ 算力趋势', group: 'onchain', w: 0.7, calc: () => { const z = zscore(state.chainSeries.hashrate); return { z, sig: z > 0.8 ? 'over' : z < -0.8 ? 'under' : 'neu', note: z > 0 ? '升' : '降' }; } },
   { id: 'tx', name: '🔗 链上活跃', group: 'onchain', w: 0.6, calc: () => { const z = zscore(state.chainSeries.n_tx); return { z, sig: z > 0.8 ? 'over' : z < -0.8 ? 'under' : 'neu', note: z > 0 ? '活跃' : '低迷' }; } },
   { id: 'dxy', name: '🇺🇸 美元指数', group: 'macro', w: 1.0, calc: () => { const v = state.macro && state.macro.DXY; if (v == null) return { z: 0, sig: 'neu', note: CONFIG.PROXY ? '—' : '需Worker' }; return { z: (v - 103) / 4, sig: v > 105 ? 'over' : v < 100 ? 'under' : 'neu', note: v.toFixed(1) }; } },
@@ -387,8 +422,9 @@ function renderMacro() {
 }
 function renderOnChain() {
   const cs = state.chainSeries; const set = (id, v) => { const e = $(id); if (e) e.textContent = v; };
-  set('oc_hr', fmtBig(cs.hashrate && cs.hashrate[cs.hashrate.length - 1]) + ' TH/s');
-  set('oc_tx', fmtBig(cs.n_tx && cs.n_tx[cs.n_tx.length - 1]));
+  const hr = cs.hashrate && cs.hashrate.length ? cs.hashrate[cs.hashrate.length - 1] : null;
+  set('oc_hr', hr != null ? fmtBig(hr) + ' TH/s' : '—');
+  set('oc_tx', cs.n_tx && cs.n_tx.length ? fmtBig(cs.n_tx[cs.n_tx.length - 1]) : '—');
   set('oc_mc', state.global ? '$' + fmtBig(state.global.total_market_cap.usd) : '—');
   set('oc_dom', state.global ? state.global.market_cap_percentage.btc.toFixed(1) + '%' : '—');
   set('oc_stable', state.global && state.global.total_market_cap.stablecoin ? '$' + fmtBig(state.global.total_market_cap.stablecoin) : '—');
