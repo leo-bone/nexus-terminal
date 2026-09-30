@@ -3,6 +3,9 @@
 加密货币 **实时监测 + 因子关系终端**。纯前端单页应用，无后端、无构建步骤；同时配套一个 Cloudflare Worker 解决宏观数据的浏览器跨域（CORS）问题，并作为 GitHub Pages 的边缘加速层。
 
 > 部署形态：**GitHub（托管静态前端）+ Cloudflare（Worker 代理宏观数据 / 可选自定义域名 CDN）**。
+>
+> - 前端（GitHub Pages）：`https://leo-bone.github.io/nexus-terminal/`
+> - 宏观数据 Worker（已部署）：`https://nexus-proxy.57990177.workers.dev`
 
 ---
 
@@ -56,6 +59,8 @@ git add -A && git commit -m "Nexus Terminal v3" && git push
 
 ### 3) 部署 Cloudflare Worker（解锁宏观数据 + 完整关系网络）
 
+> ✅ **已部署并接入**：Worker `nexus-proxy` 已上线于 `https://nexus-proxy.57990177.workers.dev`，`app.js` 的 `CONFIG.PROXY` 已填写该地址，宏观仪表盘与全量因子相关性已自动解锁。以下为重新部署/迁移步骤。
+
 ```bash
 cd worker
 npm i -g wrangler        # 或 npx wrangler
@@ -64,19 +69,13 @@ wrangler deploy
 # 记下分配的 *.workers.dev 地址
 ```
 
-部署后在 **`app.js` 顶部**把：
+`app.js` 顶部 `CONFIG.PROXY` 已配置为 Worker 地址：
 
 ```js
-const CONFIG = { PROXY: '', ... }
+const CONFIG = { PROXY: 'https://nexus-proxy.57990177.workers.dev', ... }
 ```
 
-改成你的 Worker 地址：
-
-```js
-const CONFIG = { PROXY: 'https://nexus-proxy.<你的子域>.workers.dev', ... }
-```
-
-未配置时：宏观卡片显示「需 Worker」，因子关系网络仅在加密/链上/衍生品因子间计算相关性；配置后自动解锁宏观因子与全量相关性。
+若重新部署得到新地址，只需同步修改这一行即可。未配置时：宏观卡片显示「需 Worker」，因子关系网络仅在加密/链上/衍生品因子间计算相关性；配置后自动解锁宏观因子与全量相关性。
 
 ### 4) （可选）自定义域名经 Cloudflare 加速
 
