@@ -1,13 +1,13 @@
 # Nexus Terminal v3
 
-加密货币 **实时监测 + 因子关系终端**。纯前端单页应用，无后端、无构建步骤；同时配套一个 Cloudflare Worker 解决宏观数据的浏览器跨域（CORS）问题。整站托管在 **Cloudflare**（Pages 静态前端 + Worker 边缘代理），并绑定自定义域名。
+加密货币 **实时监测 + 因子关系终端**。纯前端单页应用，无后端、无构建步骤；同时配套一个 Cloudflare Worker 解决宏观数据的浏览器跨域（CORS）问题。整站托管在 **Cloudflare**（前端用 Workers Assets + 宏观数据代理 Worker），并绑定自定义域名。
 
-> 部署形态：**Cloudflare Workers（前端用 Workers Assets 托管静态文件 + 宏观数据代理 Worker）**，整站走 `uichain.org` 自定义域名，无需手动配置 DNS（经 `workers_routes` 自动绑定）。
+> 部署形态：**纯 Cloudflare 单一出口**——前端（Workers Assets）+ 宏观数据代理 Worker，均经 `workers_routes` 自动绑定到 `uichain.org`，无需手动配置 DNS。GitHub 仅作为**源码仓库**，不再对外提供 Pages 站点。
 >
 > - 前端（Cloudflare Worker + Assets / 自定义域名）：**https://nexus.uichain.org**
 > - 宏观数据 Worker（自定义域名）：**https://nexus-api.uichain.org**
-> - GitHub 仓库（源码 + 历史版）：`https://github.com/leo-bone/nexus-terminal`
-> - 备用前端（GitHub Pages）：`https://leo-bone.github.io/nexus-terminal/`
+> - 唯一对外入口：以上两个 `uichain.org` 子域（GitHub Pages 备用站已关停）
+> - 源码仓库（仅存代码，不对外服务）：`https://github.com/leo-bone/nexus-terminal`
 
 ---
 
@@ -19,7 +19,7 @@
 | K 线 + 技术指标 | Canvas 自绘 K 线（15m/1H/4H/1D），RSI / MACD / 布林 / ATR / MA 趋势 | Binance |
 | 因子模型（20 维） | 情绪 / 资金费率 / 多空比 / 持仓 / 占比 / 稳定币 / 算力 / 链上活跃 / 美元指数 / 美债 / 黄金 / 标普 / VIX / 技术面 / 动量 → 加权合成 **Nexus Score** | 多源 |
 | **因子关系网络** | 力导向图 + Pearson 相关性矩阵，**实时计算各因子与 BTC 的相关关系**（绿=正相关，红=负相关，线宽=相关强度） | 多源 |
-| 宏观仪表盘 | DXY / 美债10Y / 黄金 / 标普500 / VIX 实时卡片 | Cloudflare Worker → Yahoo |
+| 宏观仪表盘 | DXY / 美债10Y / 黄金 / 标普500 / VIX 实时卡片 | Cloudflare Worker → Stooq（Yahoo 兜底） |
 | 链上数据 | 全网算力 / 日交易笔数 / 总市值 / BTC 占比 / 稳定币市值 | CryptoCompare / CoinGecko |
 | 衍生品 | 资金费率 / 持仓量 / 多空比 | Binance FAPI |
 | 量化回测 | 均线交叉 / RSI 反转 / 突破，输出收益、夏普、回撤、胜率、净值曲线 | 本地计算 |
@@ -81,7 +81,7 @@ wrangler deploy
 const CONFIG = { PROXY: 'https://nexus-api.uichain.org', ... }
 ```
 
-若换域名，只需同步修改这一行并重新部署 Pages。未配置时：宏观卡片显示「需 Worker」，因子关系网络仅在加密/链上/衍生品因子间计算相关性；配置后自动解锁宏观因子与全量相关性。
+若换域名，只需同步修改这一行并重新部署前端 Worker。未配置时：宏观卡片显示「需 Worker」，因子关系网络仅在加密/链上/衍生品因子间计算相关性；配置后自动解锁宏观因子与全量相关性。
 
 ### 4) 源码同步到 GitHub（本机 git 因 xcrun 损坏，走 REST API）
 
@@ -102,7 +102,7 @@ nexus-terminal/
 │   ├── worker.js     # 静态资源 Worker（passthrough 到 ASSETS）
 │   ├── wrangler.toml # 绑定 nexus.uichain.org 自定义域
 │   └── public/       # 静态资源（index.html / app.js / nexus*.html）
-├── worker/           # 宏观数据 Cloudflare Worker（Yahoo 代理 + 边缘缓存）
+├── worker/           # 宏观数据 Cloudflare Worker（Stooq 主源 + Yahoo 兜底 + 边缘缓存）
 │   ├── worker.js     # /api/snapshot 宏观数据接口
 │   └── wrangler.toml # 绑定 nexus-api.uichain.org 自定义域
 ├── nexus.html        # v1 历史版本（保留）
