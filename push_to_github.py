@@ -90,12 +90,21 @@ st, jt = req("POST", f"/repos/{OWNER}/{REPO}/git/trees", {"tree": tree})
 new_tree = jt["sha"]
 print("TREE", new_tree)
 
-# commit
+# commit message：版本号从 README 首行自动读取，避免提交信息过期
+VERSION = "Nexus Terminal"
+try:
+    with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as fh:
+        _first = fh.readline().strip()
+    if _first.startswith("# "):
+        VERSION = _first[2:].strip()
+except Exception:
+    pass
+MSG = sys.argv[1] if len(sys.argv) > 1 else (
+    VERSION + ": 新增事件因子(非农/失业率/初请/核心PCE/CPI) + 美国经济日历面板"
+    " + 原油双源(WTI+布伦特) + 数据源主备调换(Yahoo 主 / Stooq 兜底)"
+)
 st, jc = req("POST", f"/repos/{OWNER}/{REPO}/git/commits", {
-    "message": (
-        "Nexus Terminal v3.1.2: 数据源切 Bybit+CoinPaprika(Cloudflare边缘可达)，"
-        "全部外部请求经 Worker /api/fetch 代理修复中国大陆不可达；更新 README/SKILL 文档"
-    ),
+    "message": MSG,
     "tree": new_tree,
     "parents": [base_commit],
 })
