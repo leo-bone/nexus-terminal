@@ -31,8 +31,8 @@ function payload(rawu) {
   if (u.includes('alternative.me')) return { data: Array.from({ length: 90 }, (_, i) => ({ value: '50', value_classification: 'Neutral', timestamp: String(Math.floor((now - i * 86400000) / 1000)) })) };
   if (u.includes('mempool.space')) return { hashrates: Array.from({ length: 365 }, (_, i) => ({ timestamp: now - i * 86400000, avgHashrate: 5e20 })) };
   if (u.includes('/api/snapshot')) {
-    const keys = ['DXY', 'US10Y', 'GOLD', 'SPX', 'VIX', 'OIL', 'BRENT', 'AGRI', 'EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10'];
-    const base = { DXY: 101, US10Y: 5.2, GOLD: 4190, SPX: 7650, VIX: 16, OIL: 89, BRENT: 97, AGRI: 28, EFFR: 3.88, UST2Y: 4.88, T10Y2Y: 0.41, REAL10Y: 2.93, BEI10: 2.36 };
+    const keys = ['DXY', 'US10Y', 'GOLD', 'SPX', 'VIX', 'OIL', 'BRENT', 'AGRI', 'EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'USDJPY', 'JGB10Y'];
+    const base = { DXY: 101, US10Y: 5.2, GOLD: 4190, SPX: 7650, VIX: 16, OIL: 89, BRENT: 97, AGRI: 28, EFFR: 3.88, UST2Y: 4.88, T10Y2Y: 0.41, REAL10Y: 2.93, BEI10: 2.36, USDJPY: 158, JGB10Y: 3.06 };
     const S = {}, D = {}, M = {}, SRC = {};
     keys.forEach(k => { const n = k === 'EFFR' ? 300 : 160; S[k] = series(n, base[k], base[k] * 0.02); D[k] = ts.slice(-n); M[k] = S[k][S[k].length - 1]; SRC[k] = 'yahoo:TEST'; });
     return { macro: M, series: S, dates: D, _prev: M, _src: SRC, ts: now };
@@ -79,6 +79,7 @@ vm.createContext(sandbox);
 vm.runInContext(code, sandbox, { filename: 'app.js' });
 const state = vm.runInContext('state', sandbox);
 const run = expr => vm.runInContext(expr, sandbox);
+const call = (expr, ...args) => vm.runInContext('(' + expr + ')', sandbox)(...args);
 
 let fail = 0;
 const chk = (label, actual, expect) => {
@@ -173,6 +174,38 @@ const near = (label, actual, expect, tol) => {
   $id('btF').value = '50'; $id('btS').value = '30';
   await sandbox.renderBacktest();
   chk('  快线≥慢线 有明确错误提示', $id('btMsg').className.includes('err'), 'true');
+
+  console.log('\n===== D. 因子方向一致性（v3.6 核心修复）=====');
+  const F = run('FACTORS');
+  chk('因子总数', F.length, 28);
+  chk('每个因子都有合法 dir', F.every(f => [1, -1, 0].includes(f.dir)), 'true');
+  chk('仅 1 项为「仅展示」(dir=0)', F.filter(f => f.dir === 0).length, 1);
+  chk('参与评分的因子数', run('computeNexusScore().nScored'), 27);
+  const expectDir = { fng: -1, fund: -1, ls: -1, oi: -1, dom: -1, stable: 1, hr: 1, tx: 1, dxy: -1, us10y: -1, spx: 1, vix: -1, gold: -1, oil: -1, agri: 0, geo: -1, fed: -1, bei: -1, curve: 1, jpy: 1, jgb: -1, nfp: -1, urate: 1, claims: 1, pce: -1, cpi: -1, tech: 1, mom: 1 };
+  const bad = Object.entries(expectDir).filter(([k, v]) => (F.find(f => f.id === k) || {}).dir !== v).map(([k]) => k);
+  chk('方向表与设计一致', bad.length ? bad.join(',') : 'ok', 'ok');
+  chk('因子 id 无遗漏', F.filter(f => !(f.id in expectDir)).length, 0);
+
+  // 方向化贡献：把某个序列的末值拉高/压低，检查贡献符号
+  const setLast = (k, m) => call('(k,m)=>{const a=state.macroSeries[k].slice(); a[a.length-1]=a[0]*m; state.macroSeries[k]=a;}', k, m);
+  const contrib = id => run(`computeNexusScore().out.${id}.contribution`);
+  const orig = {};
+  ['DXY', 'SPX', 'VIX', 'JGB10Y', 'USDJPY', 'GOLD'].forEach(k => orig[k] = run(`state.macroSeries.${k}.slice()`));
+
+  setLast('DXY', 1.5); chk('美元 z>0 → 贡献为负（利空）', contrib('dxy') < 0, 'true');
+  setLast('DXY', 0.5); chk('美元 z<0 → 贡献为正（利多）', contrib('dxy') > 0, 'true');
+  setLast('SPX', 1.5); chk('标普 60日动能 z>0 → 贡献为正', contrib('spx') > 0, 'true');
+  setLast('VIX', 3.0); chk('VIX z>0 → 贡献为负（避险）', contrib('vix') < 0, 'true');
+  setLast('JGB10Y', 2.0); chk('日债10Y z>0 → 贡献为负（套息成本升）', contrib('jgb') < 0, 'true');
+  setLast('USDJPY', 1.3); chk('美元日元 z>0 → 贡献为正（套息顺畅）', contrib('jpy') > 0, 'true');
+  setLast('GOLD', 1.5); chk('黄金急涨 z>0 → 贡献为负（避险）', contrib('gold') < 0, 'true');
+  chk('农业 dir=0 → 贡献恒为 0', contrib('agri'), 0);
+  Object.entries(orig).forEach(([k, v]) => call('(k,a)=>{state.macroSeries[k]=a;}', k, v));
+
+  console.log('\n===== E. 趋势型 z 不再贴顶 =====');
+  const trend = 'Array.from({length:300},(_,i)=>100*Math.pow(1.002,i))';
+  near('稳定复利上涨序列 chgZ ≈ 0', run(`chgZ(${trend},60,120)`), 0, 0.6);
+  chk('同一序列 rollZ 明显偏离 0（旧做法会贴顶）', Math.abs(run(`rollZ(${trend},120)`)) > 1, 'true');
 
   console.log('\n' + (fail ? `❌ 失败 ${fail} 项` : '✅ 全部断言通过'));
   process.exit(fail ? 1 : 0);

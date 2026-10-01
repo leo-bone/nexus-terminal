@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Nexus Terminal · 加密货币因子关系终端 v3.4</title>
+<title>Nexus Terminal · 加密货币因子关系终端 v3.6</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -72,6 +72,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
 .fscore-center{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center}
 .fscore-n{font-size:15px;font-weight:800;color:var(--text4);line-height:1}.fscore-l{font-size:7px;color:var(--dim)}
 .fgrid{display:grid;grid-template-columns:repeat(5,1fr);gap:6px}
+.fnote{font-size:9px;color:var(--dim);line-height:1.7;margin-bottom:9px;padding:0 1px}
 @media(max-width:1100px){.fgrid{grid-template-columns:repeat(4,1fr)}.ta-grid{grid-template-columns:repeat(3,1fr)}}
 .fcard{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 6px;text-align:center}
 .fc-name{font-size:8px;color:var(--dim);letter-spacing:.5px;margin-bottom:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -82,7 +83,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
 @media(max-width:1100px){.net-wrap{grid-template-columns:1fr}}
 #netCanvas{display:block;width:100%;height:420px;background:radial-gradient(circle at 50% 45%,#0d1828,#060c18)}
 .heat{overflow:auto;padding:10px}.heat-grid{display:grid;gap:2px}
-.hm-h{font-size:8px;color:var(--dim);display:flex;align-items:center;justify-content:center;padding:2px;text-align:center}
+.hm-h{font-size:8px;color:var(--dim);display:flex;align-items:center;justify-content:center;padding:2px;text-align:center;overflow:hidden;white-space:nowrap}
 .hm-cell{font-size:9px;font-family:'JetBrains Mono',monospace;display:flex;align-items:center;justify-content:center;border-radius:3px;padding:6px 2px;font-weight:600}
 .bt-sec{padding:12px}.bt-tabs{display:flex;gap:3px;margin-bottom:10px;background:var(--bg);border-radius:8px;padding:4px;border:1px solid var(--border)}
 .bt-tab{flex:1;padding:6px 8px;border-radius:6px;font-size:10px;font-weight:600;cursor:pointer;border:none;color:var(--text);background:transparent;font-family:inherit}
@@ -142,7 +143,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
   <div class="header">
     <div class="logo">NEXUS <em>TERMINAL</em></div>
     <div class="tagline">CRYPTO FACTOR TERMINAL</div>
-    <div class="live-badge"><span class="live-dot"></span> LIVE · v3.4</div>
+    <div class="live-badge"><span class="live-dot"></span> LIVE · v3.6</div>
     <div class="hdr-right">
       <span class="net-lbl">数据源</span><span id="netDot" class="net-dot"></span>
       <span id="lastUpd" class="last-upd">—</span>
@@ -194,7 +195,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
   </div>
 
   <div class="panel">
-    <div class="phdr"><span class="icon">🧠</span><span class="lbl">因子模型 · Nexus Score</span><span id="fCount" class="hint">26 维</span><span class="hint">Z-Score 加权合成 · 实时</span></div>
+    <div class="phdr"><span class="icon">🧠</span><span class="lbl">因子模型 · Nexus Score</span><span id="fCount" class="hint">28 维</span><span class="hint">方向加权合成 · 实时</span></div>
     <div class="fpanel">
       <div class="fhdr">
         <span class="fttl">综合多空评分</span>
@@ -203,6 +204,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
           <div class="fscore-center"><div id="nxScore" class="fscore-n">—</div><div id="nxSig" class="fscore-l n">—</div></div>
         </div>
       </div>
+      <div class="fnote">每个因子先算 z（相对自身历史的偏离），再乘方向 dir 得到多空贡献：<b style="color:var(--green)">绿=利多</b> · <b style="color:var(--red)">红=利空</b> · 灰「仅展示」不参与评分。悬停卡片可看权重与原始 z。</div>
       <div id="factorGrid" class="fgrid"></div>
     </div>
   </div>
@@ -219,7 +221,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
   </div>
 
   <div class="panel">
-    <div class="phdr"><span class="icon">🏦</span><span class="lbl">宏观 · 政策 · 通胀 · 大宗</span><span class="hint">Yahoo/Stooq + NY Fed + 美财政部</span></div>
+    <div class="phdr"><span class="icon">🏦</span><span class="lbl">宏观 · 政策 · 通胀 · 大宗 · 日元</span><span class="hint">Yahoo Finance + NY Fed + 美财政部 + 日本财务省</span></div>
     <div id="macroGrid" class="mgrid"></div>
     <div id="macroHint" class="macro-hint">—</div>
   </div>
@@ -324,7 +326,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
   </div>
 
   <div class="footer">
-    NEXUS TERMINAL v3.5 · 纯前端实时加密终端 · 数据源: Bybit / CoinPaprika / DefiLlama / blockchain.info / alternative.me / mempool.space / Yahoo Finance / NY Fed / U.S. Treasury / Forex Factory<br>
+    NEXUS TERMINAL v3.6 · 纯前端实时加密终端 · 数据源: Bybit / CoinPaprika / DefiLlama / blockchain.info / alternative.me / mempool.space / Yahoo Finance / NY Fed / U.S. Treasury / Japan MOF / Forex Factory<br>
     仅供研究与教育，不构成投资建议。加密资产风险极高，请独立判断。
   </div>
 </div>

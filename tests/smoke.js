@@ -32,8 +32,8 @@ function payload(rawu) {
   if (u.includes('mempool.space'))
     return { hashrates: Array.from({ length: 365 }, (_, i) => ({ timestamp: now - i * 86400000, avgHashrate: 5e20 + i * 1e18 })) };
   if (u.includes('/api/snapshot')) {
-    const keys = ['DXY', 'US10Y', 'GOLD', 'SPX', 'VIX', 'OIL', 'BRENT', 'AGRI', 'EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10'];
-    const base = { DXY: 101, US10Y: 5.2, GOLD: 4190, SPX: 7650, VIX: 16, OIL: 89, BRENT: 97, AGRI: 28, EFFR: 3.88, UST2Y: 4.88, T10Y2Y: 0.41, REAL10Y: 2.93, BEI10: 2.36 };
+    const keys = ['DXY', 'US10Y', 'GOLD', 'SPX', 'VIX', 'OIL', 'BRENT', 'AGRI', 'EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'USDJPY', 'JGB10Y'];
+    const base = { DXY: 101, US10Y: 5.2, GOLD: 4190, SPX: 7650, VIX: 16, OIL: 89, BRENT: 97, AGRI: 28, EFFR: 3.88, UST2Y: 4.88, T10Y2Y: 0.41, REAL10Y: 2.93, BEI10: 2.36, USDJPY: 158, JGB10Y: 3.06 };
     const S = {}, D = {}, M = {}, SRC = {};
     keys.forEach(k => { const n = k === 'EFFR' ? 300 : 160; S[k] = series(n, base[k], base[k] * 0.02); D[k] = ts.slice(-n); M[k] = S[k][S[k].length - 1]; SRC[k] = k === 'EFFR' ? 'nyfed' : 'yahoo:TEST'; });
     return { macro: M, series: S, dates: D, _prev: M, _src: SRC, ts: now };
@@ -97,9 +97,12 @@ try {
     console.log('Nexus Score =', r.score);
     const ids = Object.keys(r.out);
     console.log('因子数 =', ids.length);
-    console.log(ids.map(k => `${k}:${r.out[k].z.toFixed(2)}(${r.out[k].note})`).join('  '));
-    const anyNaN = ids.filter(k => !isFinite(r.out[k].z));
-    console.log(anyNaN.length ? 'NaN Z 因子: ' + anyNaN.join(',') : 'ALL Z FINITE OK');
+    console.log(ids.map(k => `${k}[dir${r.out[k].dir}]z=${r.out[k].z.toFixed(2)}/c=${r.out[k].contribution.toFixed(2)}`).join(' '));
+    const anyNaN = ids.filter(k => !isFinite(r.out[k].z) || !isFinite(r.out[k].contribution));
+    if (anyNaN.length) { console.error('NaN 因子: ' + anyNaN.join(',')); process.exit(1); }
+    console.log('ALL Z / CONTRIBUTION FINITE OK  (参与评分 =', r.nScored, ')');
+    const badDir = ids.filter(k => ![1, -1, 0].includes(r.out[k].dir));
+    if (badDir.length) { console.error('非法 dir: ' + badDir.join(',')); process.exit(1); }
   } catch (e) { console.error('score ERROR:', e.stack || e.message); process.exit(1); }
   try { sandbox.renderHeatmap(); console.log('heatmap OK'); } catch (e) { console.error('heatmap ERROR:', e.message); process.exit(1); }
   try {

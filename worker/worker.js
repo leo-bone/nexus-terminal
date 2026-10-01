@@ -1,25 +1,28 @@
 /* =====================================================================
- * NEXUS PROXY — Cloudflare Worker  v3.4
+ * NEXUS PROXY — Cloudflare Worker  v3.5
  * 服务端数据聚合 + 通用代理，带边缘缓存，输出 CORS 友好的 API。
  *
  * 出口:
- *   /api/snapshot  宏观 / 政策 / 通胀 / 大宗 序列（含日期 + 数据源诊断）
+ *   /api/snapshot  宏观 / 政策 / 通胀 / 大宗 / 日元 序列（含日期 + 数据源诊断）
  *   /api/calendar  美国经济日历（非农 / 失业率 / 初请 / PCE / CPI / FOMC）
  *   /api/fetch     白名单代理（浏览器所有外部请求经此，绕 GFW + CORS）
  *   /health        健康检查
  *   /api/probe     数据源可达性诊断
  *
  * 数据源（均为 CF 边缘实测可用）:
- *   Yahoo Finance     指数/汇率/黄金/原油(WTI+布伦特)/农业 日线（主源）
- *   Stooq              同上一组（兜底；2026-10 起 CF 边缘常见 522，故降为备源）
+ *   Yahoo Finance     指数/汇率(含美元日元)/黄金/原油(WTI+布伦特)/农业 日线（主源）
+ *   Stooq              同上一组（兜底；2026-10 起 CF 边缘返回 JS 反爬页，实际已不可用）
  *   NY Fed (markets)   联邦基金有效利率 EFFR（日频，真实政策利率）
  *   U.S. Treasury      名义/实际收益率曲线 → 曲线利差 + 市场隐含通胀预期
+ *   Japan MOF          国债金利情报 CSV → 日本 10 年期国债收益率（日频，1974 至今）
  *   Forex Factory      美国经济日历 JSON（非农 / 失业率 / 初请 / PCE / CPI 的实际·预期·前值）
  *
  * 注 1: 官方月频 CPI/PCE 原始序列（BLS / FRED）从 CF 边缘被 WAF 拦截（403/520，实测）。
  *       通胀维度用两条互补数据：①「10Y 名义 − 10Y 实际」= 市场隐含通胀预期（日频、前瞻）
  *       ②经济日历中的 CPI/PCE 实际发布值（超预期方向）。
  * 注 2: DBnomics 上的 BLS 镜像实测数据只更新到 2025-01（滞后 20 个月），不可用于实时，已弃用。
+ * 注 3: 日本财务省 CSV 为 Shift-JIS，而 Workers 的 TextDecoder 不支持该编码；
+ *       但除表头外的数据行全为 ASCII（日期 R8.8.31 + 数字），故按 UTF-8 读取后只解析数据行。
  * ===================================================================== */
 
 const CORS = {
@@ -41,6 +44,7 @@ const PROXY_ALLOW = [
   'nfs.faireconomy.media',  // 美国经济日历（非农/PCE/CPI/失业率/初请）
   'query1.finance.yahoo.com',
   'query2.finance.yahoo.com',
+  'www.mof.go.jp',          // 日本财务省 国债金利情报（日债利率）
 ];
 
 // 简单序列：按顺序尝试多个源（yahoo 主源 / stooq 兜底）
@@ -53,6 +57,7 @@ const SIMPLE = {
   OIL:   ['yahoo:CL=F',     'stooq:cl.f'],     // WTI 原油
   BRENT: ['yahoo:BZ=F',     'stooq:brn.f'],    // 布伦特原油
   AGRI:  ['yahoo:DBA',      'stooq:dba.us'],   // 农业 ETF
+  USDJPY:['yahoo:JPY=X',    'stooq:usdjpy'],   // 美元/日元（套息交易风向标）
 };
 
 const FF_URL = 'https://nfs.faireconomy.media/ff_calendar_thisweek.json';
@@ -169,6 +174,56 @@ function alignSubtract(aTs, aV, bTs, bV) {
   return { ts, v };
 }
 
+/* ---------- 日本财务省 国债金利情报（JGB 10年） ----------
+ * 文件是 Shift-JIS，但「表头以外的数据行」全部是纯 ASCII（日期形如 R8.8.31 + 数字），
+ * 而 Cloudflare Workers 的 TextDecoder 不支持 shift_jis，所以这里按 UTF-8 读进来后
+ * 只解析 ASCII 数据行，绕开编码问题。
+ * 列顺序固定：種類,1年,2年,3年,4年,5年,6年,7年,8年,9年,10年,15年,20年,25年,30年,40年
+ *  → cells[0]=日期, cells[10]=10年
+ * 日期用日本年号：R(令和)=2018+N, H(平成)=1988+N, S(昭和)=1925+N
+ */
+const JGB_ERA = { R: 2018, H: 1988, S: 1925 };
+const JGB_URL_ALL = 'https://www.mof.go.jp/jgbs/reference/interest_rate/data/jgbcm_all.csv';
+const JGB_URL_MONTH = 'https://www.mof.go.jp/jgbs/reference/interest_rate/jgbcm.csv';
+
+function parseJgbLine(line) {
+  const cells = line.split(',');
+  const m = (cells[0] || '').trim().match(/^([RHS])(\d+)\.(\d+)\.(\d+)$/);
+  if (!m) return null;
+  const y = JGB_ERA[m[1]] + parseInt(m[2], 10);
+  const mo = parseInt(m[3], 10), da = parseInt(m[4], 10);
+  if (!(y > 1970 && mo >= 1 && mo <= 12 && da >= 1 && da <= 31)) return null;
+  const v = parseFloat(cells[10]);
+  if (!isFinite(v) || v <= -10 || v > 30) return null;   // 10年日债收益率合理区间
+  return { t: Date.UTC(y, mo - 1, da), c: v };
+}
+async function fetchJgbCsv(url, cacheTtl) {
+  const key = new Request(url);
+  if (cacheTtl > 0) { const hit = await caches.default.match(key); if (hit) return await hit.text(); }
+  const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NexusTerminal/3.5)' } });
+  if (!r.ok) throw new Error('jgb ' + r.status);
+  const txt = await r.text();
+  if (cacheTtl > 0) await caches.default.put(key, new Response(txt, { headers: { 'Cache-Control': `public, max-age=${cacheTtl}` } }));
+  return txt;
+}
+async function fetchJGB() {
+  const rows = [];
+  const push = txt => txt.split(/\r?\n/).forEach(l => { const p = parseJgbLine(l); if (p) rows.push(p); });
+  // 完整历史大文件（1.2MB）边缘缓存 6 小时；当月小文件（2KB）实时取，取最新几天
+  const [hist, mon] = await Promise.allSettled([
+    fetchJgbCsv(JGB_URL_ALL, 21600),
+    fetchJgbCsv(JGB_URL_MONTH, 0),
+  ]);
+  if (hist.status === 'fulfilled') push(hist.value);
+  if (mon.status === 'fulfilled') push(mon.value);
+  const map = new Map(); rows.forEach(r => map.set(r.t, r.c));
+  const ts = [...map.keys()].sort((a, b) => a - b);
+  if (ts.length < 60) throw new Error('jgb insufficient (' + ts.length + ')');
+  const keep = 900;   // 约 3.5 年日频
+  const kt = ts.slice(-keep);
+  return { ts: kt, closes: kt.map(t => map.get(t)) };
+}
+
 async function loadSimple(key) {
   const list = SIMPLE[key]; let lastErr;
   for (const src of list) {
@@ -205,8 +260,9 @@ async function buildSnapshot() {
     catch (e) { put(k, null); console.warn('simple fail', k, e.message); }
   }));
 
-  const [effr, nom, real] = await Promise.allSettled([fetchEFFR(), fetchTreasuryNominal(), fetchTreasuryReal()]);
+  const [effr, nom, real, jgb] = await Promise.allSettled([fetchEFFR(), fetchTreasuryNominal(), fetchTreasuryReal(), fetchJGB()]);
   if (effr.status === 'fulfilled') put('EFFR', effr.value, 'nyfed'); else { put('EFFR', null); console.warn('effr fail'); }
+  if (jgb.status === 'fulfilled') put('JGB10Y', jgb.value, 'mof'); else { put('JGB10Y', null); console.warn('jgb fail', jgb.reason && jgb.reason.message); }
 
   if (nom.status === 'fulfilled') {
     const n = nom.value;
@@ -228,13 +284,12 @@ async function buildSnapshot() {
 }
 
 const PROBE_URLS = [
-  'https://query1.finance.yahoo.com/v8/finance/chart/DX-Y.NYB?range=1y&interval=1d',
-  'https://query1.finance.yahoo.com/v8/finance/chart/BZ=F?range=1y&interval=1d',
+  'https://query1.finance.yahoo.com/v8/finance/chart/JPY=X?range=1y&interval=1d',
+  'https://www.mof.go.jp/jgbs/reference/interest_rate/jgbcm.csv',
+  'https://www.mof.go.jp/jgbs/reference/interest_rate/data/jgbcm_all.csv',
   'https://nfs.faireconomy.media/ff_calendar_thisweek.json',
-  'https://stooq.com/q/d/l/?s=cl.f&i=d',
   'https://markets.newyorkfed.org/api/rates/unsecured/effr/last/1.json',
-  'https://stablecoins.llama.fi/stablecoins?includePrices=false',
-  'https://api.blockchain.info/charts/n-transactions?timespan=30days&format=json',
+  'https://stooq.com/q/d/l/?s=cl.f&i=d',
 ];
 
 export default {
@@ -249,7 +304,7 @@ export default {
         try {
           const r = await fetch(u, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NexusTerminal/3.4)' } });
           const t = await r.text();
-          out[key] = { status: r.status, len: t.length, head: t.slice(0, 240).replace(/\s+/g, ' ') };
+          out[key] = { status: r.status, len: t.length, head: t.slice(0, 200).replace(/\s+/g, ' '), tail: t.slice(-200).replace(/\s+/g, ' ') };
         } catch (e) { out[key] = { error: String(e.message || e) }; }
       }));
       return jsonResp(out, 200, { 'Cache-Control': 'no-store' });
@@ -262,7 +317,7 @@ export default {
       if (!resp) {
         try {
           const data = await buildSnapshot();
-          resp = jsonResp(data);
+          resp = jsonResp(data, 200, { 'Cache-Control': 'public, max-age=900' });
           const core = ['DXY', 'US10Y', 'GOLD', 'SPX', 'VIX'];
           if (core.every(k => data.macro[k] != null)) await cache.put(cacheKey, resp.clone());
         } catch (e) { resp = jsonResp({ error: e.message }, 502); }
@@ -293,7 +348,7 @@ export default {
     }
 
     if (url.pathname === '/' || url.pathname === '/health') {
-      return jsonResp({ name: 'nexus-proxy', version: '3.4', status: 'ok', source: 'yahoo+stooq+nyfed+treasury+finforexfactory+proxy', symbols: Object.keys(SIMPLE).concat(['EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10']) });
+      return jsonResp({ name: 'nexus-proxy', version: '3.5', status: 'ok', source: 'yahoo+stooq+nyfed+treasury+mof+finforexfactory+proxy', symbols: Object.keys(SIMPLE).concat(['EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'JGB10Y']) });
     }
 
     return new Response('Not Found', { status: 404, headers: CORS });

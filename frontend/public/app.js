@@ -1,5 +1,5 @@
 /* =====================================================================
- * NEXUS TERMINAL v3.4 — 加密货币实时监测与因子关系终端
+ * NEXUS TERMINAL v3.6 — 加密货币实时监测与因子关系终端
  * 纯前端 / 无后端 / 无构建步骤。可直接 file:// 打开，也可部署到 Cloudflare。
  *
  * 数据源（全经 Cloudflare Worker 代理，解决中国大陆无法直连 + 浏览器 CORS）:
@@ -10,8 +10,23 @@
  *   - alternative.me        : 恐惧贪婪指数 (F&G)
  *   - mempool.space         : 比特币全网算力
  *   - Forex Factory         : 美国经济日历（非农 / 失业率 / 初请 / PCE / CPI）
- *   - Cloudflare Worker     : 宏观/政策/通胀/大宗序列 + 经济日历
- *                             (Yahoo/Stooq + NY Fed 利率 + 美财政部 + Forex Factory)
+ *   - Cloudflare Worker     : 宏观/政策/通胀/大宗/日元序列 + 经济日历
+ *                             (Yahoo Finance + NY Fed + 美财政部 + 日本财务省 + Forex Factory)
+ *
+ * v3.6 变更:
+ *   1) 因子新增 dir（方向）字段 —— 修复 Nexus Score「方向混用」：
+ *      原实现把所有因子的原始 z 直接相加，等于把「美元走强 / 美债收益率上行 /
+ *      VIX 抬升 / 通胀超预期」这些利空项当成利多计入，评分方向是乱的。
+ *      现在每个因子显式声明方向（+1 利多 / -1 利空 / 0 仅展示），评分按 dir×z 合成。
+ *   2) 新增 2 个因子：美元/日元（套息交易风向标）、日本 10 年期国债收益率（套息成本）
+ *      —— 2024-08 的全球风险资产暴跌就是日元套息平仓引发的，这条比黄金更贴近加密。
+ *   3) 趋势型序列改「变化率 z」（chgZ）: 黄金 / 标普 / 原油 / 算力 / 美元日元 / 日债
+ *      原先对水位直接做 z-score，单调上行的序列会长期贴顶（z 永远 > 0），失真。
+ *   4) 美联储因子改用美债 2Y（市场对政策路径的定价）替代 EFFR 水平：
+ *      EFFR 是阶梯常数，短窗口内滚动 z 恒为 0，等于空转。
+ *   5) 修复若干真实缺陷：因子网络 requestAnimationFrame 每 60 秒泄漏一个动画循环、
+ *      回测净值图在面板展开前用错误宽度绘制、账户未初始化时点击开仓静默失败、
+ *      宏观快照 9 秒超时过短（冷启动常 10~30 秒）。
  *
  * v3.4 变更:
  *   1) 新增「事件因子」5 个: 非农就业 / 失业率 / 初请失业金 / 核心PCE / CPI(超预期方向)
@@ -125,7 +140,18 @@ function rollZ(a, n = 120) {
   const sd = Math.sqrt(w.reduce((s, v) => s + (v - m) ** 2, 0) / w.length) || 1;
   return (a[a.length - 1] - m) / sd;
 }
+/* 变化率 z：用于长期趋势型序列（黄金/标普/原油/算力/美元日元/日债）
+ * 直接对「水位」做 z-score 会让单调上行的序列长期贴顶（恒 z>0），
+ * 改为对「近 days 期的相对变化」做 z-score —— 衡量"涨/跌得是否异常快"。 */
+function chgZ(a, days = 60, n = 120) {
+  if (!a || a.length < days + 15) return 0;
+  const chg = [];
+  for (let i = days; i < a.length; i++) { const p = a[i - days]; if (p) chg.push((a[i] - p) / Math.abs(p)); }
+  if (chg.length < 15) return 0;
+  return rollZ(chg, n);
+}
 const mZ = (key, n = 120) => (state.macroSeries && state.macroSeries[key]) ? rollZ(state.macroSeries[key], n) : 0;
+const mChgZ = (key, days = 60, n = 120) => (state.macroSeries && state.macroSeries[key]) ? chgZ(state.macroSeries[key], days, n) : 0;
 const mV = key => last(state.macroSeries && state.macroSeries[key]);
 function dailyReturnsMap(ts, vals) {
   const out = new Map(); if (!ts || !vals || ts.length < 5) return out;
@@ -161,21 +187,16 @@ function econFind(re) {
   for (let i = arr.length - 1; i >= 0; i--) if (re.test(arr[i].title)) return arr[i];
   return null;
 }
-/* 事件因子: surprise = 实际 − 预期; 未发布时退化用「预期 − 前值」(半权重) */
+/* 事件因子: surprise = 实际 − 预期（正数=强于预期），
+ * 这里只算「原始 surprise 的标准化值」，方向由因子表的 dir 决定（避免方向被应用两次）。
+ * 未发布时退化为「预期 − 前值」× 0.5 权重。 */
 function econFactor(cfg) {
   const e = econFind(cfg.re);
-  if (!e) return { z: 0, sig: 'neu', note: '本周无发布' };
+  if (!e) return { z: 0, note: '本周无发布' };
   const a = parseEconVal(e.a), f = parseEconVal(e.f), p = parseEconVal(e.p);
-  const sgn = cfg.invert ? -1 : 1;
-  if (a != null && f != null) {
-    const z = clampZ(sgn * (a - f) / cfg.std);
-    return { z, sig: z > 0.6 ? 'over' : z < -0.6 ? 'under' : 'neu', note: `实际 ${e.a} / 预期 ${e.f}` };
-  }
-  if (f != null && p != null) {
-    const z = clampZ(sgn * (f - p) / cfg.std * 0.5);
-    return { z, sig: 'neu', note: `预期 ${e.f}（未发布）` };
-  }
-  return { z: 0, sig: 'neu', note: '待发布' };
+  if (a != null && f != null) return { z: clampZ((a - f) / cfg.std), note: `实际 ${e.a} / 预期 ${e.f}` };
+  if (f != null && p != null) return { z: clampZ((f - p) / cfg.std * 0.5), note: `预期 ${e.f}（未发布·半权重）` };
+  return { z: 0, note: '待发布' };
 }
 
 /* =====================================================================
@@ -268,7 +289,7 @@ async function fetchDeriv() {
 async function fetchMacro() {
   if (!CONFIG.PROXY) { state.macro = null; state.macroSeries = null; state.macroDates = null; return false; }
   try {
-    const d = await getJSON(CONFIG.PROXY + '/api/snapshot');
+    const d = await getJSON(CONFIG.PROXY + '/api/snapshot', 25000);   // 冷启动常需 10~30s，9s 会误判失败
     state.macro = d.macro; state.macroSeries = d.series; state.macroDates = d.dates;
     state.macroPrev = d._prev || null; state.macroSrc = d._src || null; return true;
   } catch (e) { console.warn('macro fail', e); return false; }
@@ -276,7 +297,7 @@ async function fetchMacro() {
 async function fetchEcon() {
   if (!ENDPOINTS.calendar) { state.econ = []; return false; }
   try {
-    const d = await getJSON(ENDPOINTS.calendar, 12000);
+    const d = await getJSON(ENDPOINTS.calendar, 20000);
     state.econ = (d && d.events) || []; state.econTs = d && d.ts;
     return state.econ.length > 0;
   } catch (e) { console.warn('econ fail', e); return false; }
@@ -307,81 +328,101 @@ function buildSeries() {
  *  因子模型（21 维）
  * ===================================================================== */
 const META = {
-  BTC: { name: 'BTC', color: '#00e5a0', group: 'core' },
-  FNG: { name: '恐惧贪婪', color: '#ffc107', group: 'sentiment' },
-  HR: { name: '算力', color: '#b388ff', group: 'onchain' },
-  TX: { name: '链上活跃', color: '#b388ff', group: 'onchain' },
-  OI: { name: '持仓量', color: '#ff9100', group: 'deriv' },
-  LS: { name: '多空比', color: '#ff9100', group: 'deriv' },
-  DXY: { name: '美元指数', color: '#00b4ff', group: 'macro' },
-  US10Y: { name: '美债10Y', color: '#00b4ff', group: 'macro' },
-  GOLD: { name: '黄金', color: '#ffb300', group: 'macro' },
-  SPX: { name: '标普500', color: '#00b4ff', group: 'macro' },
-  VIX: { name: 'VIX恐慌', color: '#ff3d6e', group: 'macro' },
-  OIL: { name: 'WTI原油', color: '#8d6e63', group: 'macro' },
-  BRENT: { name: '布伦特原油', color: '#a1887f', group: 'macro' },
-  AGRI: { name: '农业', color: '#8bc34a', group: 'macro' },
-  EFFR: { name: '联邦利率', color: '#26c6da', group: 'policy' },
-  BEI10: { name: '通胀预期', color: '#ef5350', group: 'policy' },
-  T10Y2Y: { name: '期限利差', color: '#7e57c2', group: 'policy' },
-  STABLE: { name: '稳定币占比', color: '#00e5a0', group: 'market' },
-  FUND: { name: '资金费率', color: '#ff9100', group: 'deriv' },
+  BTC: { s: 'BTC', name: 'BTC', color: '#00e5a0', group: 'core' },
+  FNG: { s: '情绪', name: '恐惧贪婪', color: '#ffc107', group: 'sentiment' },
+  HR: { s: '算力', name: '算力', color: '#b388ff', group: 'onchain' },
+  TX: { s: '链上', name: '链上活跃', color: '#b388ff', group: 'onchain' },
+  OI: { s: '持仓', name: '持仓量', color: '#ff9100', group: 'deriv' },
+  LS: { s: '多空', name: '多空比', color: '#ff9100', group: 'deriv' },
+  DXY: { s: '美元', name: '美元指数', color: '#00b4ff', group: 'macro' },
+  US10Y: { s: '10Y', name: '美债10Y', color: '#00b4ff', group: 'macro' },
+  UST2Y: { s: '2Y', name: '美债2Y', color: '#4fc3f7', group: 'policy' },
+  GOLD: { s: '黄金', name: '黄金', color: '#ffb300', group: 'macro' },
+  SPX: { s: '标普', name: '标普500', color: '#00b4ff', group: 'macro' },
+  VIX: { s: 'VIX', name: 'VIX恐慌', color: '#ff3d6e', group: 'macro' },
+  OIL: { s: 'WTI', name: 'WTI原油', color: '#8d6e63', group: 'macro' },
+  BRENT: { s: '布油', name: '布伦特原油', color: '#a1887f', group: 'macro' },
+  AGRI: { s: '农业', name: '农业', color: '#8bc34a', group: 'macro' },
+  EFFR: { s: 'FFR', name: '联邦利率', color: '#26c6da', group: 'policy' },
+  BEI10: { s: '通胀', name: '通胀预期', color: '#ef5350', group: 'policy' },
+  T10Y2Y: { s: '利差', name: '期限利差', color: '#7e57c2', group: 'policy' },
+  USDJPY: { s: '日元', name: '美元日元', color: '#e57373', group: 'jpy' },
+  JGB10Y: { s: '日债', name: '日债10Y', color: '#f06292', group: 'jpy' },
+  STABLE: { s: '稳定', name: '稳定币占比', color: '#00e5a0', group: 'market' },
+  FUND: { s: '费率', name: '资金费率', color: '#ff9100', group: 'deriv' },
 };
 
+/* ---------------------------------------------------------------------
+ * 因子表（28 项 · 27 项参与评分）
+ *
+ *   dir = 该因子 z 相对加密资产的方向
+ *         +1 → z 越高越「利多」   -1 → z 越高越「利空」   0 → 只展示、不参与评分
+ *   z   = 相对自身历史的标准化偏离
+ *         · 均值回复型（美元/美债/VIX/通胀预期/期限利差/资金费率/多空比/持仓/链上活跃）
+ *           → rollZ（水平滚动 z）
+ *         · 趋势型（黄金/标普/原油/算力/美元日元/日债）→ chgZ（变化率滚动 z）
+ *
+ *   合成: Nexus Score = 50 + 22 × Σ(w · dir · z) / Σw
+ *
+ *   方向取值的依据（可争议的判断，统一取「对加密的短期风险偏好」口径并公开标注）：
+ *     · 拥挤类（资金费率 / 多空比 / 合约持仓 / 恐惧贪婪）→ -1
+ *       多头越拥挤，越容易发生反向挤压，作为反向指标
+ *     · 紧缩与避险类（美元 / 美债收益率 / 日债收益率 / VIX / 通胀预期 / PCE / CPI / 非农）→ -1
+ *     · 风险偏好与基本面扩张类（标普 / 算力 / 链上活跃 / 稳定币 / 期限利差 / 技术面 / 动量）→ +1
+ *     · 日元（美元/日元）→ +1：日元贬值 = 套息交易顺畅 = 风险偏好；
+ *       日元急升 = 套息平仓 = 全球风险资产承压（2024-08 即此机制）
+ *     · 劳动力走弱类（失业率 / 初请失业金）→ +1：就业降温 → 降息预期升温 → 利多
+ *     · 农业 → 0：与加密相关性极弱，仅作通胀侧背景展示
+ * ------------------------------------------------------------------- */
 const FACTORS = [
-  { id: 'fng', name: '😱 市场情绪', group: 'sentiment', w: 1.2, calc: () => { const v = state.fg ? +state.fg.value : 50; return { z: (v - 50) / 18, sig: v > 70 ? 'over' : v < 30 ? 'under' : 'neu', note: `F&G ${v}` }; } },
-  { id: 'fund', name: '💸 资金费率', group: 'deriv', w: 1.0, calc: () => { const f = state.deriv.funding; if (f == null) return { z: 0, sig: 'neu', note: '—' }; return { z: f / 0.05, sig: f > 0.05 ? 'over' : f < -0.02 ? 'under' : 'neu', note: `${f.toFixed(4)}%` }; } },
-  { id: 'ls', name: '⚖️ 多空比', group: 'deriv', w: 0.8, calc: () => { const l = state.deriv.ls; if (l == null) return { z: 0, sig: 'neu', note: '—' }; return { z: (l - 50) / 12, sig: l > 62 ? 'over' : l < 38 ? 'under' : 'neu', note: `${l.toFixed(1)}%多` }; } },
-  { id: 'oi', name: '📊 合约持仓', group: 'deriv', w: 0.7, calc: () => { const s = state.deriv.oiSeries; if (!s || !s.length) return { z: 0, sig: 'neu', note: '—' }; const z = rollZ(s, 96); return { z, sig: z > 1 ? 'over' : z < -1 ? 'under' : 'neu', note: fmtBig(state.deriv.oi) + ' BTC' }; } },
-  { id: 'dom', name: '👑 BTC占比', group: 'market', w: 0.8, calc: () => { const d = state.global ? state.global.market_cap_percentage.btc : 50; return { z: (d - 50) / 8, sig: d > 56 ? 'over' : d < 44 ? 'under' : 'neu', note: `${d.toFixed(1)}%` }; } },
-  { id: 'stable', name: '🏦 稳定币占比', group: 'market', w: 0.7, calc: () => {
-      const st = state.stableMcap, tot = state.global && state.global.total_market_cap.usd;
-      if (!st || !tot) return { z: 0, sig: 'neu', note: '—' };
-      const r = st / tot * 100;
-      return { z: (r - 11) / 3, sig: r > 13 ? 'over' : r < 8 ? 'under' : 'neu', note: `${r.toFixed(1)}%` };
-    } },
-  { id: 'hr', name: '⛏ 算力趋势', group: 'onchain', w: 0.7, calc: () => { const s = state.chainSeries.hashrate; if (!s || !s.length) return { z: 0, sig: 'neu', note: '—' }; const z = rollZ(s, 90); return { z, sig: z > 0.8 ? 'over' : z < -0.8 ? 'under' : 'neu', note: z > 0 ? '升' : '降' }; } },
-  { id: 'tx', name: '🔗 链上活跃', group: 'onchain', w: 0.6, calc: () => { const s = state.chainSeries.n_tx; if (!s || !s.length) return { z: 0, sig: 'neu', note: '—' }; const z = rollZ(s, 90); return { z, sig: z > 0.8 ? 'over' : z < -0.8 ? 'under' : 'neu', note: fmtBig(last(s)) + '笔/日' }; } },
-  { id: 'dxy', name: '🇺🇸 美元指数', group: 'macro', w: 1.0, calc: () => { const v = mV('DXY'); if (v == null) return { z: 0, sig: 'neu', note: CONFIG.PROXY ? '—' : '需Worker' }; const z = mZ('DXY'); return { z, sig: z > 1 ? 'over' : z < -1 ? 'under' : 'neu', note: v.toFixed(1) }; } },
-  { id: 'us10y', name: '🏦 美债10Y', group: 'macro', w: 1.0, calc: () => { const v = mV('US10Y'); if (v == null) return { z: 0, sig: 'neu', note: '—' }; const z = mZ('US10Y'); return { z, sig: z > 1 ? 'over' : z < -1 ? 'under' : 'neu', note: v.toFixed(2) + '%' }; } },
-  { id: 'gold', name: '🥇 黄金', group: 'macro', w: 0.6, calc: () => { const v = mV('GOLD'); if (v == null) return { z: 0, sig: 'neu', note: '—' }; const z = mZ('GOLD'); return { z, sig: z > 1.5 ? 'over' : z < -1.5 ? 'under' : 'neu', note: '$' + v.toFixed(0) }; } },
-  { id: 'spx', name: '📈 标普500', group: 'macro', w: 0.9, calc: () => { const v = mV('SPX'); if (v == null) return { z: 0, sig: 'neu', note: '—' }; const z = mZ('SPX'); return { z, sig: z > 1.5 ? 'over' : z < -1.5 ? 'under' : 'neu', note: v.toFixed(0) }; } },
-  { id: 'vix', name: '😰 VIX恐慌', group: 'macro', w: 0.9, calc: () => { const v = mV('VIX'); if (v == null) return { z: 0, sig: 'neu', note: '—' }; const z = mZ('VIX'); return { z, sig: v > 24 ? 'over' : v < 13 ? 'under' : 'neu', note: v.toFixed(1) }; } },
-  { id: 'fed', name: '🏛 美联储利率', group: 'policy', w: 1.0, calc: () => { const v = mV('EFFR'); if (v == null) return { z: 0, sig: 'neu', note: '—' }; const z = mZ('EFFR', 120); return { z, sig: v >= 4.5 ? 'over' : v <= 2.5 ? 'under' : 'neu', note: v.toFixed(2) + '%' }; } },
-  { id: 'bei', name: '🔥 通胀预期', group: 'policy', w: 0.9, calc: () => { const v = mV('BEI10'); if (v == null) return { z: 0, sig: 'neu', note: '—' }; const z = mZ('BEI10'); return { z, sig: v > 2.6 ? 'over' : v < 1.8 ? 'under' : 'neu', note: v.toFixed(2) + '%' }; } },
-  { id: 'curve', name: '📉 期限利差', group: 'policy', w: 0.8, calc: () => { const v = mV('T10Y2Y'); if (v == null) return { z: 0, sig: 'neu', note: '—' }; const z = mZ('T10Y2Y'); return { z, sig: v < 0 ? 'over' : v > 1.2 ? 'under' : 'neu', note: (v >= 0 ? '+' : '') + v.toFixed(2) }; } },
-  { id: 'oil', name: '🛢 原油(WTI+布伦特)', group: 'macro', w: 0.7, calc: () => {
-      const zs = []; const ws = mV('OIL'), bs = mV('BRENT');
-      if (ws != null) zs.push(mZ('OIL'));
-      if (bs != null) zs.push(mZ('BRENT'));
-      if (!zs.length) return { z: 0, sig: 'neu', note: '—' };
-      const z = zs.reduce((a, b) => a + b, 0) / zs.length;
-      const note = (ws != null ? '$' + ws.toFixed(0) : '—') + (bs != null ? ' / $' + bs.toFixed(0) : '');
-      return { z, sig: z > 1.5 ? 'over' : z < -1.5 ? 'under' : 'neu', note };
-    } },
-  { id: 'agri', name: '🌾 农业指数', group: 'macro', w: 0.4, calc: () => { const v = mV('AGRI'); if (v == null) return { z: 0, sig: 'neu', note: '—' }; const z = mZ('AGRI'); return { z, sig: z > 1.5 ? 'over' : z < -1.5 ? 'under' : 'neu', note: '$' + v.toFixed(2) }; } },
-  { id: 'geo', name: '🌍 地缘风险(代理)', group: 'macro', w: 0.8, calc: () => {
-      const zs = [];
-      ['VIX', 'GOLD', 'OIL'].forEach(k => { const s = state.macroSeries && state.macroSeries[k]; if (s && s.length > 20) zs.push(rollZ(s, 120)); });
-      if (!zs.length) return { z: 0, sig: 'neu', note: '—' };
-      const z = zs.reduce((a, b) => a + b, 0) / zs.length;
-      return { z, sig: z > 1 ? 'over' : z < -1 ? 'under' : 'neu', note: 'VIX+金+油' };
-    } },
-  /* —— 事件因子（美国经济日历 · 超预期方向） —— */
-  { id: 'nfp', name: '👷 非农就业', group: 'event', w: 1.0, calc: () => econFactor({ re: /^Non-Farm Employment Change$/i, std: 60, invert: false }) },
-  { id: 'urate', name: '🧑‍💼 失业率', group: 'event', w: 0.7, calc: () => econFactor({ re: /^Unemployment Rate$/i, std: 0.12, invert: true }) },
-  { id: 'claims', name: '📋 初请失业金', group: 'event', w: 0.5, calc: () => econFactor({ re: /^Unemployment Claims$/i, std: 8, invert: true }) },
-  { id: 'pce', name: '💵 核心PCE', group: 'event', w: 0.6, calc: () => econFactor({ re: /^Core PCE Price Index m\/m$/i, std: 0.08, invert: true }) },
-  { id: 'cpi', name: '🔥 CPI月率', group: 'event', w: 0.5, calc: () => econFactor({ re: /^CPI m\/m$/i, std: 0.12, invert: true }) },
-  { id: 'tech', name: '📐 技术面', group: 'tech', w: 1.1, calc: () => { const k = state.klines['BTC' + state.interval]; if (!k) return { z: 0, sig: 'neu', note: '—' }; const c = k.map(x => x.c); const ema20 = ema(c, 20), ema50 = ema(c, 50); const r = rsi(c); const z = (ema20[ema20.length - 1] - ema50[ema50.length - 1]) / (ema50[ema50.length - 1] || 1) * 30 + (r[r.length - 1] - 50) / 12; return { z, sig: z > 0.6 ? 'over' : z < -0.6 ? 'under' : 'neu', note: `RSI ${r[r.length - 1].toFixed(0)}` }; } },
-  { id: 'mom', name: '🚀 动量', group: 'tech', w: 0.9, calc: () => { const k = state.klines['BTC' + state.interval]; if (!k) return { z: 0, sig: 'neu', note: '—' }; const c = k.map(x => x.c); const z = pctChange(c.slice(-30)) / 8; return { z, sig: z > 1 ? 'over' : z < -1 ? 'under' : 'neu', note: `${(pctChange(c.slice(-30)) || 0).toFixed(1)}%` }; } },
+  /* —— 情绪 / 仓位拥挤（反向指标）—— */
+  { id: 'fng', name: '😱 恐惧贪婪', group: 'sentiment', w: 1.0, dir: -1, calc: () => { const v = state.fg ? +state.fg.value : 50; return { z: (v - 50) / 18, note: 'F&G ' + v + ' · 反向' }; } },
+  { id: 'fund', name: '💸 资金费率', group: 'deriv', w: 0.9, dir: -1, calc: () => { const f = state.deriv.funding; if (f == null) return { z: 0, note: '—' }; return { z: f / 0.03, note: f.toFixed(4) + '% · 反向' }; } },
+  { id: 'ls', name: '⚖️ 多空比', group: 'deriv', w: 0.7, dir: -1, calc: () => { const l = state.deriv.ls; if (l == null) return { z: 0, note: '—' }; return { z: (l - 50) / 10, note: l.toFixed(1) + '%多 · 反向' }; } },
+  { id: 'oi', name: '📊 合约持仓', group: 'deriv', w: 0.6, dir: -1, calc: () => { const a = state.deriv.oiSeries; if (!a || !a.length) return { z: 0, note: '—' }; return { z: rollZ(a, 120), note: fmtBig(state.deriv.oi) + ' BTC' }; } },
+  /* —— 结构 / 流动性 —— */
+  { id: 'dom', name: '👑 BTC占比', group: 'market', w: 0.6, dir: -1, calc: () => { const d = state.global ? state.global.market_cap_percentage.btc : 52; return { z: (d - 52) / 6, note: d.toFixed(1) + '%' }; } },
+  { id: 'stable', name: '🪙 稳定币占比', group: 'market', w: 0.5, dir: 1, calc: () => { const st = state.stableMcap, tot = state.global && state.global.total_market_cap.usd; if (!st || !tot) return { z: 0, note: '—' }; const r = st / tot * 100; return { z: (r - 11) / 3, note: r.toFixed(1) + '% · 场外购买力' }; } },
+  { id: 'hr', name: '⛏ 算力趋势', group: 'onchain', w: 0.6, dir: 1, calc: () => { const a = state.chainSeries.hashrate; if (!a || a.length < 120) return { z: 0, note: '—' }; const z = chgZ(a, 90, 120); return { z, note: '近90日' + (z >= 0 ? '加速' : '放缓') }; } },
+  { id: 'tx', name: '🔗 链上活跃', group: 'onchain', w: 0.5, dir: 1, calc: () => { const a = state.chainSeries.n_tx; if (!a || !a.length) return { z: 0, note: '—' }; return { z: rollZ(a, 90), note: fmtBig(last(a)) + '笔/日' }; } },
+  /* —— 美元 / 风险资产 —— */
+  { id: 'dxy', name: '🇺🇸 美元指数', group: 'macro', w: 1.0, dir: -1, calc: () => { const v = mV('DXY'); if (v == null) return { z: 0, note: CONFIG.PROXY ? '—' : '需Worker' }; return { z: mZ('DXY'), note: v.toFixed(1) }; } },
+  { id: 'us10y', name: '🏦 美债10Y', group: 'macro', w: 1.0, dir: -1, calc: () => { const v = mV('US10Y'); if (v == null) return { z: 0, note: '—' }; return { z: mZ('US10Y'), note: v.toFixed(2) + '%' }; } },
+  { id: 'spx', name: '📈 标普500', group: 'macro', w: 0.9, dir: 1, calc: () => { const v = mV('SPX'); if (v == null) return { z: 0, note: '—' }; return { z: mChgZ('SPX', 60), note: v.toFixed(0) + ' · 60日动能' }; } },
+  { id: 'vix', name: '😰 VIX恐慌', group: 'macro', w: 1.0, dir: -1, calc: () => { const v = mV('VIX'); if (v == null) return { z: 0, note: '—' }; return { z: mZ('VIX'), note: v.toFixed(1) }; } },
+  { id: 'gold', name: '🥇 黄金', group: 'macro', w: 0.5, dir: -1, calc: () => { const v = mV('GOLD'); if (v == null) return { z: 0, note: '—' }; return { z: mChgZ('GOLD', 60), note: '$' + v.toFixed(0) + ' · 避险' }; } },
+  { id: 'oil', name: '🛢 原油', group: 'macro', w: 0.5, dir: -1, calc: () => { const zs = []; const ws = mV('OIL'), bs = mV('BRENT'); if (ws != null) zs.push(mChgZ('OIL', 30)); if (bs != null) zs.push(mChgZ('BRENT', 30)); if (!zs.length) return { z: 0, note: '—' }; const note = (ws != null ? '$' + ws.toFixed(0) : '—') + (bs != null ? ' / $' + bs.toFixed(0) : ''); return { z: zs.reduce((a, b) => a + b, 0) / zs.length, note }; } },
+  { id: 'agri', name: '🌾 农业(展示)', group: 'macro', w: 0, dir: 0, calc: () => { const v = mV('AGRI'); return { z: 0, note: v == null ? '—' : '$' + v.toFixed(2) + ' 不参与评分' }; } },
+  { id: 'geo', name: '🌍 地缘风险(代理)', group: 'macro', w: 0.7, dir: -1, calc: () => { const S = state.macroSeries || {}; const zs = []; if (S.VIX) zs.push(mZ('VIX', 120)); if (S.GOLD) zs.push(mChgZ('GOLD', 60)); if (S.OIL) zs.push(mChgZ('OIL', 30)); if (!zs.length) return { z: 0, note: '—' }; return { z: zs.reduce((a, b) => a + b, 0) / zs.length, note: 'VIX+金+油' }; } },
+  /* —— 政策 / 利率 —— */
+  { id: 'fed', name: '🏛 美联储(2Y)', group: 'policy', w: 1.0, dir: -1, calc: () => { const v = mV('UST2Y'); if (v == null) return { z: 0, note: '—' }; return { z: mZ('UST2Y', 120), note: '2Y ' + v.toFixed(2) + '%' }; } },
+  { id: 'bei', name: '🔥 通胀预期', group: 'policy', w: 0.8, dir: -1, calc: () => { const v = mV('BEI10'); if (v == null) return { z: 0, note: '—' }; return { z: mZ('BEI10'), note: v.toFixed(2) + '%' }; } },
+  { id: 'curve', name: '📉 期限利差', group: 'policy', w: 0.7, dir: 1, calc: () => { const v = mV('T10Y2Y'); if (v == null) return { z: 0, note: '—' }; return { z: mZ('T10Y2Y'), note: (v >= 0 ? '+' : '') + v.toFixed(2) + (v < 0 ? ' 倒挂' : '') }; } },
+  /* —— 日元 / 套息交易 —— */
+  { id: 'jpy', name: '💴 美元/日元', group: 'jpy', w: 1.1, dir: 1, calc: () => { const v = mV('USDJPY'); if (v == null) return { z: 0, note: '—' }; return { z: mChgZ('USDJPY', 60), note: v.toFixed(1) + ' · 套息' }; } },
+  { id: 'jgb', name: '🇯🇵 日债10Y', group: 'jpy', w: 0.9, dir: -1, calc: () => { const v = mV('JGB10Y'); if (v == null) return { z: 0, note: '—' }; return { z: mChgZ('JGB10Y', 90), note: v.toFixed(2) + '% · 套息成本' }; } },
+  /* —— 事件因子（美国经济日历 · 超预期方向）—— */
+  { id: 'nfp', name: '👷 非农就业', group: 'event', w: 0.6, dir: -1, calc: () => econFactor({ re: /^Non-Farm Employment Change$/i, std: 60 }) },
+  { id: 'urate', name: '🧑‍💼 失业率', group: 'event', w: 0.5, dir: 1, calc: () => econFactor({ re: /^Unemployment Rate$/i, std: 0.12 }) },
+  { id: 'claims', name: '📋 初请失业金', group: 'event', w: 0.4, dir: 1, calc: () => econFactor({ re: /^Unemployment Claims$/i, std: 8 }) },
+  { id: 'pce', name: '💵 核心PCE', group: 'event', w: 0.6, dir: -1, calc: () => econFactor({ re: /^Core PCE Price Index m\/m$/i, std: 0.08 }) },
+  { id: 'cpi', name: '🔥 CPI月率', group: 'event', w: 0.5, dir: -1, calc: () => econFactor({ re: /^CPI m\/m$/i, std: 0.12 }) },
+  /* —— 技术面（BTC 自身）—— */
+  { id: 'tech', name: '📐 技术面', group: 'tech', w: 1.0, dir: 1, calc: () => { const k = state.klines['BTC' + state.interval]; if (!k) return { z: 0, note: '—' }; const c = k.map(x => x.c); const e20 = ema(c, 20), e50 = ema(c, 50), r = rsi(c); const z = (e20[e20.length - 1] - e50[e50.length - 1]) / (e50[e50.length - 1] || 1) * 30 + (r[r.length - 1] - 50) / 12; return { z, note: 'RSI ' + r[r.length - 1].toFixed(0) }; } },
+  { id: 'mom', name: '🚀 动量', group: 'tech', w: 0.8, dir: 1, calc: () => { const k = state.klines['BTC' + state.interval]; if (!k) return { z: 0, note: '—' }; const c = k.map(x => x.c); const pc = pctChange(c.slice(-30)) || 0; return { z: pc / 8, note: pc.toFixed(1) + '%' }; } },
 ];
 
 function computeNexusScore() {
-  let sum = 0, wsum = 0; const out = {};
-  FACTORS.forEach(f => { const r = f.calc(); out[f.id] = r; const clamped = Math.max(-2.5, Math.min(2.5, r.z)); sum += clamped * f.w; wsum += f.w; });
-  const score = Math.round(50 + (sum / wsum) * 22);
-  return { score: Math.max(2, Math.min(98, score)), out };
+  let sum = 0, wsum = 0, nScored = 0; const out = {};
+  FACTORS.forEach(f => {
+    const r = f.calc();
+    const z = clampZ(r.z);
+    const contribution = Math.max(-2.5, Math.min(2.5, (f.dir || 0) * z));   // 方向化贡献
+    out[f.id] = { z, contribution, dir: f.dir || 0, note: r.note };
+    if (f.dir) { sum += contribution * f.w; wsum += f.w; nScored++; }
+  });
+  const score = Math.round(50 + (wsum ? sum / wsum : 0) * 22);
+  return { score: Math.max(2, Math.min(98, score)), out, nScored };
 }
 
 /* =====================================================================
@@ -438,21 +479,22 @@ function renderTA() {
  *  因子关系网络 + 相关性热力图（日收益率，日期对齐）
  * ===================================================================== */
 let net = null;
+let netRunning = false;      // 全局唯一动画循环开关（修复每 60 秒泄漏一个 rAF 循环）
 function netKeys() { return Object.keys(state.series).filter(k => META[k] && state.retMaps[k] && state.retMaps[k].size > 20); }
 function initNetwork() {
   const cv = $('netCanvas'); if (!cv) return;
   const W = cv.clientWidth, H = cv.clientHeight;
   const keys = netKeys();
   const nodes = [], edges = [];
-  keys.forEach(id => { const m = META[id]; nodes.push({ id, label: m.name, color: m.color, group: m.group, x: W / 2 + (Math.random() - .5) * 200, y: H / 2 + (Math.random() - .5) * 160, vx: 0, vy: 0, fixed: id === 'BTC' }); });
+  keys.forEach(id => { const m = META[id]; nodes.push({ id, label: m.name, short: m.s, color: m.color, group: m.group, x: W / 2 + (Math.random() - .5) * 200, y: H / 2 + (Math.random() - .5) * 160, vx: 0, vy: 0, fixed: id === 'BTC' }); });
   for (let i = 0; i < keys.length; i++) for (let j = i + 1; j < keys.length; j++) {
     const r = pearsonMaps(state.retMaps[keys[i]], state.retMaps[keys[j]]);
     if (r != null && Math.abs(r) > 0.08) edges.push({ a: keys[i], b: keys[j], r });
   }
-  net = { cv, ctx: cv.getContext('2d'), nodes, edges, W, H };
+  net = { cv, ctx: cv.getContext('2d'), nodes, edges, W, H, idle: 0 };
   const btc = nodes.find(n => n.id === 'BTC'); if (btc) { btc.x = W / 2; btc.y = H / 2; btc.fixed = true; }
   $('netCount') && ($('netCount').textContent = `${nodes.length} 因子 / ${edges.length} 关系 · 日收益相关性`);
-  animateNetwork();
+  if (!netRunning) { netRunning = true; animateNetwork(); }   // 只允许一个循环
 }
 function animateNetwork() {
   if (!net) return; const { cv, ctx, nodes, edges, W, H } = net;
@@ -466,15 +508,19 @@ function animateNetwork() {
     edges.forEach(e => { const a = nodes.find(n => n.id === e.a), b = nodes.find(n => n.id === e.b); if (!a || !b) return; const dx = b.x - a.x, dy = b.y - a.y, d = Math.sqrt(dx * dx + dy * dy) || 1, f = (d - 90) * 0.01; a.vx += dx / d * f; a.vy += dy / d * f; b.vx -= dx / d * f; b.vy -= dy / d * f; });
   }
   edges.forEach(e => { const a = nodes.find(n => n.id === e.a), b = nodes.find(n => n.id === e.b); if (!a || !b) return; const col = e.r > 0 ? `rgba(0,229,160,${Math.min(.7, Math.abs(e.r))})` : `rgba(255,61,110,${Math.min(.7, Math.abs(e.r))})`; ctx.strokeStyle = col; ctx.lineWidth = 1 + Math.abs(e.r) * 3; ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke(); });
-  nodes.forEach(n => { const r = n.id === 'BTC' ? 16 : 9; ctx.fillStyle = n.color; ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, 7); ctx.fill(); ctx.fillStyle = '#060c18'; ctx.font = 'bold 9px JetBrains Mono, monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(n.id === 'BTC' ? 'BTC' : n.label.slice(0, 3), n.x, n.y); if (n.id !== 'BTC') { ctx.fillStyle = '#a8bfd6'; ctx.font = '8px Inter, sans-serif'; ctx.fillText(n.label, n.x, n.y + r + 9); } });
+  nodes.forEach(n => { const r = n.id === 'BTC' ? 16 : 9; ctx.fillStyle = n.color; ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, 7); ctx.fill(); ctx.fillStyle = '#060c18'; ctx.font = 'bold 9px JetBrains Mono, monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(n.id === 'BTC' ? 'BTC' : (n.short || n.label.slice(0, 3)), n.x, n.y); if (n.id !== 'BTC') { ctx.fillStyle = '#a8bfd6'; ctx.font = '8px Inter, sans-serif'; ctx.fillText(n.label, n.x, n.y + r + 9); } });
+  // 力导向收敛后停帧省电（刷新/缩放时会重新启动）
+  const ke = nodes.reduce((a, n) => a + Math.abs(n.vx) + Math.abs(n.vy), 0);
+  net.idle = ke < 0.06 ? net.idle + 1 : 0;
+  if (net.idle > 90) { netRunning = false; return; }
   requestAnimationFrame(animateNetwork);
 }
 function renderHeatmap() {
   const box = $('heatmap'); if (!box) return; const ids = netKeys();
   box.style.gridTemplateColumns = `64px repeat(${ids.length}, 1fr)`;
-  let html = '<div class="hm-h"></div>' + ids.map(id => `<div class="hm-h">${META[id].name.slice(0, 4)}</div>`).join('');
+  let html = '<div class="hm-h"></div>' + ids.map(id => `<div class="hm-h" title="${META[id].name}">${META[id].s || META[id].name.slice(0, 2)}</div>`).join('');
   ids.forEach(ri => {
-    html += `<div class="hm-h" style="text-align:left">${META[ri].name}</div>`;
+    html += `<div class="hm-h" style="text-align:left" title="${META[ri].name}">${META[ri].s || META[ri].name.slice(0, 2)}</div>`;
     ids.forEach(ci => { const r = ri === ci ? 1 : pearsonMaps(state.retMaps[ri], state.retMaps[ci]); const bg = r == null ? '#132035' : r > 0 ? `rgba(0,229,160,${Math.abs(r) * .8})` : `rgba(255,61,110,${Math.abs(r) * .8})`; html += `<div class="hm-cell" style="background:${bg};color:${Math.abs(r || 0) > .5 ? '#060c18' : '#a8bfd6'}">${r == null ? '·' : r.toFixed(2)}</div>`; });
   });
   box.innerHTML = html;
@@ -640,11 +686,13 @@ async function renderBacktest() {
       scope.textContent = `${coin}/USDT · ${interval} · ${label} · ${r.bars} 根 · 手续费 ${feeBps}bps`;
     }
 
+    res && res.classList.add('show');   // 必须先展开，否则 clientWidth=0 会以 320px 绘制再被拉伸
     const cv = $('btCanvas');
     if (cv) {
+      const dpr = window.devicePixelRatio || 1;
       const W = cv.clientWidth || 320, H = cv.clientHeight || 120;
-      cv.width = W; cv.height = H;
-      const ctx = cv.getContext('2d'); ctx.clearRect(0, 0, W, H);
+      cv.width = W * dpr; cv.height = H * dpr;
+      const ctx = cv.getContext('2d'); ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, W, H);
       const all = r.eq.concat(r.bh);
       const mn = Math.min(...all), mx = Math.max(...all), sp = (mx - mn) || 1, n = r.eq.length;
       const X = i => n > 1 ? i / (n - 1) * W : 0, Y = v => H - (v - mn) / sp * H;
@@ -667,7 +715,6 @@ async function renderBacktest() {
           : '<div class="tr">本次参数没有触发任何完整交易，可放宽参数或换周期</div>');
     }
     if (msg) { msg.className = 'bt-msg ok'; msg.textContent = `已回测 ${r.bars} 根 ${interval} K 线（${fmtDate(k[0].t)} ~ ${fmtDate(k[k.length - 1].t)}），共 ${r.tradeCount} 笔已平仓交易，累计手续费 ${r.fees.toFixed(2)}`; }
-    res && res.classList.add('show');
   } catch (e) {
     if (msg) { msg.className = 'bt-msg err'; msg.textContent = '回测失败：' + ((e && e.message) || '数据源不可用，请稍后重试'); }
   } finally { btRunning = false; }
@@ -816,8 +863,9 @@ function renderFG() {
 const MACRO_CARDS = [
   ['DXY', '美元指数 DXY', 2, ''], ['US10Y', '美债10Y', 2, '%'], ['GOLD', '黄金 (USD)', 0, ''],
   ['SPX', '标普500', 0, ''], ['VIX', 'VIX 恐慌', 1, ''], ['OIL', 'WTI 原油', 2, ''], ['BRENT', '布伦特原油', 2, ''],
-  ['AGRI', '农业 ETF', 2, ''], ['EFFR', '联邦基金利率', 2, '%'], ['BEI10', '通胀预期(隐含)', 2, '%'],
-  ['T10Y2Y', '10Y-2Y 利差', 2, ''],
+  ['AGRI', '农业 ETF', 2, ''], ['EFFR', '联邦基金利率', 2, '%'], ['UST2Y', '美债 2Y', 2, '%'],
+  ['BEI10', '通胀预期(隐含)', 2, '%'], ['T10Y2Y', '10Y-2Y 利差', 2, ''],
+  ['USDJPY', '美元/日元', 2, ''], ['JGB10Y', '日债 10Y', 2, '%'],
 ];
 function renderMacro() {
   const box = $('macroGrid'); const hint = $('macroHint');
@@ -845,7 +893,8 @@ function macroSrcText() {
   const s = state.macroSrc; if (!s) return '';
   const vals = Object.values(s);
   const ny = vals.filter(v => /^yahoo/.test(v)).length, ns = vals.filter(v => /^stooq/.test(v)).length;
-  return `数据源: Yahoo Finance ${ny} 项` + (ns ? ` · Stooq ${ns} 项` : ' · Stooq 不可用(已由 Yahoo 兜底)') + ' · NY Fed · 美财政部';
+  const nm = vals.filter(v => /^mof$/.test(v)).length;
+  return `数据源: Yahoo Finance ${ny} 项` + (ns ? ` · Stooq ${ns} 项` : ' · Stooq 不可用(已由 Yahoo 兜底)') + ' · NY Fed' + (nm ? ' · 日本财务省' : '') + ' · 美财政部';
 }
 function renderEcon() {
   const box = $('econList'); if (!box) return;
@@ -885,13 +934,25 @@ function renderDeriv() {
   const fb = $('dv_fund'); if (fb && d.funding != null) fb.style.color = d.funding > 0.03 ? '#ff3d6e' : d.funding < -0.02 ? '#00e5a0' : '#a8bfd6';
 }
 function renderFactors() {
-  const { score, out } = computeNexusScore();
+  const { score, out, nScored } = computeNexusScore();
   const ring = $('nxRing'); if (ring) { ring.setAttribute('stroke-dasharray', `${score * 2.51} 251`); ring.setAttribute('stroke', score > 60 ? '#00e5a0' : score < 40 ? '#ff3d6e' : '#ffc107'); }
   if ($('nxScore')) $('nxScore').textContent = score;
   if ($('nxSig')) { const s = score > 60 ? '偏多' : score < 40 ? '偏空' : '中性'; $('nxSig').textContent = s; $('nxSig').className = 'fscore-l ' + (score > 60 ? 'up' : score < 40 ? 'dn' : 'n'); }
   const box = $('factorGrid'); if (!box) return; box.innerHTML = '';
-  FACTORS.forEach(f => { const r = out[f.id]; const clamped = Math.max(-2.5, Math.min(2.5, r.z)); const col = r.sig === 'over' ? '#ff3d6e' : r.sig === 'under' ? '#00e5a0' : '#ffc107'; const card = document.createElement('div'); card.className = 'fcard'; card.title = `${f.name} (权重 ${f.w})`; card.innerHTML = `<div class="fc-name">${f.name}</div><div class="fc-z" style="color:${col}">${clamped >= 0 ? '+' : ''}${clamped.toFixed(1)}</div><div class="fc-str"><div class="fc-strbar" style="width:${Math.min(100, Math.abs(clamped) / 2.5 * 100)}%;background:${col}"></div></div><div class="fc-sig" style="color:${col}">${r.note}</div>`; box.appendChild(card); });
-  const cnt = $('fCount'); if (cnt) cnt.textContent = FACTORS.length + ' 维';
+  FACTORS.forEach(f => {
+    const r = out[f.id];
+    const c = r.contribution;                       // dir × z：正=利多、负=利空
+    const show = f.dir === 0;
+    const col = show ? '#3a5070' : c > 0.25 ? '#00e5a0' : c < -0.25 ? '#ff3d6e' : '#ffc107';
+    const tag = show ? '仅展示' : c > 0.25 ? '利多' : c < -0.25 ? '利空' : '中性';
+    const dirTxt = f.dir > 0 ? 'z↑=利多' : f.dir < 0 ? 'z↑=利空' : '不参与评分';
+    const card = document.createElement('div');
+    card.className = 'fcard';
+    card.title = `${f.name}\n权重 ${f.w} · 方向 ${f.dir > 0 ? '+1' : f.dir < 0 ? '-1' : '0'}（${dirTxt}）\n原始 z ${r.z.toFixed(2)} · 贡献 ${c.toFixed(2)}\n${r.note}`;
+    card.innerHTML = `<div class="fc-name">${f.name}</div><div class="fc-z" style="color:${col}">${show ? '—' : (c >= 0 ? '+' : '') + c.toFixed(1)}</div><div class="fc-str"><div class="fc-strbar" style="width:${Math.min(100, Math.abs(c) / 2.5 * 100)}%;background:${col}"></div></div><div class="fc-sig" style="color:${col}">${tag} · ${r.note}</div>`;
+    box.appendChild(card);
+  });
+  const cnt = $('fCount'); if (cnt) cnt.textContent = FACTORS.length + ' 维 · ' + nScored + ' 参与评分';
 }
 function renderStatus(ok) {
   const dot = $('netDot'); if (dot) { dot.className = 'net-dot ' + (ok ? 'ok' : ''); }
@@ -917,6 +978,7 @@ async function refreshAll() {
  *  UI 事件
  * ===================================================================== */
 function bindUI() {
+  if (!state.acct) state.acct = loadAcct();   // 未初始化就点开仓会静默失败，这里提前加载
   document.querySelectorAll('.ibtn').forEach(b => b.addEventListener('click', () => { document.querySelectorAll('.ibtn').forEach(x => x.classList.remove('active')); b.classList.add('active'); state.interval = b.dataset.i; fetchKlines('BTC', b.dataset.i).then(() => { renderChart(); renderTA(); renderFactors(); }); }));
   const cv = $('mainCanvas');
   if (cv) cv.addEventListener('mousemove', e => { const rect = cv.getBoundingClientRect(); const k = state.klines['BTC' + state.interval]; if (!k) return; const i = Math.round((e.clientX - rect.left) / (rect.width) * (k.length - 1)); chartState.hover = Math.max(0, Math.min(k.length - 1, i)); renderChart(); });
@@ -943,5 +1005,8 @@ window.addEventListener('load', async () => {
   bindUI();
   await refreshAll();
   setInterval(refreshAll, CONFIG.REFRESH_MS);
-  window.addEventListener('resize', () => { renderChart(); net && (net.W = $('netCanvas').clientWidth, net.H = $('netCanvas').clientHeight); });
+  window.addEventListener('resize', () => {
+    renderChart();
+    if (net) { net.W = $('netCanvas').clientWidth; net.H = $('netCanvas').clientHeight; net.idle = 0; if (!netRunning) { netRunning = true; animateNetwork(); } }
+  });
 });
