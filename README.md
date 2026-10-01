@@ -2,7 +2,7 @@
 
 加密货币 **实时监测 + 因子关系终端**。纯前端单页应用，无后端、无构建步骤。整站托管在 **Cloudflare**（前端 Workers Assets + 数据代理 Worker），并绑定自定义域名。
 
-> **数据源全部经 Cloudflare Worker 代理**：浏览器只与 `nexus-api.uichain.org` 通信，由 Worker 从边缘节点抓取真实 API 并加 CORS 头。这样解决两件事——① 中国大陆无法直连 Binance/CoinGecko 等（Binance 在中国被封禁）；② 浏览器跨域（CORS）。**已实测从 Cloudflare 边缘可稳定拉取** Bybit / CoinPaprika / DefiLlama / blockchain.info / alternative.me / mempool.space / **Yahoo Finance** / NY Fed / U.S. Treasury / **Japan MOF（日本财务省）** / **Forex Factory**（Stooq 自 2026-10 起已实际失效，仅留作兜底）。
+> **数据源全部经 Cloudflare Worker 代理**：浏览器只与 `nexus-api.uichain.org` 通信，由 Worker 从边缘节点抓取真实 API 并加 CORS 头。这样解决两件事——① 中国大陆无法直连 Binance/CoinGecko 等（Binance 在中国被封禁）；② 浏览器跨域（CORS）。**已实测从 Cloudflare 边缘可稳定拉取** Bybit / CoinPaprika / DefiLlama / blockchain.info / alternative.me / mempool.space / **Yahoo Finance** / NY Fed / U.S. Treasury / **Japan MOF（日本财务省）** / **Forex Factory**（Stooq 自 2026-10 起已实际失效，仅留作兜底）。Forex Factory 的 nfs CDN **会限流（429）**，故 `/api/calendar` 采用「成功长缓存 + 失败退避 + 陈旧兜底 + XML 降级」（详见 v3.6）。
 
 > 部署形态：**纯 Cloudflare 单一出口**——前端（Workers Assets）+ 数据代理 Worker，均经 `workers_routes` 自动绑定到 `uichain.org`，无需手动配置 DNS。GitHub 仅作为**源码仓库**，不再对外提供 Pages 站点。
 >
@@ -81,6 +81,7 @@ EFFR 是**阶梯常数**（调息后几个月不动），120 日滚动 z 恒为 
 | **模拟盘静默失败** | 账户是懒加载的，若在首轮刷新完成前点「开仓」，`state.acct` 为 null 会**静默 return**（无任何提示）。现改为 `bindUI()` 阶段就初始化账户。 |
 | **宏观快照超时过短** | 客户端拉 `/api/snapshot` 的超时只有 9 秒，而该端点冷启动（聚合 15 条序列 + 1.2MB 日本国债历史文件）常需 10~30 秒 → 偶发静默失败、宏观全部显示「—」。现提到 25 秒（经济日历 20 秒），并把快照边缘缓存延长到 15 分钟。 |
 | **热力图列头重名** | 20 个节点下，`US10Y / UST2Y / USDJPY` 截断后都是 `US`。现在为每个因子配了唯一短标签（`10Y / 2Y / 日元`）并加 `title` 提示。 |
+| **经济日历被限流后「锁死」** | Forex Factory 的 nfs CDN 对高频请求返回 **429（Rate Limited 的 HTML 页）**。原实现只在成功时缓存 15 分钟、失败即返回 502，一旦被限流就会**每次请求都再去打 FF** → 持续 429，5 个事件因子全部落中性（实测复现）。现改为「成功缓存 6 小时 + **失败退避 30 分钟**（退避期内直接吃缓存）+ **陈旧兜底**（失败返回上一份可用数据而非 502）+ **XML 端点自动降级**」，并在响应头暴露 `X-Calendar-Source: live / edge-cache / stale`。 |
 
 ### 6) 日元数据源是怎么找到的（实测记录）
 
@@ -243,7 +244,7 @@ wrangler deploy          # nexus-api.uichain.org 自动绑定
 `worker/worker.js` 暴露：
 
 - `/api/snapshot` —— 宏观/政策/通胀/大宗/**日元**序列（DXY·US10Y·GOLD·SPX·VIX·OIL·BRENT·AGRI·**USDJPY**·EFFR·UST2Y·T10Y2Y·REAL10Y·BEI10·**JGB10Y**，含日期 + `_src` 数据源诊断），Yahoo 主源 / Stooq 兜底 + NY Fed + 美财政部 + 日本财务省；边缘缓存 15 分钟
-- `/api/calendar` —— 美国经济日历（本周 USD 事件，含非农/失业率/初请/PCE/CPI 的实际·预期·前值），15 分钟边缘缓存
+- `/api/calendar` —— 美国经济日历（本周 USD 事件，含非农/失业率/初请/PCE/CPI 的实际·预期·前值）。成功结果边缘缓存 **6 小时**，距上次尝试不足 **30 分钟**则不再打 FF（退避），失败时返回**陈旧缓存**而非报错，并对 **XML 端点**自动降级；响应头 `X-Calendar-Source` 标明 `live / edge-cache / stale`
 - `/api/fetch?url=<encoded>` —— 通用代理（白名单：Bybit / CoinPaprika / CoinGecko / alternative.me / mempool.space / DefiLlama / blockchain.info / Forex Factory / Yahoo Finance / **Japan MOF**），带 CORS 头；限流源做 10 分钟边缘缓存
 - `/api/probe` —— 数据源可达性诊断（临时调试）
 

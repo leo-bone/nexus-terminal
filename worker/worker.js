@@ -1,5 +1,5 @@
 /* =====================================================================
- * NEXUS PROXY — Cloudflare Worker  v3.5
+ * NEXUS PROXY — Cloudflare Worker  v3.6
  * 服务端数据聚合 + 通用代理，带边缘缓存，输出 CORS 友好的 API。
  *
  * 出口:
@@ -23,6 +23,9 @@
  * 注 2: DBnomics 上的 BLS 镜像实测数据只更新到 2025-01（滞后 20 个月），不可用于实时，已弃用。
  * 注 3: 日本财务省 CSV 为 Shift-JIS，而 Workers 的 TextDecoder 不支持该编码；
  *       但除表头外的数据行全为 ASCII（日期 R8.8.31 + 数字），故按 UTF-8 读取后只解析数据行。
+ * 注 4: Forex Factory 的 nfs CDN 会对高频请求返回 429（Rate Limited HTML 页）。
+ *       /api/calendar 采用「成功长缓存 6h + 失败退避 30min + 陈旧兜底」，并对 XML 端点做自动降级，
+ *       避免被限流后持续重试导致「锁死」。
  * ===================================================================== */
 
 const CORS = {
@@ -59,8 +62,6 @@ const SIMPLE = {
   AGRI:  ['yahoo:DBA',      'stooq:dba.us'],   // 农业 ETF
   USDJPY:['yahoo:JPY=X',    'stooq:usdjpy'],   // 美元/日元（套息交易风向标）
 };
-
-const FF_URL = 'https://nfs.faireconomy.media/ff_calendar_thisweek.json';
 
 function jsonResp(obj, status = 200, extra = {}) {
   return new Response(JSON.stringify(obj), { status, headers: { ...CORS, 'Content-Type': 'application/json', ...extra } });
@@ -236,16 +237,82 @@ async function loadSimple(key) {
   throw lastErr || new Error('all sources failed ' + key);
 }
 
-/* ---------- 美国经济日历（Forex Factory 周历 JSON） ---------- */
+/* ---------- 美国经济日历（Forex Factory 周历）----------
+ * 坑：FF 的 nfs CDN 会对高频请求返回 429（Rate Limited 的 HTML 页）。
+ * 原实现只在成功时缓存 15 分钟，一旦被限流就每次请求都再去打 FF → 持续 429「锁死」。
+ * 现在改为「成功长缓存 + 失败退避 + 陈旧兜底」：
+ *   - 成功结果缓存 6 小时
+ *   - 任何一次尝试（无论成败）记录时间戳；距上次尝试 < CAL_MIN_RETRY 秒则直接吃缓存，不再打 FF
+ *   - 打 FF 失败时，若存在陈旧缓存则返回陈旧数据（标注 X-Calendar-Source: stale），而非 502
+ */
+const CAL_URLS = [
+  'https://nfs.faireconomy.media/ff_calendar_thisweek.json',
+  'https://nfs.faireconomy.media/ff_calendar_thisweek.xml',
+];
+const CAL_DATA_KEY = 'https://nexus-cache.internal/calendar-v1';
+const CAL_META_KEY = 'https://nexus-cache.internal/calendar-meta-v1';
+const CAL_TTL = 21600;        // 成功结果在缓存里保留 6 小时
+const CAL_MIN_RETRY = 1800;   // 距上次尝试不足 30 分钟 → 不再打 FF（退避）
+
+/* 把 FF 的 XML 日历也解析成同一结构（JSON 端点 429 时的备用出口） */
+function parseFfXml(text) {
+  const out = [];
+  const blocks = text.split(/<event>/i).slice(1);
+  const get = (b, tag) => { const m = b.match(new RegExp('<' + tag + '>([\\s\\S]*?)</' + tag + '>', 'i')); return m ? m[1].replace(/<!\[CDATA\[|\]\]>/g, '').trim() : ''; };
+  blocks.forEach(b => {
+    const country = get(b, 'country');
+    const title = get(b, 'title');
+    if (country !== 'USD' || !title) return;
+    out.push({ t: get(b, 'date'), title, impact: get(b, 'impact'), f: get(b, 'forecast'), p: get(b, 'previous'), a: get(b, 'actual') });
+  });
+  return out.sort((a, b) => Date.parse(a.t) - Date.parse(b.t));
+}
+
 async function fetchCalendar() {
-  const r = await fetch(FF_URL, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NexusTerminal/3.4)', 'Accept': 'application/json' } });
-  if (!r.ok) throw new Error('ff ' + r.status);
-  const arr = await r.json();
-  if (!Array.isArray(arr)) throw new Error('ff shape');
-  return arr
-    .filter(e => e && e.country === 'USD' && e.title)
-    .map(e => ({ t: e.date, title: e.title, impact: e.impact || '', f: e.forecast || '', p: e.previous || '', a: e.actual || '' }))
-    .sort((a, b) => Date.parse(a.t) - Date.parse(b.t));
+  let lastErr;
+  for (const url of CAL_URLS) {
+    try {
+      const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36', 'Accept': 'application/json, text/xml, */*' } });
+      if (!r.ok) throw new Error('ff ' + r.status);
+      const text = await r.text();
+      if (text.trim().startsWith('{') || text.trim().startsWith('[')) {
+        const arr = JSON.parse(text);
+        if (!Array.isArray(arr)) throw new Error('ff shape');
+        const ev = arr.filter(e => e && e.country === 'USD' && e.title)
+          .map(e => ({ t: e.date, title: e.title, impact: e.impact || '', f: e.forecast || '', p: e.previous || '', a: e.actual || '' }))
+          .sort((a, b) => Date.parse(a.t) - Date.parse(b.t));
+        if (!ev.length) throw new Error('ff empty');
+        return ev;
+      }
+      const ev = parseFfXml(text);
+      if (!ev.length) throw new Error('ff xml empty');
+      return ev;
+    } catch (e) { lastErr = e; console.warn('calendar src fail', url.slice(-28), e.message); }
+  }
+  throw lastErr || new Error('calendar all sources failed');
+}
+
+async function calendarWithFallback() {
+  const cache = caches.default;
+  const dataKey = new Request(CAL_DATA_KEY), metaKey = new Request(CAL_META_KEY);
+  const [hit, meta] = await Promise.all([cache.match(dataKey), cache.match(metaKey)]);
+  let lastTry = 0;
+  if (meta) { try { lastTry = (await meta.json()).t || 0; } catch (e) { } }
+  const ageSec = (Date.now() - lastTry) / 1000;
+  const wrap = (body, src) => new Response(body, { status: 200, headers: { ...CORS, 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=900', 'X-Calendar-Source': src } });
+
+  if (hit && ageSec < CAL_MIN_RETRY) return wrap(await hit.text(), 'edge-cache');
+  try {
+    const events = await fetchCalendar();
+    const payload = JSON.stringify({ events, ts: Date.now() });
+    await cache.put(dataKey, new Response(payload, { headers: { 'Cache-Control': `public, max-age=${CAL_TTL}` } }));
+    await cache.put(metaKey, new Response(JSON.stringify({ t: Date.now(), ok: true }), { headers: { 'Cache-Control': `public, max-age=${CAL_TTL}` } }));
+    return wrap(payload, 'live');
+  } catch (e) {
+    await cache.put(metaKey, new Response(JSON.stringify({ t: Date.now(), ok: false, err: String(e.message || e) }), { headers: { 'Cache-Control': `public, max-age=${CAL_MIN_RETRY}` } }));
+    if (hit) return wrap(await hit.text(), 'stale');
+    return jsonResp({ error: e.message, events: [], ts: Date.now() }, 502);
+  }
 }
 
 async function buildSnapshot() {
@@ -284,12 +351,14 @@ async function buildSnapshot() {
 }
 
 const PROBE_URLS = [
+  // —— 经济日历备用源（FF JSON 会 429 限流）——
+  'https://nfs.faireconomy.media/ff_calendar_thisweek.json',
+  'https://nfs.faireconomy.media/ff_calendar_thisweek.xml',
+  'https://nfs.faireconomy.media/ff_calendar_nextweek.json',
+  'https://www.forexfactory.com/calendar?week=this',
+  // —— 对照 ——
   'https://query1.finance.yahoo.com/v8/finance/chart/JPY=X?range=1y&interval=1d',
   'https://www.mof.go.jp/jgbs/reference/interest_rate/jgbcm.csv',
-  'https://www.mof.go.jp/jgbs/reference/interest_rate/data/jgbcm_all.csv',
-  'https://nfs.faireconomy.media/ff_calendar_thisweek.json',
-  'https://markets.newyorkfed.org/api/rates/unsecured/effr/last/1.json',
-  'https://stooq.com/q/d/l/?s=cl.f&i=d',
 ];
 
 export default {
@@ -326,17 +395,8 @@ export default {
     }
 
     if (url.pathname === '/api/calendar') {
-      const cache = caches.default;
-      const cacheKey = new Request(url.toString(), request);
-      let resp = await cache.match(cacheKey);
-      if (!resp) {
-        try {
-          const events = await fetchCalendar();
-          resp = jsonResp({ events, ts: Date.now() }, 200, { 'Cache-Control': 'public, max-age=900' });
-          if (events.length) await cache.put(cacheKey, resp.clone());
-        } catch (e) { resp = jsonResp({ error: e.message, events: [] }, 502); }
-      }
-      return resp;
+      try { return await calendarWithFallback(); }
+      catch (e) { return jsonResp({ error: e.message, events: [], ts: Date.now() }, 502); }
     }
 
     if (url.pathname === '/api/fetch') {
@@ -348,7 +408,7 @@ export default {
     }
 
     if (url.pathname === '/' || url.pathname === '/health') {
-      return jsonResp({ name: 'nexus-proxy', version: '3.5', status: 'ok', source: 'yahoo+stooq+nyfed+treasury+mof+finforexfactory+proxy', symbols: Object.keys(SIMPLE).concat(['EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'JGB10Y']) });
+      return jsonResp({ name: 'nexus-proxy', version: '3.6', status: 'ok', source: 'yahoo+stooq+nyfed+treasury+mof+finforexfactory+proxy', symbols: Object.keys(SIMPLE).concat(['EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'JGB10Y']) });
     }
 
     return new Response('Not Found', { status: 404, headers: CORS });
