@@ -50,6 +50,9 @@ const PROXY_ALLOW = [
   'query1.finance.yahoo.com',
   'query2.finance.yahoo.com',
   'www.mof.go.jp',          // 日本财务省 国债金利情报（日债利率）
+  'bitcoin-data.com',       // BGeometrics 免费 BTC 链上指标 API（MVRV/活跃地址，无 key，免费档 8 次/小时）
+  'fapi.binance.com',       // Binance USDT 本位永续历史（资金费率/持仓量/多空比，供 /api/history 用）
+  'futures-data.binance.com', // Binance 衍生品统计备用域
 ];
 
 // 简单序列：按顺序尝试多个源（yahoo 主源 / stooq 兜底）
@@ -428,14 +431,117 @@ const HIST_TTL = 3600;          // 成功缓存 1 小时
 const HIST_MIN_RETRY = 900;     // 失败退避 15 分钟
 /* 注意：改动本端点的「负载结构或语义」时必须同步提升 vN，否则会被上一次的
  * 边缘缓存挡住，表现为「改了代码但线上数据没变」（实测踩过）。 */
-const HIST_DATA_KEY = 'https://nexus-cache.internal/history-v4';
-const HIST_META_KEY = 'https://nexus-cache.internal/history-meta-v4';
+const HIST_DATA_KEY = 'https://nexus-cache.internal/history-v7';
+const HIST_META_KEY = 'https://nexus-cache.internal/history-meta-v7';
 
 const trimS = (s, n = HIST_KEEP) => {
   if (!s || !s.ts || !s.ts.length) return null;
   const k = s.ts.length > n ? s.ts.length - n : 0;
   return { ts: s.ts.slice(k), closes: s.closes.slice(k) };
 };
+
+/* ---------- v3.10: 本质输入 —— 链上估值/使用量/需求 + 衍生品结构 ----------
+ * v3.9 的样本外验证证明：调 17 个宏观序列的权重是死路，要换更本质的输入。
+ * 新增 5 条有历史深度的序列（全部免费、无需 key、CF 边缘实测可达）：
+ *   MRV  MVRV  市值/实现市值 —— bitcoin-data.com（BGeometrics）免费 API，
+ *        数据滞后约 1 周，免费档限 8 次/小时，每次构建只打 2 个请求
+ *   ADR  活跃地址 —— 同上（滞后约 1 天）
+ *   FEE  链上手续费 USD —— blockchain.info charts transaction-fees-usd
+ *        （CoinMetrics 社区 API 已下线 404，GitHub CSV 已冻结 4 个月，全部弃用）
+ *   PREM 永续溢价指数日频 —— Bybit premium-index-price-kline，1000 天深；
+ *        history-funding-rate 从 CF 出口实测超时，弃用
+ *   OIH  永续持仓量日频 —— Bybit open-interest，**intervalTime 必须用 1d
+ *        （用 D 会静默返回空列表，实测踩过）**，必须带 startTime，翻页 200 点/次
+ * Binance fapi 从 CF 出口被 WAF 拦（403 Request blocked，实测），全部弃用。
+ * ===================================================================== */
+/* bitcoin-data 免费档 8 次/小时，但数据日更 → 每源独立长缓存：
+ *   成功 → 缓存 12h；失败（429 限速等）→ 缓存失败标记 30min，期间不再打它。
+ * 不做这一层的话，/api/history 每 15 分钟的重建会烧光小时配额，429 永远清不空（实测踩过）。 */
+const BITDATA_KEY = 'https://nexus-cache.internal/bitdata-v1';
+async function bitDataWithCache() {
+  const cache = caches.default;
+  const key = new Request(BITDATA_KEY);
+  try {
+    const hit = await cache.match(key);
+    if (hit) {
+      const j = await hit.json();
+      return j.failed ? null : j;
+    }
+  } catch (e) { /* 缓存读失败按无缓存处理 */ }
+  try {
+    const val = await fetchBitDataAll();
+    await cache.put(key, new Response(JSON.stringify(val), { headers: { 'Cache-Control': 'public, max-age=43200' } }));
+    return val;
+  } catch (e) {
+    console.warn('bitdata fail, cooldown 30min:', e.message);
+    await cache.put(key, new Response(JSON.stringify({ failed: true, err: e.message, t: Date.now() }), { headers: { 'Cache-Control': 'public, max-age=1800' } }));
+    return null;
+  }
+}
+
+async function fetchBitDataAll() {
+  const mk = arr => {
+    const rows = arr.map(x => ({ t: (+x.unixTs) * 1000, c: x.mvrv != null ? +x.mvrv : x.activeAddresses != null ? +x.activeAddresses : NaN }))
+      .filter(x => isFinite(x.t) && isFinite(x.c)).sort((a, b) => a.t - b.t);
+    if (rows.length < 400) throw new Error('bitdata short: ' + rows.length);
+    return { ts: rows.map(x => x.t), closes: rows.map(x => x.c) };
+  };
+  const get = ep => fetch('https://bitcoin-data.com/v1/' + ep, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NexusTerminal/3.10)' } })
+    .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); });
+  /* 串行两个请求，尊重免费档限速（8 次/小时）；429 时直接失败走降级 */
+  const mrv = await get('mvrv');
+  const adr = await get('active-addresses');
+  return { MRV: mk(mrv), ADR: mk(adr) };
+}
+
+async function fetchFeeHist() {
+  const r = await fetch('https://api.blockchain.info/charts/transaction-fees-usd?timespan=2years&format=json',
+    { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NexusTerminal/3.10)' } });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  const vals = (await r.json()).values || [];
+  const rows = vals.map(x => ({ t: +x.x * 1000, c: +x.y })).filter(x => isFinite(x.t) && isFinite(x.c)).sort((a, b) => a.t - b.t);
+  if (rows.length < 380) throw new Error('fee short: ' + rows.length);
+  return { ts: rows.map(x => x.t), closes: rows.map(x => x.c) };
+}
+
+async function fetchPremiumHist() {
+  const r = await fetch('https://api.bybit.com/v5/market/premium-index-price-kline?category=linear&symbol=BTCUSDT&interval=D&limit=1000',
+    { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NexusTerminal/3.10)' } });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  const d = await r.json();
+  if (d.retCode !== 0) throw new Error('bybit ' + d.retMsg);
+  const list = (d.result && d.result.list) || [];   // [ts, premium, ...] 最新在前
+  const rows = list.map(x => ({ t: +x[0], c: +x[1] })).filter(x => isFinite(x.t) && isFinite(x.c)).sort((a, b) => a.t - b.t);
+  if (rows.length < 400) throw new Error('premium short: ' + rows.length);
+  return { ts: rows.map(x => x.t), closes: rows.map(x => x.c) };
+}
+
+async function fetchOIHist() {
+  /* 实测：intervalTime 用 D 会静默返回空列表，必须用 1d；必须带 startTime/endTime。
+   * 每页 200 点，end 往前挪，翻 3 页 ≈ 600 天。 */
+  const day = 86400000;
+  let end = Date.now();
+  const seen = {}, rows = [];
+  for (let p = 0; p < 3; p++) {
+    const start = end - 200 * day;
+    const r = await fetch('https://api.bybit.com/v5/market/open-interest?category=linear&symbol=BTCUSDT&intervalTime=1d&limit=200&startTime=' + start + '&endTime=' + end,
+      { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NexusTerminal/3.10)' } });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    if (d.retCode !== 0) throw new Error('bybit ' + d.retMsg);
+    const list = (d.result && d.result.list) || [];
+    if (!list.length) break;
+    list.forEach(x => {
+      let t = +x.timestamp; if (t && t < 1e12) t *= 1000;
+      const c = +x.openInterest;
+      if (isFinite(t) && isFinite(c) && !seen[t]) { seen[t] = 1; rows.push({ t: t, c: c }); }
+    });
+    end = start;
+  }
+  rows.sort((a, b) => a.t - b.t);
+  if (rows.length < 380) throw new Error('oi short: ' + rows.length);
+  return { ts: rows.map(x => x.t), closes: rows.map(x => x.c) };
+}
 
 async function fetchHistoryBundle() {
   const out = { macro: {}, fng: null, tx: null, hr: null, btc: null, srcs: {} };
@@ -469,6 +575,19 @@ async function fetchHistoryBundle() {
       putM('BEI10', { ts: bei.ts, closes: bei.v }, 'treasury');
     }
   }
+
+  // —— v3.10: 本质输入（链上估值/使用量/需求 + 衍生品结构）——
+  /* 与宏观源分开 allSettled：这 5 条缺了不该拖垮整个历史包，
+   * 前端对缺失因子的处理是 ok:false 退出分母（v3.7 已有此机制）。 */
+  const [bd, fee, prem, oih] = await Promise.allSettled([bitDataWithCache(), fetchFeeHist(), fetchPremiumHist(), fetchOIHist()]);
+  if (bd.status === 'fulfilled' && bd.value) { putM('MRV', bd.value.MRV, 'bitcoin-data'); putM('ADR', bd.value.ADR, 'bitcoin-data'); }
+  else console.warn('hist bitdata unavailable (rate-limit cooldown or fail)');
+  if (fee.status === 'fulfilled') putM('FEE', fee.value, 'blockchain.info:fees-usd');
+  else console.warn('hist fee fail', fee.reason && fee.reason.message);
+  if (prem.status === 'fulfilled') putM('PREM', prem.value, 'bybit:premium');
+  else console.warn('hist prem fail', prem.reason && prem.reason.message);
+  if (oih.status === 'fulfilled') putM('OIH', oih.value, 'bybit:oi');
+  else console.warn('hist oih fail', oih.reason && oih.reason.message);
 
   // —— 链上 / 情绪 ——
   await Promise.all([
@@ -650,7 +769,7 @@ export default {
     }
 
     if (url.pathname === '/' || url.pathname === '/health') {
-      return jsonResp({ name: 'nexus-proxy', version: '3.8', status: 'ok', source: 'yahoo+stooq+nyfed+treasury+mof+coinlore+finforexfactory+proxy', symbols: Object.keys(SIMPLE).concat(['EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'JGB10Y']) });
+      return jsonResp({ name: 'nexus-proxy', version: '3.10', status: 'ok', source: 'yahoo+stooq+nyfed+treasury+mof+coinlore+finforexfactory+coinmetrics+bybit+proxy', symbols: Object.keys(SIMPLE).concat(['EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'JGB10Y']) });
     }
 
     return new Response('Not Found', { status: 404, headers: CORS });

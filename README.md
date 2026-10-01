@@ -1,8 +1,8 @@
-# Nexus Terminal v3.9
+# Nexus Terminal v3.10
 
 加密货币 **实时监测 + 因子关系终端**。纯前端单页应用，无后端、无构建步骤。整站托管在 **Cloudflare**（前端 Workers Assets + 数据代理 Worker），并绑定自定义域名。
 
-> **数据源全部经 Cloudflare Worker 代理**：浏览器只与 `nexus-api.uichain.org` 通信，由 Worker 从边缘节点抓取真实 API 并加 CORS 头。这样解决两件事——① 中国大陆无法直连 Binance/CoinGecko 等（Binance 在中国被封禁）；② 浏览器跨域（CORS）。**已实测从 Cloudflare 边缘可稳定拉取** Bybit / CoinLore / DefiLlama / blockchain.info / alternative.me / mempool.space / **Yahoo Finance** / NY Fed / U.S. Treasury / **Japan MOF（日本财务省）** / **Forex Factory**（Stooq 自 2026-10 起已实际失效，仅留作兜底）。Forex Factory 的 nfs CDN **会限流（429）**，故 `/api/calendar` 采用「成功长缓存 + 失败退避 + 陈旧兜底 + XML 降级」（详见 v3.6）。
+> **数据源全部经 Cloudflare Worker 代理**：浏览器只与 `nexus-api.uichain.org` 通信，由 Worker 从边缘节点抓取真实 API 并加 CORS 头。这样解决两件事——① 中国大陆无法直连 Binance/CoinGecko 等（Binance 在中国被封禁）；② 浏览器跨域（CORS）。**已实测从 Cloudflare 边缘可稳定拉取** Bybit / CoinLore / DefiLlama / blockchain.info / alternative.me / mempool.space / **bitcoin-data.com（BGeometrics，v3.10 新增：MVRV/活跃地址，免费档限速见 v3.10 章节）** / **Yahoo Finance** / NY Fed / U.S. Treasury / **Japan MOF（日本财务省）** / **Forex Factory**（Stooq 自 2026-10 起已实际失效，仅留作兜底）。Forex Factory 的 nfs CDN **会限流（429）**，故 `/api/calendar` 采用「成功长缓存 + 失败退避 + 陈旧兜底 + XML 降级」（详见 v3.6）。
 
 > 部署形态：**纯 Cloudflare 单一出口**——前端（Workers Assets）+ 数据代理 Worker，均经 `workers_routes` 自动绑定到 `uichain.org`，无需手动配置 DNS。GitHub 仅作为**源码仓库**，不再对外提供 Pages 站点。
 >
@@ -19,7 +19,7 @@
 |---|---|---|
 | 实时行情 | BTC/ETH/SOL/BNB/XRP/ADA 价格、24h 涨跌、成交量 | Bybit Spot |
 | K 线 + 技术指标 | Canvas 自绘 K 线（15m/1H/4H/1D），RSI / MACD / 布林 / ATR / MA 趋势 | Bybit Kline |
-| 因子模型（**28 维 · 27 项参与评分；其中 17 维支持历史回放**） | 每个因子先算 z（相对自身历史的偏离），再乘**方向 dir**（+1 利多 / −1 利空 / 0 仅展示）得到多空贡献 → 加权合成 **Nexus Score**。覆盖情绪 / 资金费率 / 多空比 / 持仓 / 占比 / 稳定币 / 算力 / 链上活跃 / 美元指数 / 美债10Y / **美债2Y** / 黄金 / 标普 / VIX / 原油(WTI+布伦特) / 农业(仅展示) / 地缘风险(代理) / 通胀预期 / 期限利差 / **美元日元 / 日债10Y** / 非农 / 失业率 / 初请 / 核心PCE / CPI月率 / 技术面 / 动量 | 多源 |
+| 因子模型（**28 维实时 · 27 项参与评分；另设 5 个回放专用因子，历史回放子集 22 维**） | 每个因子先算 z（相对自身历史的偏离），再乘**方向 dir**（+1 利多 / −1 利空 / 0 仅展示）得到多空贡献 → 加权合成 **Nexus Score**。覆盖情绪 / 资金费率 / 多空比 / 持仓 / 占比 / 稳定币 / 算力 / 链上活跃 / 美元指数 / 美债10Y / **美债2Y** / 黄金 / 标普 / VIX / 原油(WTI+布伦特) / 农业(仅展示) / 地缘风险(代理) / 通胀预期 / 期限利差 / **美元日元 / 日债10Y** / 非农 / 失业率 / 初请 / 核心PCE / CPI月率 / 技术面 / 动量 | 多源 |
 | **因子关系网络** | 力导向图（**20 个节点**）+ Pearson 相关性矩阵，基于**日收益率 + 日期对齐**实时计算各因子与 BTC 的相关关系（绿=正相关，红=负相关，线宽=相关强度） | 多源 |
 | 宏观 · 政策 · 通胀 · 大宗 · 日元 | DXY / 美债10Y / 黄金 / 标普500 / VIX / WTI原油 / 布伦特原油 / 农业 / 联邦基金利率 / **美债2Y** / 通胀预期 / 10Y-2Y 利差 / **美元/日元** / **日债10Y**（底部实时显示各序列生效数据源） | Yahoo + NY Fed + 美财政部 + 日本财务省 |
 | **美国经济日历** | 本周中/高影响美国事件：时间 · 事件 · 预期 · 前值 · 实际（非农 / 失业率 / 核心PCE / 初请 / ADP / ISM / FOMC…） | Forex Factory |
@@ -31,7 +31,50 @@
 
 ---
 
-## v3.9 变更（本次）
+## v3.10 变更（本次）
+
+**主题：换血 —— 按 v3.9 样本外验证给出的指引行动。** v3.9 证明「继续调 17 个宏观序列的权重」是死路（样本内优选 IC 0.23，样本外塌到 −0.05），结论是**换更本质的输入**。v3.10 把 5 条有历史深度、经济含义更硬的序列接进回放子集，回放维度 **17 → 22**。
+
+### 1) 新增 5 个回放专用因子（replayOnly）
+
+| id | 因子 | 方向假设 | 数据源 | 深度 |
+|---|---|---|---|---|
+| `mrv` | MVRV 估值 | −1（市值/实现市值过高=过热） | bitcoin-data.com（BGeometrics） | 4 年 |
+| `adr` | 活跃地址 | +1（网络使用量） | bitcoin-data.com | 4 年 |
+| `fee` | 链上手续费(USD) | +1（真实需求计） | blockchain.info `transaction-fees-usd` | 2 年 |
+| `prem` | 永续溢价 | −1（溢价高=多头拥挤，反向） | Bybit `premium-index-price-kline` | 1000 天 |
+| `oih` | 持仓量(史) | −1（持仓高=杠杆拥挤，反向） | Bybit `open-interest` 翻页 3×200 天 | 600 天 |
+
+`replayOnly` 因子只在历史回放里参与评分（无实时源）：`computeNexusScore` 实时模式跳过、因子网格不渲染、计数不过——**实时 28 维完全不变**。方向假设沿用实时同类因子（funding/oi）的反向约定，**对错由 IC 归因表裁决**。
+
+### 2) 数据源实战记录（全部经 CF 边缘实测，失败的比成功的重要）
+
+- ❌ **Binance fapi 从 CF 出口被 WAF 拦**（403 Request blocked）——衍生品历史唯一免费深度源出局
+- ❌ **Bybit `history-funding-rate` 从 CF 出口超时**；`open-interest` 的 **`intervalTime` 必须用 `1d`，用 `D` 会静默返回空列表**（不报错！），且必须带 `startTime/endTime`
+- ✅ Bybit `premium-index-price-kline`（1000 天）顶替 funding 历史——溢价指数就是资金费率的日频代理
+- ❌ **CoinMetrics 全线不可用**：community API v4 已下线（404）；GitHub `btc.csv` 已冻结 4 个月（末行 2026-05-24 且为空值）——写代码前验证了列结构、差点直接用，**数据新鲜度必须单独验证**
+- ✅ **bitcoin-data.com**（免费无 key）：MVRV（滞后约 1 周）+ 活跃地址（滞后约 1 天）。**免费档 8 次/小时**，而 `/api/history` 每 15 分钟可重建 → 不加保护会把配额烧成永久锁死。解法：**每源独立缓存**——成功缓存 12h（数据日更）、失败缓存 30min 冷却标记。这个「按数据更新频率限速」的分层缓存放进了 `bitDataWithCache()`
+
+### 3) 真实数据实测（448 个交易日，回放 20 维）
+
+> MVRV/活跃地址 因限速冷却暂缺（自动补全），本轮实测口径为 17+3 维。
+
+- **持仓量(史) `oih` 拿下全场最高 |IC(10)| = 0.158**（IC(20) = −0.199）——符号为负即「持仓高 → 未来收益弱」，与反向假设**一致**，但 t ≈ −1.0 未过显著性门槛
+- `fee` −0.117（方向反了：手续费飙升后收益反而偏弱，与「需求+1」假设相反，同样不显著）、`prem` −0.043（接近零）
+- 合成分数 IC(10) = −0.057，样本外三组依旧全负（现状 0.063→**−0.265** / 等权 0.077→**−0.335** / 优选 0.234→−0.045）
+
+**诚实结论：本质输入 v1 仍无统计显著预测力，没有一个因子 |t|>2。** 但排序变化是真实的：衍生品结构（持仓量）取代宏观利率类成为最强苗头，方向判断（拥挤反向）与数据一致。下一步若要继续，优先给 oih/prem 换更长的验证窗口、并把 MRV/ADR 补全后再重跑裁判。
+
+### 4) 工程改动
+
+- Worker：`fetchBitDataAll` / `fetchFeeHist` / `fetchPremiumHist` / `fetchOIHist` + `bitDataWithCache` 分层缓存；历史包缓存键 `history-v6 → v7`
+- 前端：5 个 `replayOnly` 因子进 `FACTORS`（含方向假设注释）；`REPLAY_IDS` 17→22；`computeNexusScore`/`renderFactors`/`fCount` 三处过滤
+- 回归测试 8 段 **89 项断言全绿**（D 段方向表 +5、G/H 段回放维数 17→22、合成包新增 5 条埋信号序列）
+- CDP 端到端：实时 28 维 · 27 参与评分不变、回放窗口 448 天、0 异常 / 0 console 错误 / 0 失败请求
+
+---
+
+## v3.9 变更（上一版）
 
 **主题：裁判上岗 —— 把「评分 IC ≈ 0」拆到因子级别。** v3.8 证明了「合成分数没用」，但那是一个没有行动价值的结论。v3.9 回答三个能指导决策的问题：**哪个因子在做正贡献、哪个方向可能设反了、样本内挑出来的因子样本外还能不能用。**
 

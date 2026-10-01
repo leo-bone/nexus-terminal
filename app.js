@@ -402,6 +402,15 @@ const FACTORS = [
   { id: 'hr', name: '⛏ 算力趋势', group: 'onchain', w: 0.6, dir: 1, calc: () => { const a = asofCut(state.chainSeries.hashrate, 'HR'); if (!a || a.length < 120) return { z: 0, ok: false, note: '无数据' }; const z = chgZ(a, 90, 120); return { z, note: '近90日' + (z >= 0 ? '加速' : '放缓') }; } },
   { id: 'tx', name: '🔗 链上活跃', group: 'onchain', w: 0.5, dir: 1, calc: () => { const a = asofCut(state.chainSeries.n_tx, 'TX'); if (!a || !a.length) return { z: 0, ok: false, note: '无数据' }; return { z: rollZ(a, 90), note: fmtBig(a[a.length - 1]) + '笔/日' }; } },
   /* —— 美元 / 风险资产 —— */
+  /* —— v3.10 回放专用因子（replayOnly）：只有历史序列、无实时源 ——
+   * computeNexusScore 在实时模式（不带 ids）跳过它们；回放模式计入子集。
+   * 方向假设沿用实时同类因子的约定：MVRV/溢价/持仓高 = 过热 → 反向(-1)；
+   * 活跃地址/手续费升 = 网络需求升 → 顺向(+1)。对错由 IC 归因表裁决。 */
+  { id: 'mrv', name: '⚖ MVRV 估值', group: 'onchain', w: 0.9, dir: -1, replayOnly: true, calc: () => { const v = mV('MRV'); if (v == null) return { z: 0, ok: false, note: '无数据' }; return { z: mZ('MRV', 120), note: 'MVRV ' + v.toFixed(2) + ' · 反向' }; } },
+  { id: 'adr', name: '👥 活跃地址', group: 'onchain', w: 0.5, dir: 1, replayOnly: true, calc: () => { const v = mV('ADR'); if (v == null) return { z: 0, ok: false, note: '无数据' }; return { z: mChgZ('ADR', 60), note: fmtBig(v) + ' · 60日动能' }; } },
+  { id: 'fee', name: '🧾 链上手续费', group: 'onchain', w: 0.5, dir: 1, replayOnly: true, calc: () => { const v = mV('FEE'); if (v == null) return { z: 0, ok: false, note: '无数据' }; return { z: mChgZ('FEE', 60), note: '$' + fmtBig(v) + ' · 需求' }; } },
+  { id: 'prem', name: '🔥 永续溢价', group: 'deriv', w: 0.8, dir: -1, replayOnly: true, calc: () => { const v = mV('PREM'); if (v == null) return { z: 0, ok: false, note: '无数据' }; return { z: mZ('PREM', 120), note: (v * 100).toFixed(3) + '% · 反向' }; } },
+  { id: 'oih', name: '📊 持仓量(史)', group: 'deriv', w: 0.6, dir: -1, replayOnly: true, calc: () => { const v = mV('OIH'); if (v == null) return { z: 0, ok: false, note: '无数据' }; return { z: mZ('OIH', 120), note: fmtBig(v) + ' · 反向' }; } },
   { id: 'dxy', name: '🇺🇸 美元指数', group: 'macro', w: 1.0, dir: -1, calc: () => { const v = mV('DXY'); if (v == null) return { z: 0, note: CONFIG.PROXY ? '—' : '需Worker' }; return { z: mZ('DXY'), note: v.toFixed(1) }; } },
   { id: 'us10y', name: '🏦 美债10Y', group: 'macro', w: 1.0, dir: -1, calc: () => { const v = mV('US10Y'); if (v == null) return { z: 0, note: '—' }; return { z: mZ('US10Y'), note: v.toFixed(2) + '%' }; } },
   { id: 'spx', name: '📈 标普500', group: 'macro', w: 0.9, dir: 1, calc: () => { const v = mV('SPX'); if (v == null) return { z: 0, note: '—' }; return { z: mChgZ('SPX', 60), note: v.toFixed(0) + ' · 60日动能' }; } },
@@ -433,6 +442,7 @@ function computeNexusScore(ids) {
   let sum = 0, wsum = 0, nScored = 0, nDead = 0; const out = {};
   FACTORS.forEach(f => {
     if (set && !set.has(f.id)) return;
+    if (!set && f.replayOnly) return;    // 回放专用因子不进实时评分
     const r = f.calc();
     const has = r.ok !== false;                     // 无数据的因子不进分母，避免把评分拉向 50
     const z = clampZ(r.z);
@@ -960,6 +970,7 @@ function renderFactors() {
   if ($('nxSig')) { const s = score > 60 ? '偏多' : score < 40 ? '偏空' : '中性'; $('nxSig').textContent = s; $('nxSig').className = 'fscore-l ' + (score > 60 ? 'up' : score < 40 ? 'dn' : 'n'); }
   const box = $('factorGrid'); if (!box) return; box.innerHTML = '';
   FACTORS.forEach(f => {
+    if (f.replayOnly) return;            // 回放专用因子不出现在实时面板
     const r = out[f.id];
     const c = r.contribution;                       // dir × z：正=利多、负=利空
     const show = f.dir === 0;
@@ -973,7 +984,7 @@ function renderFactors() {
     card.innerHTML = `<div class="fc-name">${f.name}</div><div class="fc-z" style="color:${col}">${show || dead ? '—' : (c >= 0 ? '+' : '') + c.toFixed(1)}</div><div class="fc-str"><div class="fc-strbar" style="width:${Math.min(100, Math.abs(c) / 2.5 * 100)}%;background:${col}"></div></div><div class="fc-sig" style="color:${col}">${tag} · ${r.note}</div>`;
     box.appendChild(card);
   });
-  const cnt = $('fCount'); if (cnt) cnt.textContent = FACTORS.length + ' 维 · ' + nScored + ' 参与评分' + (nDead ? ' · ' + nDead + ' 无数据' : '');
+  const cnt = $('fCount'); if (cnt) cnt.textContent = FACTORS.filter(f => !f.replayOnly).length + ' 维 · ' + nScored + ' 参与评分' + (nDead ? ' · ' + nDead + ' 无数据' : '');
 }
 /* =====================================================================
  *  历史回放 · IC 有效性检验 / 因子归因（v3.8 → v3.9）
@@ -982,13 +993,15 @@ function renderFactors() {
  *  长历史序列取回来，就能用**同一套因子代码**逐日重放，算出历史上每一天的评分。
  *  没有 KV / cron / D1，永远不会和线上因子代码脱节（脱节是双份实现的经典坑）。
  *
- *  代价：只有「有历史序列」的因子能回放。以下三类无法回放 →
+ *  代价：只有「有历史序列」的因子能回放。无法回放的仍有三类 →
  *    ① 事件类（非农/CPI/失业率/初请/PCE）：周历没有历史发布值
- *    ② 衍生品快照（资金费率 / 多空比）：Bybit 只给当日值
+ *    ② 资金费率/多空比：Bybit 只给当日值（但 v3.10 已用溢价指数/持仓量历史补上衍生品结构）
  *    ③ BTC占比 / 稳定币占比：需要「历史全网总市值」，免费源都没有
- *  因此回放用 17 维子集并**重新归一化**，与实时 28 维的绝对值不可直接比较。
+ *  v3.10 起「本质输入」登场：MVRV / 活跃地址 / 手续费 / 永续溢价 / 持仓量(史)
+ *  五条 replayOnly 因子加入回放子集（17→22 维），方向假设仍由 IC 归因裁决。
+ *  因此回放用 22 维子集并**重新归一化**，与实时 28 维的绝对值不可直接比较。
  * ===================================================================== */
-const REPLAY_IDS = ['fng', 'hr', 'tx', 'dxy', 'us10y', 'spx', 'vix', 'gold', 'oil', 'geo', 'fed', 'bei', 'curve', 'jpy', 'jgb', 'tech', 'mom'];
+const REPLAY_IDS = ['fng', 'hr', 'tx', 'mrv', 'adr', 'fee', 'prem', 'oih', 'dxy', 'us10y', 'spx', 'vix', 'gold', 'oil', 'geo', 'fed', 'bei', 'curve', 'jpy', 'jgb', 'tech', 'mom'];
 const REPLAY_MIN_LOOKBACK = 130;   // 每条序列至少要有这么多回看点（rollZ(120) 与 chgZ(90) 都够）
 const IC_HORIZONS = [1, 5, 10, 20];
 
@@ -1302,7 +1315,7 @@ function renderHistory() {
     const s = rep.srcs || {};
     const cov = state.histBundle && state.histBundle.coverage;
     const covTxt = cov ? '覆盖度：最短序列 ' + cov.minKey + ' ' + cov.minLen + ' 点' + (cov.degraded ? '（降级·可能是某源偶发失败）' : '') + '，共 ' + cov.nSeries + ' 条。' : '';
-    src.textContent = covTxt + '回放因子子集（17 维）：情绪 / 算力 / 链上活跃 / 美元 / 美债10Y / 标普 / VIX / 黄金 / 原油 / 地缘代理 / 美联储2Y / 通胀预期 / 期限利差 / 美元日元 / 日债10Y / 技术面 / 动量。' +
+    src.textContent = covTxt + '回放因子子集（22 维）：情绪 / 算力 / 链上活跃 / MVRV / 活跃地址 / 手续费 / 永续溢价 / 持仓量(史) / 美元 / 美债10Y / 标普 / VIX / 黄金 / 原油 / 地缘代理 / 美联储2Y / 通胀预期 / 期限利差 / 美元日元 / 日债10Y / 技术面 / 动量。' +
       '不含：5 个事件因子（无历史发布值）、资金费率与多空比（仅当日值）、BTC占比与稳定币占比（无历史总市值）。价格用 ' + (s.BTC || 'yahoo:BTC-USD') + '。';
   }
 

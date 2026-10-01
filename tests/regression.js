@@ -179,11 +179,12 @@ const near = (label, actual, expect, tol) => {
 
   console.log('\n===== D. 因子方向一致性（v3.6 核心修复）=====');
   const F = run('FACTORS');
-  chk('因子总数', F.length, 28);
+  chk('因子总数（含 5 个回放专用）', F.length, 33);
+  chk('回放专用因子 5 个且实时不参与', F.filter(f => f.replayOnly).map(f => f.id).join(','), 'mrv,adr,fee,prem,oih');
   chk('每个因子都有合法 dir', F.every(f => [1, -1, 0].includes(f.dir)), 'true');
   chk('仅 1 项为「仅展示」(dir=0)', F.filter(f => f.dir === 0).length, 1);
   chk('参与评分的因子数', run('computeNexusScore().nScored'), 27);
-  const expectDir = { fng: -1, fund: -1, ls: -1, oi: -1, dom: -1, stable: 1, hr: 1, tx: 1, dxy: -1, us10y: -1, spx: 1, vix: -1, gold: -1, oil: -1, agri: 0, geo: -1, fed: -1, bei: -1, curve: 1, jpy: 1, jgb: -1, nfp: -1, urate: 1, claims: 1, pce: -1, cpi: -1, tech: 1, mom: 1 };
+  const expectDir = { fng: -1, fund: -1, ls: -1, oi: -1, dom: -1, stable: 1, hr: 1, tx: 1, mrv: -1, adr: 1, fee: 1, prem: -1, oih: -1, dxy: -1, us10y: -1, spx: 1, vix: -1, gold: -1, oil: -1, agri: 0, geo: -1, fed: -1, bei: -1, curve: 1, jpy: 1, jgb: -1, nfp: -1, urate: 1, claims: 1, pce: -1, cpi: -1, tech: 1, mom: 1 };
   const bad = Object.entries(expectDir).filter(([k, v]) => (F.find(f => f.id === k) || {}).dir !== v).map(([k]) => k);
   chk('方向表与设计一致', bad.length ? bad.join(',') : 'ok', 'ok');
   chk('因子 id 无遗漏', F.filter(f => !(f.id in expectDir)).length, 0);
@@ -265,6 +266,11 @@ const near = (label, actual, expect, tol) => {
     ser.T10Y2Y = mk(i => 0.5  * (1 + K * SP(i)));   // dir +1
     ser.USDJPY = mk(i => 150  * (1 + K * SP(i)));   // dir +1
     ser.JGB10Y = mk(i => 3    * (1 - K * SP(i)));   // dir -1
+    ser.MRV   = mk(i => 1.5    * (1 - 0.8 * K * SP(i)));  // dir -1（高估反向）
+    ser.ADR   = mk(i => 9e5    * (1 + K * SP(i)));        // dir +1
+    ser.FEE   = mk(i => 5e5    * (1 + K * SP(i)));        // dir +1
+    ser.PREM  = mk(i => 0.0004 * (1 - 2 * K * SP(i)));    // dir -1（拥挤反向）
+    ser.OIH   = mk(i => 8e8    * (1 - K * SP(i)));        // dir -1
     const fng = mk(i => 50 - 25 * SP(i));            // dir -1
     const hr  = mk(i => 1e21 * (1 + 0.20 * SP(i)));  // dir +1
     const tx  = mk(i => 500000 * (1 + 0.20 * SP(i)));// dir +1
@@ -281,7 +287,7 @@ const near = (label, actual, expect, tol) => {
   if (rep) {
     const win = rep.n - rep.start;
     chk('回放窗口 ≥ 250 天', win >= 250, 'true');
-    chk('回放因子数 = 17', rep.nScored, 17);
+    chk('回放因子数 = 22', rep.nScored, 22);
     chk('评分全部落在 [2,98]', rep.scores.slice(rep.start).every(x => x >= 2 && x <= 98), 'true');
     const uniq = new Set(rep.scores.slice(rep.start)).size;
     chk('评分有足够波动（非贴顶）', uniq > 20, 'true');
@@ -332,7 +338,7 @@ const near = (label, actual, expect, tol) => {
   console.log('\n===== H. 因子 IC 归因 / 样本内外 / 滚动 IC（v3.9）=====');
   if (rep) {
     const facs = call('factorICRows', rep);
-    chk('归因表覆盖全部回放因子（17）', facs.length, 17);
+    chk('归因表覆盖全部回放因子（22）', facs.length, 22);
     chk('每个因子都有 IC(1/5/10/20) 且有足够样本',
       facs.every(r => [1, 5, 10, 20].every(h => r.per[h] && r.per[h].n >= 100)), 'true');
     const pos = facs.filter(r => r.per[10] && r.per[10].ic > 0).length;
