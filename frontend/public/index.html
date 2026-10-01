@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Nexus Terminal · 加密货币因子关系终端 v3</title>
+<title>Nexus Terminal · 加密货币因子关系终端 v3.4</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -109,6 +109,16 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
 .pt-pos{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-top:6px}
 .pt-pos-row{display:flex;justify-content:space-between;padding:2px 0;font-size:10px;border-bottom:1px solid rgba(255,255,255,.04)}
 .pt-pos-lbl{color:var(--dim);font-family:'JetBrains Mono',monospace}.pt-pos-val{color:var(--text3);font-family:'JetBrains Mono',monospace;font-weight:600}
+.econ-list{padding:6px 10px 10px;max-height:340px;overflow:auto}
+.econ-row{display:grid;grid-template-columns:96px 1fr 62px 62px 62px;gap:6px;align-items:center;padding:5px 6px;border-bottom:1px solid rgba(255,255,255,.04);font-size:10px}
+.econ-row.econ-hd{color:var(--dim);font-size:8px;letter-spacing:1px;text-transform:uppercase;border-bottom:1px solid var(--border);position:sticky;top:0;background:rgba(8,17,31,.98);z-index:2}
+.econ-row.hi{background:rgba(255,61,110,.06)}
+.econ-row.md{background:rgba(255,193,7,.03)}
+.econ-t{color:var(--dim);font-family:'JetBrains Mono',monospace;font-size:9px}
+.econ-e{color:var(--text3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.econ-v{text-align:right;font-family:'JetBrains Mono',monospace;color:var(--text2)}
+.econ-a{text-align:right;font-family:'JetBrains Mono',monospace;color:var(--yellow);font-weight:700}
+@media(max-width:700px){.econ-row{grid-template-columns:74px 1fr 48px 48px 48px}}
 .macro-hint{font-size:9px;color:var(--dim);padding:6px 10px;text-align:center}
 .footer{padding:14px 0 30px;color:var(--dim);font-size:10px;text-align:center;line-height:1.8}
 .footer a{color:var(--blue);text-decoration:none}
@@ -120,7 +130,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
   <div class="header">
     <div class="logo">NEXUS <em>TERMINAL</em></div>
     <div class="tagline">CRYPTO FACTOR TERMINAL</div>
-    <div class="live-badge"><span class="live-dot"></span> LIVE · v3</div>
+    <div class="live-badge"><span class="live-dot"></span> LIVE · v3.4</div>
     <div class="hdr-right">
       <span class="net-lbl">数据源</span><span id="netDot" class="net-dot"></span>
       <span id="lastUpd" class="last-upd">—</span>
@@ -172,7 +182,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
   </div>
 
   <div class="panel">
-    <div class="phdr"><span class="icon">🧠</span><span class="lbl">因子模型 · Nexus Score</span><span id="fCount" class="hint">21 维</span><span class="hint">Z-Score 加权合成 · 实时</span></div>
+    <div class="phdr"><span class="icon">🧠</span><span class="lbl">因子模型 · Nexus Score</span><span id="fCount" class="hint">26 维</span><span class="hint">Z-Score 加权合成 · 实时</span></div>
     <div class="fpanel">
       <div class="fhdr">
         <span class="fttl">综合多空评分</span>
@@ -197,9 +207,14 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
   </div>
 
   <div class="panel">
-    <div class="phdr"><span class="icon">🏦</span><span class="lbl">宏观 · 政策 · 通胀 · 大宗</span><span class="hint">Stooq/Yahoo + NY Fed + 美财政部</span></div>
+    <div class="phdr"><span class="icon">🏦</span><span class="lbl">宏观 · 政策 · 通胀 · 大宗</span><span class="hint">Yahoo/Stooq + NY Fed + 美财政部</span></div>
     <div id="macroGrid" class="mgrid"></div>
-    <div id="macroHint" class="macro-hint">未配置 Cloudflare Worker：宏观数据暂不可用（详见 README）。</div>
+    <div id="macroHint" class="macro-hint">—</div>
+  </div>
+
+  <div class="panel">
+    <div class="phdr"><span class="icon">📅</span><span class="lbl">美国经济日历 · 本周</span><span id="econCount" class="hint">—</span></div>
+    <div id="econList" class="econ-list"><div class="macro-hint">加载中…</div></div>
   </div>
 
   <div class="main-grid">
@@ -275,7 +290,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
   </div>
 
   <div class="footer">
-    NEXUS TERMINAL v3.3 · 纯前端实时加密终端 · 数据源: Bybit / CoinPaprika / DefiLlama / blockchain.info / alternative.me / mempool.space / NY Fed / U.S. Treasury / Stooq<br>
+    NEXUS TERMINAL v3.4 · 纯前端实时加密终端 · 数据源: Bybit / CoinPaprika / DefiLlama / blockchain.info / alternative.me / mempool.space / Yahoo Finance / NY Fed / U.S. Treasury / Forex Factory<br>
     仅供研究与教育，不构成投资建议。加密资产风险极高，请独立判断。
   </div>
 </div>

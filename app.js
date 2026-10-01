@@ -1,5 +1,5 @@
 /* =====================================================================
- * NEXUS TERMINAL v3.3 — 加密货币实时监测与因子关系终端
+ * NEXUS TERMINAL v3.4 — 加密货币实时监测与因子关系终端
  * 纯前端 / 无后端 / 无构建步骤。可直接 file:// 打开，也可部署到 Cloudflare。
  *
  * 数据源（全经 Cloudflare Worker 代理，解决中国大陆无法直连 + 浏览器 CORS）:
@@ -9,8 +9,16 @@
  *   - blockchain.info       : 链上日交易笔数（链上活跃因子）
  *   - alternative.me        : 恐惧贪婪指数 (F&G)
  *   - mempool.space         : 比特币全网算力
- *   - Cloudflare Worker     : 宏观/政策/通胀/大宗序列
- *                             (Stooq/Yahoo + NY Fed 利率 + 美财政部收益率曲线)
+ *   - Forex Factory         : 美国经济日历（非农 / 失业率 / 初请 / PCE / CPI）
+ *   - Cloudflare Worker     : 宏观/政策/通胀/大宗序列 + 经济日历
+ *                             (Yahoo/Stooq + NY Fed 利率 + 美财政部 + Forex Factory)
+ *
+ * v3.4 变更:
+ *   1) 新增「事件因子」5 个: 非农就业 / 失业率 / 初请失业金 / 核心PCE / CPI(超预期方向)
+ *   2) 新增「美国经济日历」面板: 本周高/中影响事件的实际·预期·前值
+ *   3) 原油因子升级为 WTI + 布伦特 双源合成; 宏观卡片新增布伦特
+ *   4) 数据源主备调换: Yahoo 升为主源 (Stooq 自 2026-10 起在 CF 边缘频繁 522/反爬)
+ *   5) 快照新增 _src 数据源诊断字段
  *
  * v3.3 变更:
  *   1) 新增因子: 美联储利率 / 通胀预期(市场隐含) / 期限利差 / 原油 / 农业 / 地缘风险(代理)
@@ -40,6 +48,7 @@ const ENDPOINTS = {
   ntx: px('https://api.blockchain.info/charts/n-transactions?timespan=180days&format=json'),
   fg: px('https://api.alternative.me/fng/?limit=90'),
   mempoolHR: px('https://mempool.space/api/v1/mining/hashrate/1y'),
+  calendar: CONFIG.PROXY ? CONFIG.PROXY + '/api/calendar' : null,
 };
 
 const state = {
@@ -49,6 +58,7 @@ const state = {
   chainSeries: {}, chainDates: {},
   deriv: {}, macro: null, macroSeries: null, macroDates: null, macroPrev: null,
   series: {}, seriesDates: {}, retMaps: {},
+  econ: [], econTs: null, macroSrc: null,
   lastUpdate: null, interval: '1h',
   positions: loadPositions(), equity: 10000,
 };
@@ -131,6 +141,41 @@ function pearsonMaps(ma, mb, n = 120) {
   const keys = [...ma.keys()].sort((a, b) => b - a);
   for (const d of keys) { if (xs.length >= n) break; if (mb.has(d)) { const x = ma.get(d), y = mb.get(d); if (isFinite(x) && isFinite(y)) { xs.push(x); ys.push(y); } } }
   return xs.length < 20 ? null : pearson(xs, ys);
+}
+
+/* ---------- 经济日历事件（非农 / 失业率 / 初请 / PCE / CPI） ---------- */
+const clampZ = v => Math.max(-2.5, Math.min(2.5, isFinite(v) ? v : 0));
+function parseEconVal(s) {
+  if (s == null) return null;
+  const str = String(s).trim();
+  if (!str) return null;
+  const m = str.replace(/,/g, '').match(/-?\d+(\.\d+)?/);
+  if (!m) return null;
+  let v = parseFloat(m[0]);
+  const suf = str.slice(-1).toUpperCase();
+  if (suf === 'M') v *= 1000; else if (suf === 'B') v *= 1000000;
+  return isFinite(v) ? v : null;
+}
+function econFind(re) {
+  const arr = state.econ || [];
+  for (let i = arr.length - 1; i >= 0; i--) if (re.test(arr[i].title)) return arr[i];
+  return null;
+}
+/* 事件因子: surprise = 实际 − 预期; 未发布时退化用「预期 − 前值」(半权重) */
+function econFactor(cfg) {
+  const e = econFind(cfg.re);
+  if (!e) return { z: 0, sig: 'neu', note: '本周无发布' };
+  const a = parseEconVal(e.a), f = parseEconVal(e.f), p = parseEconVal(e.p);
+  const sgn = cfg.invert ? -1 : 1;
+  if (a != null && f != null) {
+    const z = clampZ(sgn * (a - f) / cfg.std);
+    return { z, sig: z > 0.6 ? 'over' : z < -0.6 ? 'under' : 'neu', note: `实际 ${e.a} / 预期 ${e.f}` };
+  }
+  if (f != null && p != null) {
+    const z = clampZ(sgn * (f - p) / cfg.std * 0.5);
+    return { z, sig: 'neu', note: `预期 ${e.f}（未发布）` };
+  }
+  return { z: 0, sig: 'neu', note: '待发布' };
 }
 
 /* =====================================================================
@@ -224,8 +269,17 @@ async function fetchMacro() {
   if (!CONFIG.PROXY) { state.macro = null; state.macroSeries = null; state.macroDates = null; return false; }
   try {
     const d = await getJSON(CONFIG.PROXY + '/api/snapshot');
-    state.macro = d.macro; state.macroSeries = d.series; state.macroDates = d.dates; state.macroPrev = d._prev || null; return true;
+    state.macro = d.macro; state.macroSeries = d.series; state.macroDates = d.dates;
+    state.macroPrev = d._prev || null; state.macroSrc = d._src || null; return true;
   } catch (e) { console.warn('macro fail', e); return false; }
+}
+async function fetchEcon() {
+  if (!ENDPOINTS.calendar) { state.econ = []; return false; }
+  try {
+    const d = await getJSON(ENDPOINTS.calendar, 12000);
+    state.econ = (d && d.events) || []; state.econTs = d && d.ts;
+    return state.econ.length > 0;
+  } catch (e) { console.warn('econ fail', e); return false; }
 }
 
 function buildSeries() {
@@ -265,6 +319,7 @@ const META = {
   SPX: { name: '标普500', color: '#00b4ff', group: 'macro' },
   VIX: { name: 'VIX恐慌', color: '#ff3d6e', group: 'macro' },
   OIL: { name: 'WTI原油', color: '#8d6e63', group: 'macro' },
+  BRENT: { name: '布伦特原油', color: '#a1887f', group: 'macro' },
   AGRI: { name: '农业', color: '#8bc34a', group: 'macro' },
   EFFR: { name: '联邦利率', color: '#26c6da', group: 'policy' },
   BEI10: { name: '通胀预期', color: '#ef5350', group: 'policy' },
@@ -295,7 +350,15 @@ const FACTORS = [
   { id: 'fed', name: '🏛 美联储利率', group: 'policy', w: 1.0, calc: () => { const v = mV('EFFR'); if (v == null) return { z: 0, sig: 'neu', note: '—' }; const z = mZ('EFFR', 120); return { z, sig: v >= 4.5 ? 'over' : v <= 2.5 ? 'under' : 'neu', note: v.toFixed(2) + '%' }; } },
   { id: 'bei', name: '🔥 通胀预期', group: 'policy', w: 0.9, calc: () => { const v = mV('BEI10'); if (v == null) return { z: 0, sig: 'neu', note: '—' }; const z = mZ('BEI10'); return { z, sig: v > 2.6 ? 'over' : v < 1.8 ? 'under' : 'neu', note: v.toFixed(2) + '%' }; } },
   { id: 'curve', name: '📉 期限利差', group: 'policy', w: 0.8, calc: () => { const v = mV('T10Y2Y'); if (v == null) return { z: 0, sig: 'neu', note: '—' }; const z = mZ('T10Y2Y'); return { z, sig: v < 0 ? 'over' : v > 1.2 ? 'under' : 'neu', note: (v >= 0 ? '+' : '') + v.toFixed(2) }; } },
-  { id: 'oil', name: '🛢 WTI原油', group: 'macro', w: 0.6, calc: () => { const v = mV('OIL'); if (v == null) return { z: 0, sig: 'neu', note: '—' }; const z = mZ('OIL'); return { z, sig: z > 1.5 ? 'over' : z < -1.5 ? 'under' : 'neu', note: '$' + v.toFixed(0) }; } },
+  { id: 'oil', name: '🛢 原油(WTI+布伦特)', group: 'macro', w: 0.7, calc: () => {
+      const zs = []; const ws = mV('OIL'), bs = mV('BRENT');
+      if (ws != null) zs.push(mZ('OIL'));
+      if (bs != null) zs.push(mZ('BRENT'));
+      if (!zs.length) return { z: 0, sig: 'neu', note: '—' };
+      const z = zs.reduce((a, b) => a + b, 0) / zs.length;
+      const note = (ws != null ? '$' + ws.toFixed(0) : '—') + (bs != null ? ' / $' + bs.toFixed(0) : '');
+      return { z, sig: z > 1.5 ? 'over' : z < -1.5 ? 'under' : 'neu', note };
+    } },
   { id: 'agri', name: '🌾 农业指数', group: 'macro', w: 0.4, calc: () => { const v = mV('AGRI'); if (v == null) return { z: 0, sig: 'neu', note: '—' }; const z = mZ('AGRI'); return { z, sig: z > 1.5 ? 'over' : z < -1.5 ? 'under' : 'neu', note: '$' + v.toFixed(2) }; } },
   { id: 'geo', name: '🌍 地缘风险(代理)', group: 'macro', w: 0.8, calc: () => {
       const zs = [];
@@ -304,6 +367,12 @@ const FACTORS = [
       const z = zs.reduce((a, b) => a + b, 0) / zs.length;
       return { z, sig: z > 1 ? 'over' : z < -1 ? 'under' : 'neu', note: 'VIX+金+油' };
     } },
+  /* —— 事件因子（美国经济日历 · 超预期方向） —— */
+  { id: 'nfp', name: '👷 非农就业', group: 'event', w: 1.0, calc: () => econFactor({ re: /^Non-Farm Employment Change$/i, std: 60, invert: false }) },
+  { id: 'urate', name: '🧑‍💼 失业率', group: 'event', w: 0.7, calc: () => econFactor({ re: /^Unemployment Rate$/i, std: 0.12, invert: true }) },
+  { id: 'claims', name: '📋 初请失业金', group: 'event', w: 0.5, calc: () => econFactor({ re: /^Unemployment Claims$/i, std: 8, invert: true }) },
+  { id: 'pce', name: '💵 核心PCE', group: 'event', w: 0.6, calc: () => econFactor({ re: /^Core PCE Price Index m\/m$/i, std: 0.08, invert: true }) },
+  { id: 'cpi', name: '🔥 CPI月率', group: 'event', w: 0.5, calc: () => econFactor({ re: /^CPI m\/m$/i, std: 0.12, invert: true }) },
   { id: 'tech', name: '📐 技术面', group: 'tech', w: 1.1, calc: () => { const k = state.klines['BTC' + state.interval]; if (!k) return { z: 0, sig: 'neu', note: '—' }; const c = k.map(x => x.c); const ema20 = ema(c, 20), ema50 = ema(c, 50); const r = rsi(c); const z = (ema20[ema20.length - 1] - ema50[ema50.length - 1]) / (ema50[ema50.length - 1] || 1) * 30 + (r[r.length - 1] - 50) / 12; return { z, sig: z > 0.6 ? 'over' : z < -0.6 ? 'under' : 'neu', note: `RSI ${r[r.length - 1].toFixed(0)}` }; } },
   { id: 'mom', name: '🚀 动量', group: 'tech', w: 0.9, calc: () => { const k = state.klines['BTC' + state.interval]; if (!k) return { z: 0, sig: 'neu', note: '—' }; const c = k.map(x => x.c); const z = pctChange(c.slice(-30)) / 8; return { z, sig: z > 1 ? 'over' : z < -1 ? 'under' : 'neu', note: `${(pctChange(c.slice(-30)) || 0).toFixed(1)}%` }; } },
 ];
@@ -475,7 +544,7 @@ function renderFG() {
 }
 const MACRO_CARDS = [
   ['DXY', '美元指数 DXY', 2, ''], ['US10Y', '美债10Y', 2, '%'], ['GOLD', '黄金 (USD)', 0, ''],
-  ['SPX', '标普500', 0, ''], ['VIX', 'VIX 恐慌', 1, ''], ['OIL', 'WTI 原油', 2, ''],
+  ['SPX', '标普500', 0, ''], ['VIX', 'VIX 恐慌', 1, ''], ['OIL', 'WTI 原油', 2, ''], ['BRENT', '布伦特原油', 2, ''],
   ['AGRI', '农业 ETF', 2, ''], ['EFFR', '联邦基金利率', 2, '%'], ['BEI10', '通胀预期(隐含)', 2, '%'],
   ['T10Y2Y', '10Y-2Y 利差', 2, ''],
 ];
@@ -488,7 +557,7 @@ function renderMacro() {
     if (hint) hint.style.display = CONFIG.PROXY ? 'none' : 'block';
     return;
   }
-  if (hint) hint.style.display = 'none';
+  if (hint) { hint.style.display = 'block'; hint.textContent = macroSrcText(); }
   const prev = state.macroPrev;
   box.innerHTML = MACRO_CARDS.map(([k, label, dp, unit]) => {
     const v = m[k];
@@ -500,6 +569,33 @@ function renderMacro() {
     }
     return `<div class="mcard"><div class="mname">${label}</div><div class="mval">${valTxt}</div><div class="msub ${subCls}">${subTxt}</div></div>`;
   }).join('');
+}
+function macroSrcText() {
+  const s = state.macroSrc; if (!s) return '';
+  const vals = Object.values(s);
+  const ny = vals.filter(v => /^yahoo/.test(v)).length, ns = vals.filter(v => /^stooq/.test(v)).length;
+  return `数据源: Yahoo Finance ${ny} 项` + (ns ? ` · Stooq ${ns} 项` : ' · Stooq 不可用(已由 Yahoo 兜底)') + ' · NY Fed · 美财政部';
+}
+function renderEcon() {
+  const box = $('econList'); if (!box) return;
+  const cnt = $('econCount');
+  const arr = (state.econ || []).filter(e => e.impact === 'High' || e.impact === 'Medium');
+  if (!arr.length) {
+    box.innerHTML = '<div class="macro-hint">经济日历暂不可用（数据源：Forex Factory）</div>';
+    if (cnt) cnt.textContent = '—';
+    return;
+  }
+  if (cnt) cnt.textContent = `本周 ${arr.length} 条中高影响 · Forex Factory`;
+  const now = Date.now();
+  let html = '<div class="econ-row econ-hd"><div class="econ-t">时间</div><div class="econ-e">事件</div><div class="econ-v">预期</div><div class="econ-v">前值</div><div class="econ-v">实际</div></div>';
+  arr.forEach(e => {
+    const t = Date.parse(e.t);
+    const ts = isNaN(t) ? '—' : new Date(t).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
+    const hasA = e.a != null && e.a !== '';
+    const aTxt = hasA ? e.a : (t > now ? '待公布' : '—');
+    html += `<div class="econ-row ${e.impact === 'High' ? 'hi' : 'md'}"><div class="econ-t">${ts}</div><div class="econ-e" title="${e.title}">${e.title}</div><div class="econ-v">${e.f || '—'}</div><div class="econ-v">${e.p || '—'}</div><div class="${hasA ? 'econ-a' : 'econ-v'}">${aTxt}</div></div>`;
+  });
+  box.innerHTML = html;
 }
 function renderOnChain() {
   const cs = state.chainSeries; const set = (id, v) => { const e = $(id); if (e) e.textContent = v; };
@@ -535,12 +631,12 @@ function renderStatus(ok) {
  *  刷新主流程
  * ===================================================================== */
 async function refreshAll() {
-  const tasks = [fetchPrices(), fetchKlines('BTC', state.interval), fetchFG(), fetchGlobal(), fetchStable(), fetchChain(), fetchDeriv(), fetchMacro()];
+  const tasks = [fetchPrices(), fetchKlines('BTC', state.interval), fetchFG(), fetchGlobal(), fetchStable(), fetchChain(), fetchDeriv(), fetchMacro(), fetchEcon()];
   const res = await Promise.allSettled(tasks);
   const ok = res.every(r => r.status === 'fulfilled' && r.value !== false);
   if (!state.klines['BTC1d']) await fetchKlines('BTC', '1d');
   buildSeries();
-  renderTicker(); renderChart(); renderTA(); renderFG(); renderMacro(); renderOnChain(); renderDeriv(); renderFactors();
+  renderTicker(); renderChart(); renderTA(); renderFG(); renderMacro(); renderEcon(); renderOnChain(); renderDeriv(); renderFactors();
   renderPaper();
   initNetwork(); renderHeatmap();
   renderStatus(ok);
