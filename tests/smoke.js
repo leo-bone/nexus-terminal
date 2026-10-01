@@ -21,6 +21,8 @@ function payload(rawu) {
     return { result: { list: Array.from({ length: 200 }, (_, i) => ({ openInterest: String(1000 + i * 3), timestamp: String(now - i * 86400000) })) } };
   if (u.includes('account-ratio'))
     return { result: { list: Array.from({ length: 200 }, (_, i) => ({ buyRatio: String(0.5 + Math.sin(i / 9) * 0.08), timestamp: String(now - i * 86400000) })) } };
+  if (u.includes('/api/global'))
+    return { mcap: 2.87e12, btcD: 58.4, ethD: 11.5, src: 'coinlore' };
   if (u.includes('coinpaprika'))
     return { market_cap_usd: 2.6e12, bitcoin_dominance_percentage: 57.3 };
   if (u.includes('stablecoins.llama.fi'))
@@ -100,7 +102,9 @@ try {
     console.log(ids.map(k => `${k}[dir${r.out[k].dir}]z=${r.out[k].z.toFixed(2)}/c=${r.out[k].contribution.toFixed(2)}`).join(' '));
     const anyNaN = ids.filter(k => !isFinite(r.out[k].z) || !isFinite(r.out[k].contribution));
     if (anyNaN.length) { console.error('NaN 因子: ' + anyNaN.join(',')); process.exit(1); }
-    console.log('ALL Z / CONTRIBUTION FINITE OK  (参与评分 =', r.nScored, ')');
+    console.log('ALL Z / CONTRIBUTION FINITE OK  (参与评分 =', r.nScored, ', 无数据 =', r.nDead, ')');
+    if (r.nDead !== 0) { console.error('模拟数据齐全时应无死因子, nDead=' + r.nDead); process.exit(1); }
+    if (typeof r.out.dom.ok !== 'boolean') { console.error('out 缺少 ok 字段'); process.exit(1); }
     const badDir = ids.filter(k => ![1, -1, 0].includes(r.out[k].dir));
     if (badDir.length) { console.error('非法 dir: ' + badDir.join(',')); process.exit(1); }
   } catch (e) { console.error('score ERROR:', e.stack || e.message); process.exit(1); }

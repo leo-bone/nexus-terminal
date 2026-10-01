@@ -58,7 +58,7 @@ const ENDPOINTS = {
   bybitLinear: s => px(`https://api.bybit.com/v5/market/tickers?category=linear&symbol=${s}`),
   bybitOI: s => px(`https://api.bybit.com/v5/market/open-interest?category=linear&symbol=${s}&intervalTime=1d&limit=200`),
   bybitLS: s => px(`https://api.bybit.com/v5/market/account-ratio?category=linear&symbol=${s}&period=1d&limit=200`),
-  ggGlobal: px('https://api.coinpaprika.com/v1/global'),
+  ggGlobal: CONFIG.PROXY ? CONFIG.PROXY + '/api/global' : px('https://api.coinlore.net/api/global/'),
   stable: px('https://stablecoins.llama.fi/stablecoins?includePrices=false'),
   ntx: px('https://api.blockchain.info/charts/n-transactions?timespan=180days&format=json'),
   fg: px('https://api.alternative.me/fng/?limit=90'),
@@ -94,7 +94,7 @@ const last = a => (a && a.length) ? a[a.length - 1] : null;
 async function getJSON(url, ms = 9000) {
   const c = new AbortController();
   const t = setTimeout(() => c.abort(), ms);
-  try { const r = await fetch(url, { signal: c.signal }); if (!r.ok) throw 0; return await r.json(); }
+  try { const r = await fetch(url, { signal: c.signal }); if (!r.ok) throw new Error('HTTP ' + r.status); return await r.json(); }
   finally { clearTimeout(t); }
 }
 
@@ -234,10 +234,11 @@ async function fetchFG() {
 }
 async function fetchGlobal() {
   try {
-    const d = await getJSON(ENDPOINTS.ggGlobal);
-    state.global = { total_market_cap: { usd: d.market_cap_usd }, market_cap_percentage: { btc: d.bitcoin_dominance_percentage } };
+    const d = await getJSON(ENDPOINTS.ggGlobal, 15000);
+    if (d.mcap == null || d.btcD == null) throw new Error('global empty');
+    state.global = { total_market_cap: { usd: d.mcap }, market_cap_percentage: { btc: d.btcD, eth: d.ethD }, _src: d.src };
     return true;
-  } catch (e) { console.warn('global fail', e); return false; }
+  } catch (e) { console.warn('global fail', (e && e.message) || e); return false; }
 }
 async function fetchStable() {
   try {
@@ -249,13 +250,18 @@ async function fetchStable() {
 }
 async function fetchChain() {
   let ok = false;
-  try {
-    const d = await getJSON(ENDPOINTS.mempoolHR);
+  const loadHR = async (attempt) => {
+    const d = await getJSON(ENDPOINTS.mempoolHR, 15000);
     const hrs = (d && d.hashrates) || [];
+    if (!hrs.length) throw new Error('hashrate empty');
     state.chainSeries.hashrate = hrs.map(x => x.avgHashrate);
     state.chainDates.hashrate = hrs.map(x => x.timestamp * 1000);
-    ok = true;
-  } catch (e) { console.warn('hashrate fail', e); }
+    if (attempt) console.warn('hashrate retry ok');
+  };
+  try {
+    try { await loadHR(0); } catch (e1) { await new Promise(r => setTimeout(r, 1200)); await loadHR(1); }
+    ok = !!state.chainSeries.hashrate;
+  } catch (e) { console.warn('hashrate fail', (e && e.message) || e); }
   try {
     const n = await getJSON(ENDPOINTS.ntx);
     const vals = (n && n.values) || [];
@@ -381,9 +387,9 @@ const FACTORS = [
   { id: 'ls', name: '⚖️ 多空比', group: 'deriv', w: 0.7, dir: -1, calc: () => { const l = state.deriv.ls; if (l == null) return { z: 0, note: '—' }; return { z: (l - 50) / 10, note: l.toFixed(1) + '%多 · 反向' }; } },
   { id: 'oi', name: '📊 合约持仓', group: 'deriv', w: 0.6, dir: -1, calc: () => { const a = state.deriv.oiSeries; if (!a || !a.length) return { z: 0, note: '—' }; return { z: rollZ(a, 120), note: fmtBig(state.deriv.oi) + ' BTC' }; } },
   /* —— 结构 / 流动性 —— */
-  { id: 'dom', name: '👑 BTC占比', group: 'market', w: 0.6, dir: -1, calc: () => { const d = state.global ? state.global.market_cap_percentage.btc : 52; return { z: (d - 52) / 6, note: d.toFixed(1) + '%' }; } },
-  { id: 'stable', name: '🪙 稳定币占比', group: 'market', w: 0.5, dir: 1, calc: () => { const st = state.stableMcap, tot = state.global && state.global.total_market_cap.usd; if (!st || !tot) return { z: 0, note: '—' }; const r = st / tot * 100; return { z: (r - 11) / 3, note: r.toFixed(1) + '% · 场外购买力' }; } },
-  { id: 'hr', name: '⛏ 算力趋势', group: 'onchain', w: 0.6, dir: 1, calc: () => { const a = state.chainSeries.hashrate; if (!a || a.length < 120) return { z: 0, note: '—' }; const z = chgZ(a, 90, 120); return { z, note: '近90日' + (z >= 0 ? '加速' : '放缓') }; } },
+  { id: 'dom', name: '👑 BTC占比', group: 'market', w: 0.6, dir: -1, calc: () => { const d = state.global && state.global.market_cap_percentage.btc; if (d == null) return { z: 0, ok: false, note: '无数据' }; return { z: (d - 56) / 5, note: d.toFixed(1) + '%' }; } },
+  { id: 'stable', name: '🪙 稳定币占比', group: 'market', w: 0.5, dir: 1, calc: () => { const st = state.stableMcap, tot = state.global && state.global.total_market_cap.usd; if (!st || !tot) return { z: 0, ok: false, note: '无数据' }; const r = st / tot * 100; return { z: (r - 11) / 3, note: r.toFixed(1) + '% · 场外购买力' }; } },
+  { id: 'hr', name: '⛏ 算力趋势', group: 'onchain', w: 0.6, dir: 1, calc: () => { const a = state.chainSeries.hashrate; if (!a || a.length < 120) return { z: 0, ok: false, note: '无数据' }; const z = chgZ(a, 90, 120); return { z, note: '近90日' + (z >= 0 ? '加速' : '放缓') }; } },
   { id: 'tx', name: '🔗 链上活跃', group: 'onchain', w: 0.5, dir: 1, calc: () => { const a = state.chainSeries.n_tx; if (!a || !a.length) return { z: 0, note: '—' }; return { z: rollZ(a, 90), note: fmtBig(last(a)) + '笔/日' }; } },
   /* —— 美元 / 风险资产 —— */
   { id: 'dxy', name: '🇺🇸 美元指数', group: 'macro', w: 1.0, dir: -1, calc: () => { const v = mV('DXY'); if (v == null) return { z: 0, note: CONFIG.PROXY ? '—' : '需Worker' }; return { z: mZ('DXY'), note: v.toFixed(1) }; } },
@@ -413,16 +419,18 @@ const FACTORS = [
 ];
 
 function computeNexusScore() {
-  let sum = 0, wsum = 0, nScored = 0; const out = {};
+  let sum = 0, wsum = 0, nScored = 0, nDead = 0; const out = {};
   FACTORS.forEach(f => {
     const r = f.calc();
+    const has = r.ok !== false;                     // 无数据的因子不进分母，避免把评分拉向 50
     const z = clampZ(r.z);
     const contribution = Math.max(-2.5, Math.min(2.5, (f.dir || 0) * z));   // 方向化贡献
-    out[f.id] = { z, contribution, dir: f.dir || 0, note: r.note };
-    if (f.dir) { sum += contribution * f.w; wsum += f.w; nScored++; }
+    out[f.id] = { z, contribution, dir: f.dir || 0, note: r.note, ok: has };
+    if (f.dir && has) { sum += contribution * f.w; wsum += f.w; nScored++; }
+    else if (f.dir && !has) nDead++;
   });
   const score = Math.round(50 + (wsum ? sum / wsum : 0) * 22);
-  return { score: Math.max(2, Math.min(98, score)), out, nScored };
+  return { score: Math.max(2, Math.min(98, score)), out, nScored, nDead };
 }
 
 /* =====================================================================
@@ -934,7 +942,7 @@ function renderDeriv() {
   const fb = $('dv_fund'); if (fb && d.funding != null) fb.style.color = d.funding > 0.03 ? '#ff3d6e' : d.funding < -0.02 ? '#00e5a0' : '#a8bfd6';
 }
 function renderFactors() {
-  const { score, out, nScored } = computeNexusScore();
+  const { score, out, nScored, nDead } = computeNexusScore();
   const ring = $('nxRing'); if (ring) { ring.setAttribute('stroke-dasharray', `${score * 2.51} 251`); ring.setAttribute('stroke', score > 60 ? '#00e5a0' : score < 40 ? '#ff3d6e' : '#ffc107'); }
   if ($('nxScore')) $('nxScore').textContent = score;
   if ($('nxSig')) { const s = score > 60 ? '偏多' : score < 40 ? '偏空' : '中性'; $('nxSig').textContent = s; $('nxSig').className = 'fscore-l ' + (score > 60 ? 'up' : score < 40 ? 'dn' : 'n'); }
@@ -943,16 +951,17 @@ function renderFactors() {
     const r = out[f.id];
     const c = r.contribution;                       // dir × z：正=利多、负=利空
     const show = f.dir === 0;
-    const col = show ? '#3a5070' : c > 0.25 ? '#00e5a0' : c < -0.25 ? '#ff3d6e' : '#ffc107';
-    const tag = show ? '仅展示' : c > 0.25 ? '利多' : c < -0.25 ? '利空' : '中性';
+    const dead = r.ok === false;
+    const col = dead || show ? '#3a5070' : c > 0.25 ? '#00e5a0' : c < -0.25 ? '#ff3d6e' : '#ffc107';
+    const tag = dead ? '无数据' : show ? '仅展示' : c > 0.25 ? '利多' : c < -0.25 ? '利空' : '中性';
     const dirTxt = f.dir > 0 ? 'z↑=利多' : f.dir < 0 ? 'z↑=利空' : '不参与评分';
     const card = document.createElement('div');
     card.className = 'fcard';
     card.title = `${f.name}\n权重 ${f.w} · 方向 ${f.dir > 0 ? '+1' : f.dir < 0 ? '-1' : '0'}（${dirTxt}）\n原始 z ${r.z.toFixed(2)} · 贡献 ${c.toFixed(2)}\n${r.note}`;
-    card.innerHTML = `<div class="fc-name">${f.name}</div><div class="fc-z" style="color:${col}">${show ? '—' : (c >= 0 ? '+' : '') + c.toFixed(1)}</div><div class="fc-str"><div class="fc-strbar" style="width:${Math.min(100, Math.abs(c) / 2.5 * 100)}%;background:${col}"></div></div><div class="fc-sig" style="color:${col}">${tag} · ${r.note}</div>`;
+    card.innerHTML = `<div class="fc-name">${f.name}</div><div class="fc-z" style="color:${col}">${show || dead ? '—' : (c >= 0 ? '+' : '') + c.toFixed(1)}</div><div class="fc-str"><div class="fc-strbar" style="width:${Math.min(100, Math.abs(c) / 2.5 * 100)}%;background:${col}"></div></div><div class="fc-sig" style="color:${col}">${tag} · ${r.note}</div>`;
     box.appendChild(card);
   });
-  const cnt = $('fCount'); if (cnt) cnt.textContent = FACTORS.length + ' 维 · ' + nScored + ' 参与评分';
+  const cnt = $('fCount'); if (cnt) cnt.textContent = FACTORS.length + ' 维 · ' + nScored + ' 参与评分' + (nDead ? ' · ' + nDead + ' 无数据' : '');
 }
 function renderStatus(ok) {
   const dot = $('netDot'); if (dot) { dot.className = 'net-dot ' + (ok ? 'ok' : ''); }

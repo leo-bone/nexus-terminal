@@ -25,6 +25,8 @@ function payload(rawu) {
   if (u.includes('market/tickers') && u.includes('category=linear')) return { result: { list: [{ fundingRate: '0.00012' }] } };
   if (u.includes('open-interest')) return { result: { list: Array.from({ length: 200 }, (_, i) => ({ openInterest: String(1000 + i * 3), timestamp: String(now - i * 86400000) })) } };
   if (u.includes('account-ratio')) return { result: { list: Array.from({ length: 200 }, (_, i) => ({ buyRatio: String(0.5 + Math.sin(i / 9) * 0.08), timestamp: String(now - i * 86400000) })) } };
+  if (u.includes('/api/global'))
+    return { mcap: 2.87e12, btcD: 58.4, ethD: 11.5, src: 'coinlore' };
   if (u.includes('coinpaprika')) return { market_cap_usd: 2.6e12, bitcoin_dominance_percentage: 57.3 };
   if (u.includes('stablecoins.llama.fi')) return { peggedAssets: [{ circulating: { peggedUSD: 1.8e11 } }] };
   if (u.includes('blockchain.info')) return { values: ts.map(t => ({ x: Math.floor(t / 1000), y: 600000 })) };
@@ -206,6 +208,30 @@ const near = (label, actual, expect, tol) => {
   const trend = 'Array.from({length:300},(_,i)=>100*Math.pow(1.002,i))';
   near('稳定复利上涨序列 chgZ ≈ 0', run(`chgZ(${trend},60,120)`), 0, 0.6);
   chk('同一序列 rollZ 明显偏离 0（旧做法会贴顶）', Math.abs(run(`rollZ(${trend},120)`)) > 1, 'true');
+
+  console.log('\n===== F. 无数据因子不稀释评分（v3.7 核心修复）=====');
+  const full = call('computeNexusScore');
+  chk('数据齐全时无死因子 (nDead=0)', full.nDead, 0);
+  chk('数据齐全时参与评分 27', full.nScored, 27);
+
+  // 拿掉 global / 稳定币 / 算力 → 三个因子应标记无数据并退出分母
+  run("state.global = null; state.stableMcap = null; state.chainSeries.hashrate = null;");
+  const dk = call('computeNexusScore');
+  chk('global 缺失 → dom 标记无数据', dk.out.dom.ok, false);
+  chk('global 缺失 → dom 不再显示假值 52，而是「无数据」', dk.out.dom.note, '无数据');
+  chk('stable 缺失 → 标记无数据', dk.out.stable.ok, false);
+  chk('hashrate 缺失 → hr 标记无数据', dk.out.hr.ok, false);
+  chk('nDead 正确计数为 3', dk.nDead, 3);
+  chk('参与评分从 27 降到 24', dk.nScored, 24);
+  chk('死因子的贡献为 0', dk.out.dom.contribution, 0);
+
+  // 关键：活因子全部 +2 时，评分必须只由活因子决定（不被死权重拉向 50）
+  // 注意：dir=-1 的因子 z=+2 时贡献是 -2，所以要让每个活因子的「贡献」都等于 +2，z 必须带上方向符号
+  run("FACTORS.forEach(f => { if (f.dir && f.id !== 'dom' && f.id !== 'stable' && f.id !== 'hr') { const zz = f.dir > 0 ? 2 : -2; f.calc = () => ({ z: zz, note: 'x' }); } });");
+  const forced = call('computeNexusScore');
+  chk('活因子全 +2 → 评分 94（不稀释）', forced.score, 94);
+  // 对照：若按 v3.6 的旧逻辑（死因子也进分母），分母含 1.7 假权重 → 50 + 22*2*(24/25.6)= 91.4，会被拉低
+  console.log('  (对照: 若死因子进分母应为 ' + Math.round(50 + 22 * 2 * (forced.nScored * 1 / (forced.nScored + 1.7))) + '，会被拉向 50)');
 
   console.log('\n' + (fail ? `❌ 失败 ${fail} 项` : '✅ 全部断言通过'));
   process.exit(fail ? 1 : 0);

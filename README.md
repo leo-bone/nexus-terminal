@@ -1,8 +1,8 @@
-# Nexus Terminal v3.6
+# Nexus Terminal v3.7
 
 加密货币 **实时监测 + 因子关系终端**。纯前端单页应用，无后端、无构建步骤。整站托管在 **Cloudflare**（前端 Workers Assets + 数据代理 Worker），并绑定自定义域名。
 
-> **数据源全部经 Cloudflare Worker 代理**：浏览器只与 `nexus-api.uichain.org` 通信，由 Worker 从边缘节点抓取真实 API 并加 CORS 头。这样解决两件事——① 中国大陆无法直连 Binance/CoinGecko 等（Binance 在中国被封禁）；② 浏览器跨域（CORS）。**已实测从 Cloudflare 边缘可稳定拉取** Bybit / CoinPaprika / DefiLlama / blockchain.info / alternative.me / mempool.space / **Yahoo Finance** / NY Fed / U.S. Treasury / **Japan MOF（日本财务省）** / **Forex Factory**（Stooq 自 2026-10 起已实际失效，仅留作兜底）。Forex Factory 的 nfs CDN **会限流（429）**，故 `/api/calendar` 采用「成功长缓存 + 失败退避 + 陈旧兜底 + XML 降级」（详见 v3.6）。
+> **数据源全部经 Cloudflare Worker 代理**：浏览器只与 `nexus-api.uichain.org` 通信，由 Worker 从边缘节点抓取真实 API 并加 CORS 头。这样解决两件事——① 中国大陆无法直连 Binance/CoinGecko 等（Binance 在中国被封禁）；② 浏览器跨域（CORS）。**已实测从 Cloudflare 边缘可稳定拉取** Bybit / CoinLore / DefiLlama / blockchain.info / alternative.me / mempool.space / **Yahoo Finance** / NY Fed / U.S. Treasury / **Japan MOF（日本财务省）** / **Forex Factory**（Stooq 自 2026-10 起已实际失效，仅留作兜底）。Forex Factory 的 nfs CDN **会限流（429）**，故 `/api/calendar` 采用「成功长缓存 + 失败退避 + 陈旧兜底 + XML 降级」（详见 v3.6）。
 
 > 部署形态：**纯 Cloudflare 单一出口**——前端（Workers Assets）+ 数据代理 Worker，均经 `workers_routes` 自动绑定到 `uichain.org`，无需手动配置 DNS。GitHub 仅作为**源码仓库**，不再对外提供 Pages 站点。
 >
@@ -23,14 +23,72 @@
 | **因子关系网络** | 力导向图（**20 个节点**）+ Pearson 相关性矩阵，基于**日收益率 + 日期对齐**实时计算各因子与 BTC 的相关关系（绿=正相关，红=负相关，线宽=相关强度） | 多源 |
 | 宏观 · 政策 · 通胀 · 大宗 · 日元 | DXY / 美债10Y / 黄金 / 标普500 / VIX / WTI原油 / 布伦特原油 / 农业 / 联邦基金利率 / **美债2Y** / 通胀预期 / 10Y-2Y 利差 / **美元/日元** / **日债10Y**（底部实时显示各序列生效数据源） | Yahoo + NY Fed + 美财政部 + 日本财务省 |
 | **美国经济日历** | 本周中/高影响美国事件：时间 · 事件 · 预期 · 前值 · 实际（非农 / 失业率 / 核心PCE / 初请 / ADP / ISM / FOMC…） | Forex Factory |
-| 链上数据 | 全网算力 / **日交易笔数** / 总市值 / BTC占比 / **稳定币市值** | mempool.space · blockchain.info · CoinPaprika · DefiLlama |
+| 链上数据 | 全网算力 / **日交易笔数** / 总市值 / BTC占比 / **稳定币市值** | mempool.space · blockchain.info · CoinLore（经 Worker `/api/global` 多源兜底） · DefiLlama |
 | 衍生品 | 资金费率 / 持仓量 / 多空比 | Bybit Linear / Open-Interest / Account-Ratio |
 | 量化回测 | 均线交叉 / RSI 反转 / **通道突破**，可选**标的 + 周期**（15m/1H/4H/1D，最多 1000 根）；输出策略收益 / **买入持有基准** / 超额 / 年化 / 夏普 / 最大回撤 / **胜率(真实平仓口径)** / **盈亏比** / 交易次数 + **净值曲线对比** + **逐笔成交明细**，含手续费 | Bybit Kline（本地计算） |
 | 模拟交易 (Paper) | **真实账户模型**：初始 10,000，可用现金 / 持仓市值 / 已实现盈亏 / 浮动盈亏 / 累计手续费 / 胜率；开仓扣现金、平仓结算盈亏，**整账户本地持久化**（含流水），含 0.1% 手续费 | Bybit（实时价） |
 
 ---
 
-## v3.6 变更（本次）
+## v3.7 变更（本次）
+
+**主题：这次不是加功能，而是「把假的变成真的」。** 用真实浏览器（CDP 无头 Chrome）对线上站点做了端到端渲染检查，抓到 **1 个掩盖真问题的诊断缺陷 + 1 个持续失效的数据源 + 1 个会系统性扭曲评分的隐性偏差**，全部修复。
+
+### 1) `getJSON` 的 `throw 0` —— 掩盖一切的诊断黑洞
+
+```js
+if (!r.ok) throw 0;        // 旧：HTTP 402 / 429 / 500 / 404 全部变成一个 "0"
+```
+
+浏览器控制台只会打出 `global fail 0`，**无法区分是限流、接口挂了、还是参数错了**。正是这个黑洞让 v3.6 的日历 429 排查变得绕。现改为 `throw new Error('HTTP ' + r.status)`，任何上游异常都能直接读出状态码。
+
+### 2) CoinPaprika 全局接口持续 402 —— BTC占比因子长期死的真凶
+
+全量探测 15 个上游数据源后发现：
+
+| 源 | 状态 |
+|---|---|
+| coinpaprika `/v1/global`（主源） | ❌ **HTTP 402 Payment Required**（免费档 60 次/时，超限封 1 小时） |
+| coingecko `/v3/global`（白名单里标了「备用」） | ❌ HTTP 429 —— **而且前端根本没写兜底逻辑，这个「备用」是死的** |
+| **coinlore `/api/global/`** | ✅ 200，**免费、无 key、限额宽松** |
+| mempool.space `/mining/hashrate/1y` | ⚠️ 偶发 404 / 21 秒超时（瞬时限流） |
+| 其余（Bybit / llama / blockchain.info / Yahoo / MOF / alternative.me） | ✅ 200 |
+
+**实际后果**（线上截图确认）：`BTC占比` 显示的是一个**硬编码的假值 52.0%**（真实 58.4%，差 6.4 个百分点），`稳定币占比` 和 `算力趋势` 显示「—」，链上面板的**总市值 / BTC占比** 整格空白 —— 而界面看起来一切正常。
+
+**修复**：Worker 新增 **`/api/global`**，与 `/api/calendar` 同一套模式：**coinlore（主）→ coinpaprika（备）→ coingecko（备2）三级兜底 + 成功缓存 10 分钟 + 失败退避 5 分钟 + 陈旧兜底**，响应头暴露 `X-Global-Source: coinlore / edge-cache / stale`。
+
+> **口径坑**：不同源的 BTC 占比算法不同 —— coinlore 给 58.4%，coinpaprika 通常给 55% 左右，**系统性差 3~5 个百分点**。切换主源必须同步校准因子里枢（52 → 56），否则 z 会整体漂移。
+
+### 3) 「无数据因子稀释评分」—— 一个此前没人发现的评分偏差
+
+旧逻辑里，只要 `dir != 0`，因子就进加权平均的**分母** —— 哪怕它根本没有数据（z=0、贡献 0）。这意味着：
+
+> **每个死掉的数据源都在把 Nexus Score 往 50（中性）拉。** 三个死因子 = 1.7 假权重 / 19.9 总权重 ≈ 8.5% 的评分被硬编码的零稀释。数据源挂得越多，终端越「看起来中性」，**故障被伪装成了「市场没有信号」**。
+
+修复：因子返回 `{ ok: false }` 时**退出分母**，`nDead` 计数并在面板标题显示「N 无数据」。回归测试 F 段验证：活因子全部贡献 +2 时评分必须等于 94（旧逻辑会算成 91）。
+
+### 4) 算力端点容错
+
+mempool.space 的 `/mining/hashrate/1y` 偶发 404/超时（瞬时限流），一次失败就让算力因子整轮空转。现改为失败后 1.2 秒重试一次，并记录真实错误信息。
+
+### 5) 验证方式升级：从 vm 沙箱到真实浏览器
+
+此前所有测试都在 vm 沙箱里跑 —— 能验证逻辑，但**验证不了「浏览器里 DOM 到底渲染成了什么」**。本次用 CDP（Chrome DevTools Protocol，Node 22 内置 WebSocket，零依赖）驱动真实无头 Chrome 打开线上站点，注入探针读取真实 DOM：
+
+| 检查项 | 修复前 | 修复后 |
+|---|---|---|
+| `👑 BTC占比` | 中性 · **52.0%（假值）** | 利空 · **58.4%（真实）** |
+| `🪙 稳定币占比` | 中性 · — | 中性 · 10.9% · 场外购买力 |
+| `⛏ 算力趋势` | 中性 · — | 利多 · 近90日加速 |
+| 链上 总市值 / BTC占比 | — / — | **$2.87T / 58.4%** |
+| 控制台警告 | `global fail 0` | **0 条** |
+
+> 这套浏览器探针是本次排障的关键：**沙箱测试全绿 ≠ 用户看到的页面是对的**。假值 52.0%、空白格，这些只有真实 DOM 才暴露。
+
+---
+
+## v3.6 变更（上一版）
 
 **主题：给因子加上「方向」，并补上日元这条最贴近加密的宏观线。**
 
@@ -109,7 +167,7 @@ EFFR 是**阶梯常数**（调息后几个月不动），120 日滚动 z 恒为 
 | 2 | 💸 资金费率 | 线性（/0.03%） | Bybit | **−1** | 费率高 = 多头拥挤 = 挤压风险 |
 | 3 | ⚖️ 多空比 | 线性（−50）/10 | Bybit | **−1** | 散户多头越重越危险（反向） |
 | 4 | 📊 合约持仓 | rollZ(120) | Bybit | **−1** | 杠杆堆积 = 脆弱性上升 |
-| 5 | 👑 BTC占比 | 线性（−52）/6 | CoinPaprika | **−1** | 占比升 = 资金收缩到蓝筹 = 风险偏好下降 |
+| 5 | 👑 BTC占比 | 线性（−56）/5（按 coinlore 口径校准） | CoinLore → CoinPaprika → CoinGecko（Worker `/api/global` 三级兜底） | **−1** | 占比升 = 资金收缩到蓝筹 = 风险偏好下降。**注意不同源口径差 3~5pp**，coinlore 系统性偏高 |
 | 6 | 🪙 稳定币占比 | 线性（−11）/3 | DefiLlama | **+1** | 稳定币占比升 = 场外购买力累积（判断项） |
 | 7 | ⛏ 算力趋势 | **chgZ(90)** | mempool.space | **+1** | 算力加速 = 矿工看多 |
 | 8 | 🔗 链上活跃 | rollZ(90) | blockchain.info | **+1** | 链上交易量升 = 真实使用上升 |
@@ -245,7 +303,8 @@ wrangler deploy          # nexus-api.uichain.org 自动绑定
 
 - `/api/snapshot` —— 宏观/政策/通胀/大宗/**日元**序列（DXY·US10Y·GOLD·SPX·VIX·OIL·BRENT·AGRI·**USDJPY**·EFFR·UST2Y·T10Y2Y·REAL10Y·BEI10·**JGB10Y**，含日期 + `_src` 数据源诊断），Yahoo 主源 / Stooq 兜底 + NY Fed + 美财政部 + 日本财务省；边缘缓存 15 分钟
 - `/api/calendar` —— 美国经济日历（本周 USD 事件，含非农/失业率/初请/PCE/CPI 的实际·预期·前值）。成功结果边缘缓存 **6 小时**，距上次尝试不足 **30 分钟**则不再打 FF（退避），失败时返回**陈旧缓存**而非报错，并对 **XML 端点**自动降级；响应头 `X-Calendar-Source` 标明 `live / edge-cache / stale`
-- `/api/fetch?url=<encoded>` —— 通用代理（白名单：Bybit / CoinPaprika / CoinGecko / alternative.me / mempool.space / DefiLlama / blockchain.info / Forex Factory / Yahoo Finance / **Japan MOF**），带 CORS 头；限流源做 10 分钟边缘缓存
+- `/api/global` —— 全球市值 / BTC 占比（coinlore 主源 → coinpaprika → coingecko 三级兜底，成功缓存 10 分钟 + 失败退避 5 分钟 + 陈旧兜底，响应头 `X-Global-Source`）
+- `/api/fetch?url=<encoded>` —— 通用代理（白名单：Bybit / CoinLore / CoinPaprika / CoinGecko / alternative.me / mempool.space / DefiLlama / blockchain.info / Forex Factory / Yahoo Finance / **Japan MOF**），带 CORS 头；限流源做 10 分钟边缘缓存
 - `/api/probe` —— 数据源可达性诊断（临时调试）
 
 `app.js` 顶部 `CONFIG.PROXY` 指向：

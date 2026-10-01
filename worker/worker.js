@@ -24,7 +24,7 @@
  * 注 3: 日本财务省 CSV 为 Shift-JIS，而 Workers 的 TextDecoder 不支持该编码；
  *       但除表头外的数据行全为 ASCII（日期 R8.8.31 + 数字），故按 UTF-8 读取后只解析数据行。
  * 注 4: Forex Factory 的 nfs CDN 会对高频请求返回 429（Rate Limited HTML 页）。
- *       /api/calendar 采用「成功长缓存 6h + 失败退避 30min + 陈旧兜底」，并对 XML 端点做自动降级，
+ *       /api/calendar 与 /api/global 均采用「成功长缓存 + 失败退避 + 陈旧兜底」，日历并对 XML 端点做自动降级，
  *       避免被限流后持续重试导致「锁死」。
  * ===================================================================== */
 
@@ -39,7 +39,8 @@ const CORS = {
 const PROXY_ALLOW = [
   'api.bybit.com',          // 行情 / K线 / 资金费率 / 持仓 / 多空比
   'api.coinpaprika.com',    // 全球市值 / BTC 占比（主源）
-  'api.coingecko.com',      // 全球市值 / BTC 占比（备用）
+  'api.coingecko.com',      // 全球市值 / BTC 占比（备用2）
+  'api.coinlore.net',       // 全球市值 / BTC 占比（主源·免费无key最稳）
   'api.alternative.me',     // 恐惧贪婪指数
   'mempool.space',          // 比特币算力
   'stablecoins.llama.fi',   // 稳定币总市值（稳定币占比因子）
@@ -315,6 +316,64 @@ async function calendarWithFallback() {
   }
 }
 
+
+/* =====================================================================
+ *  全球市值 / BTC 占比 —— 多源 + 陈旧兜底（模式同 /api/calendar）
+ *  背景：coinpaprika 免费档 60 次/小时，超限返回 402 并封 1 小时；
+ *        coingecko 免费档也常 429。coinlore 免费、无 key、限额宽松 → 主源。
+ *  注意：不同源的 BTC 占比口径不同（coinlore 约 +3~5pp 偏高于 coinpaprika），
+ *        前端因子中枢按 coinlore 口径校准，切换源时必须同步校准。
+ * ===================================================================== */
+const GLOBAL_SOURCES = [
+  { name: 'coinlore', url: 'https://api.coinlore.net/api/global/',
+    parse: d => { const g = d[0]; return { mcap: +g.total_mcap, btcD: +g.btc_d, ethD: +g.eth_d }; } },
+  { name: 'coinpaprika', url: 'https://api.coinpaprika.com/v1/global',
+    parse: d => ({ mcap: +d.market_cap_usd, btcD: +d.bitcoin_dominance_percentage, ethD: null }) },
+  { name: 'coingecko', url: 'https://api.coingecko.com/api/v3/global',
+    parse: d => ({ mcap: +d.data.total_market_cap.usd, btcD: +d.data.market_cap_percentage.btc, ethD: +d.data.market_cap_percentage.eth }) },
+];
+const GLOBAL_DATA_KEY = 'https://nexus-cache.internal/global-v1';
+const GLOBAL_META_KEY = 'https://nexus-cache.internal/global-meta-v1';
+const GLOBAL_TTL = 600;       // 成功结果缓存 10 分钟
+const GLOBAL_MIN_RETRY = 300; // 距上次尝试不足 5 分钟 → 直接吃缓存（退避）
+
+async function fetchGlobalMcap() {
+  let lastErr;
+  for (const s of GLOBAL_SOURCES) {
+    try {
+      const r = await fetch(s.url, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NexusTerminal/3.7)', 'Accept': 'application/json' } });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const v = s.parse(JSON.parse(await r.text()));
+      if (!isFinite(v.mcap) || v.mcap <= 0 || !isFinite(v.btcD) || v.btcD <= 0 || v.btcD >= 100) throw new Error('bad shape');
+      return { mcap: v.mcap, btcD: v.btcD, ethD: isFinite(v.ethD) ? v.ethD : null, src: s.name };
+    } catch (e) { lastErr = e; console.warn('global src fail', s.name, e.message); }
+  }
+  throw lastErr || new Error('global all sources failed');
+}
+
+async function globalWithFallback() {
+  const cache = caches.default;
+  const dataKey = new Request(GLOBAL_DATA_KEY), metaKey = new Request(GLOBAL_META_KEY);
+  const [hit, meta] = await Promise.all([cache.match(dataKey), cache.match(metaKey)]);
+  let lastTry = 0;
+  if (meta) { try { lastTry = (await meta.json()).t || 0; } catch (e) { } }
+  const ageSec = (Date.now() - lastTry) / 1000;
+  const wrap = (body, src) => new Response(body, { status: 200, headers: { ...CORS, 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=300', 'X-Global-Source': src } });
+
+  if (hit && ageSec < GLOBAL_MIN_RETRY) return wrap(await hit.text(), 'edge-cache');
+  try {
+    const g = await fetchGlobalMcap();
+    const payload = JSON.stringify({ mcap: g.mcap, btcD: g.btcD, ethD: g.ethD, src: g.src, ts: Date.now() });
+    await cache.put(dataKey, new Response(payload, { headers: { 'Cache-Control': `public, max-age=${GLOBAL_TTL}` } }));
+    await cache.put(metaKey, new Response(JSON.stringify({ t: Date.now(), ok: true }), { headers: { 'Cache-Control': `public, max-age=${GLOBAL_TTL}` } }));
+    return wrap(payload, g.src);
+  } catch (e) {
+    await cache.put(metaKey, new Response(JSON.stringify({ t: Date.now(), ok: false, err: String(e.message || e) }), { headers: { 'Cache-Control': `public, max-age=${GLOBAL_MIN_RETRY}` } }));
+    if (hit) return wrap(await hit.text(), 'stale');
+    return jsonResp({ error: e.message, mcap: null, btcD: null, ts: Date.now() }, 502);
+  }
+}
+
 async function buildSnapshot() {
   const macro = {}; const series = {}; const dates = {}; const srcMap = {};
   const put = (k, s, src) => {
@@ -394,6 +453,11 @@ export default {
       return resp;
     }
 
+    if (url.pathname === '/api/global') {
+      try { return await globalWithFallback(); }
+      catch (e) { return jsonResp({ error: e.message, mcap: null, btcD: null, ts: Date.now() }, 502); }
+    }
+
     if (url.pathname === '/api/calendar') {
       try { return await calendarWithFallback(); }
       catch (e) { return jsonResp({ error: e.message, events: [], ts: Date.now() }, 502); }
@@ -408,7 +472,7 @@ export default {
     }
 
     if (url.pathname === '/' || url.pathname === '/health') {
-      return jsonResp({ name: 'nexus-proxy', version: '3.6', status: 'ok', source: 'yahoo+stooq+nyfed+treasury+mof+finforexfactory+proxy', symbols: Object.keys(SIMPLE).concat(['EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'JGB10Y']) });
+      return jsonResp({ name: 'nexus-proxy', version: '3.7', status: 'ok', source: 'yahoo+stooq+nyfed+treasury+mof+coinlore+finforexfactory+proxy', symbols: Object.keys(SIMPLE).concat(['EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'JGB10Y']) });
     }
 
     return new Response('Not Found', { status: 404, headers: CORS });
