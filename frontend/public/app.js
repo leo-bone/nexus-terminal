@@ -75,6 +75,7 @@ const state = {
   series: {}, seriesDates: {}, retMaps: {},
   econ: [], econTs: null, macroSrc: null,
   lastUpdate: null, interval: '1h',
+  asof: null, histBundle: null, hist: null,
   positions: [], acct: null, btStrat: 'ma',
 };
 
@@ -150,9 +151,18 @@ function chgZ(a, days = 60, n = 120) {
   if (chg.length < 15) return 0;
   return rollZ(chg, n);
 }
-const mZ = (key, n = 120) => (state.macroSeries && state.macroSeries[key]) ? rollZ(state.macroSeries[key], n) : 0;
-const mChgZ = (key, days = 60, n = 120) => (state.macroSeries && state.macroSeries[key]) ? chgZ(state.macroSeries[key], days, n) : 0;
-const mV = key => last(state.macroSeries && state.macroSeries[key]);
+/* 历史回放游标（v3.8）：state.asof = { DXY: 123, ... } 时，下列读取器只看到该下标
+ * 之前的数据，从而能用「同一套因子代码」逐日重放历史评分（无前视偏差）。
+ * state.asof === null 表示用最新值 —— 即正常实时模式。 */
+function asofCut(a, key) {
+  if (!a) return a;
+  if (!state.asof || state.asof[key] == null) return a;
+  const i = Math.min(state.asof[key], a.length - 1);
+  return i < 0 ? [] : a.slice(0, i + 1);
+}
+const mZ = (key, n = 120) => { const a = asofCut(state.macroSeries && state.macroSeries[key], key); return a ? rollZ(a, n) : 0; };
+const mChgZ = (key, days = 60, n = 120) => { const a = asofCut(state.macroSeries && state.macroSeries[key], key); return a ? chgZ(a, days, n) : 0; };
+const mV = key => { const a = asofCut(state.macroSeries && state.macroSeries[key], key); return a && a.length ? a[a.length - 1] : null; };
 function dailyReturnsMap(ts, vals) {
   const out = new Map(); if (!ts || !vals || ts.length < 5) return out;
   const byDay = new Map();
@@ -389,8 +399,8 @@ const FACTORS = [
   /* —— 结构 / 流动性 —— */
   { id: 'dom', name: '👑 BTC占比', group: 'market', w: 0.6, dir: -1, calc: () => { const d = state.global && state.global.market_cap_percentage.btc; if (d == null) return { z: 0, ok: false, note: '无数据' }; return { z: (d - 56) / 5, note: d.toFixed(1) + '%' }; } },
   { id: 'stable', name: '🪙 稳定币占比', group: 'market', w: 0.5, dir: 1, calc: () => { const st = state.stableMcap, tot = state.global && state.global.total_market_cap.usd; if (!st || !tot) return { z: 0, ok: false, note: '无数据' }; const r = st / tot * 100; return { z: (r - 11) / 3, note: r.toFixed(1) + '% · 场外购买力' }; } },
-  { id: 'hr', name: '⛏ 算力趋势', group: 'onchain', w: 0.6, dir: 1, calc: () => { const a = state.chainSeries.hashrate; if (!a || a.length < 120) return { z: 0, ok: false, note: '无数据' }; const z = chgZ(a, 90, 120); return { z, note: '近90日' + (z >= 0 ? '加速' : '放缓') }; } },
-  { id: 'tx', name: '🔗 链上活跃', group: 'onchain', w: 0.5, dir: 1, calc: () => { const a = state.chainSeries.n_tx; if (!a || !a.length) return { z: 0, note: '—' }; return { z: rollZ(a, 90), note: fmtBig(last(a)) + '笔/日' }; } },
+  { id: 'hr', name: '⛏ 算力趋势', group: 'onchain', w: 0.6, dir: 1, calc: () => { const a = asofCut(state.chainSeries.hashrate, 'HR'); if (!a || a.length < 120) return { z: 0, ok: false, note: '无数据' }; const z = chgZ(a, 90, 120); return { z, note: '近90日' + (z >= 0 ? '加速' : '放缓') }; } },
+  { id: 'tx', name: '🔗 链上活跃', group: 'onchain', w: 0.5, dir: 1, calc: () => { const a = asofCut(state.chainSeries.n_tx, 'TX'); if (!a || !a.length) return { z: 0, ok: false, note: '无数据' }; return { z: rollZ(a, 90), note: fmtBig(a[a.length - 1]) + '笔/日' }; } },
   /* —— 美元 / 风险资产 —— */
   { id: 'dxy', name: '🇺🇸 美元指数', group: 'macro', w: 1.0, dir: -1, calc: () => { const v = mV('DXY'); if (v == null) return { z: 0, note: CONFIG.PROXY ? '—' : '需Worker' }; return { z: mZ('DXY'), note: v.toFixed(1) }; } },
   { id: 'us10y', name: '🏦 美债10Y', group: 'macro', w: 1.0, dir: -1, calc: () => { const v = mV('US10Y'); if (v == null) return { z: 0, note: '—' }; return { z: mZ('US10Y'), note: v.toFixed(2) + '%' }; } },
@@ -418,9 +428,11 @@ const FACTORS = [
   { id: 'mom', name: '🚀 动量', group: 'tech', w: 0.8, dir: 1, calc: () => { const k = state.klines['BTC' + state.interval]; if (!k) return { z: 0, note: '—' }; const c = k.map(x => x.c); const pc = pctChange(c.slice(-30)) || 0; return { z: pc / 8, note: pc.toFixed(1) + '%' }; } },
 ];
 
-function computeNexusScore() {
+function computeNexusScore(ids) {
+  const set = ids ? new Set(ids) : null;      // ids 非空 → 只算这个子集（历史回放用）
   let sum = 0, wsum = 0, nScored = 0, nDead = 0; const out = {};
   FACTORS.forEach(f => {
+    if (set && !set.has(f.id)) return;
     const r = f.calc();
     const has = r.ok !== false;                     // 无数据的因子不进分母，避免把评分拉向 50
     const z = clampZ(r.z);
@@ -963,6 +975,311 @@ function renderFactors() {
   });
   const cnt = $('fCount'); if (cnt) cnt.textContent = FACTORS.length + ' 维 · ' + nScored + ' 参与评分' + (nDead ? ' · ' + nDead + ' 无数据' : '');
 }
+/* =====================================================================
+ *  历史回放 · IC 有效性检验（v3.8）
+ *
+ *  为什么不需要数据库：Nexus Score 的每一个输入本身就是历史序列，所以只要把
+ *  长历史序列取回来，就能用**同一套因子代码**逐日重放，算出历史上每一天的评分。
+ *  没有 KV / cron / D1，永远不会和线上因子代码脱节（脱节是双份实现的经典坑）。
+ *
+ *  代价：只有「有历史序列」的因子能回放。以下三类无法回放 →
+ *    ① 事件类（非农/CPI/失业率/初请/PCE）：周历没有历史发布值
+ *    ② 衍生品快照（资金费率 / 多空比）：Bybit 只给当日值
+ *    ③ BTC占比 / 稳定币占比：需要「历史全网总市值」，免费源都没有
+ *  因此回放用 17 维子集并**重新归一化**，与实时 28 维的绝对值不可直接比较。
+ * ===================================================================== */
+const REPLAY_IDS = ['fng', 'hr', 'tx', 'dxy', 'us10y', 'spx', 'vix', 'gold', 'oil', 'geo', 'fed', 'bei', 'curve', 'jpy', 'jgb', 'tech', 'mom'];
+const REPLAY_MIN_LOOKBACK = 130;   // 每条序列至少要有这么多回看点（rollZ(120) 与 chgZ(90) 都够）
+const IC_HORIZONS = [1, 5, 10, 20];
+
+function histUrl() { return CONFIG.PROXY ? CONFIG.PROXY + '/api/history' : null; }
+
+/* 把主日历（BTC 日线）的每一天，映射到每条序列「当时可见」的最后一个下标。
+ * 这是整个回放不产生前视偏差（look-ahead bias）的关键：第 i 天只能用 ≤ 第 i 天的数据。 */
+function buildAsOf(H) {
+  const calTs = H.btc.ts, n = calTs.length;
+  const day = t => Math.floor(t / 86400000);
+  const ser = {};
+  Object.keys(H.macro || {}).forEach(k => (ser[k] = { ts: H.macro[k].ts, v: H.macro[k].closes }));
+  if (H.fng) ser.FNG = { ts: H.fng.ts, v: H.fng.closes };
+  if (H.tx) ser.TX = { ts: H.tx.ts, v: H.tx.closes };
+  if (H.hr) ser.HR = { ts: H.hr.ts, v: H.hr.closes };
+  const asof = {};
+  Object.keys(ser).forEach(k => {
+    const S = ser[k].ts, arr = new Int32Array(n);
+    let j = -1;
+    for (let i = 0; i < n; i++) {
+      const d = day(calTs[i]);
+      while (j + 1 < S.length && day(S[j + 1]) <= d) j++;
+      arr[i] = j;
+    }
+    asof[k] = arr;
+  });
+  return { calTs, ser, asof, n };
+}
+
+/* 逐日重放：走的是与实时**完全相同**的 computeNexusScore 与 calc() */
+function replayHistory() {
+  const H = state.histBundle;
+  if (!H || !H.btc || !H.btc.ts || !H.btc.ts.length) return null;
+  const { calTs, ser, asof, n } = buildAsOf(H);
+  const keys = Object.keys(asof);
+
+  let start = -1;
+  for (let i = 0; i < n; i++) { if (keys.every(k => asof[k][i] >= REPLAY_MIN_LOOKBACK)) { start = i; break; } }
+  if (start < 0 || n - start < 60) return null;
+
+  const closes = H.btc.closes;
+  const klFull = calTs.map((t, i) => ({ t, c: closes[i] }));
+
+  /* 关键：必须把历史序列灌进 state.macroSeries —— mZ/mChgZ/mV 读的是它。
+   * 只设 state.asof 而沿用实时序列，会算出「被截断的实时数据」的评分：
+   * 数值看着正常，结论全错（这个 bug 就是被回归测试 G 段抓出来的）。 */
+  const mk = keys.filter(k => k !== 'FNG' && k !== 'TX' && k !== 'HR');
+  const keep = {
+    interval: state.interval, kl: state.klines['BTC1d'], asof: state.asof, fg: state.fg,
+    hr: state.chainSeries.hashrate, tx: state.chainSeries.n_tx, series: state.macroSeries,
+  };
+  const hs = {};
+  for (let q = 0; q < mk.length; q++) hs[mk[q]] = ser[mk[q]].v;
+  state.macroSeries = hs;
+  const scores = new Array(n).fill(null);
+  let nScored = 0;
+  state.interval = '1d';
+  if (ser.HR) state.chainSeries.hashrate = ser.HR.v;
+  if (ser.TX) state.chainSeries.n_tx = ser.TX.v;
+  try {
+    for (let i = start; i < n; i++) {
+      const cur = {};
+      for (let q = 0; q < keys.length; q++) cur[keys[q]] = asof[keys[q]][i];
+      state.asof = cur;
+      state.fg = (H.fng && asof.FNG && asof.FNG[i] >= 0) ? { value: ser.FNG.v[asof.FNG[i]] } : null;
+      state.klines['BTC1d'] = klFull.slice(0, i + 1);
+      const r = computeNexusScore(REPLAY_IDS);
+      scores[i] = r.score;
+      nScored = r.nScored;
+    }
+  } finally {
+    state.interval = keep.interval; state.klines['BTC1d'] = keep.kl;
+    state.asof = keep.asof; state.fg = keep.fg;
+    state.chainSeries.hashrate = keep.hr; state.chainSeries.n_tx = keep.tx;
+    state.macroSeries = keep.series;
+  }
+  return { calTs, closes, scores, start, n, nScored, srcs: H.srcs || {} };
+}
+
+/* 平均秩（并列取平均），用于 Spearman */
+function rankAvg(a) {
+  const idx = a.map((v, i) => i).sort((x, y) => a[x] - a[y]);
+  const r = new Array(a.length);
+  let i = 0;
+  while (i < idx.length) {
+    let j = i;
+    while (j + 1 < idx.length && a[idx[j + 1]] === a[idx[i]]) j++;
+    const avg = (i + j) / 2 + 1;
+    for (let q = i; q <= j; q++) r[idx[q]] = avg;
+    i = j + 1;
+  }
+  return r;
+}
+function pearson(x, y) {
+  const n = x.length; if (n < 5) return null;
+  let mx = 0, my = 0;
+  for (let i = 0; i < n; i++) { mx += x[i]; my += y[i]; }
+  mx /= n; my /= n;
+  let sxy = 0, sxx = 0, syy = 0;
+  for (let i = 0; i < n; i++) { const a = x[i] - mx, b = y[i] - my; sxy += a * b; sxx += a * a; syy += b * b; }
+  if (!sxx || !syy) return null;
+  return sxy / Math.sqrt(sxx * syy);
+}
+
+function icFor(rep, h) {
+  const s = [], r = [];
+  for (let i = rep.start; i < rep.n; i++) {
+    if (rep.scores[i] == null) continue;
+    const j = i + h;
+    if (j >= rep.n) break;
+    const p0 = rep.closes[i];
+    if (!p0) continue;
+    s.push(rep.scores[i]); r.push(rep.closes[j] / p0 - 1);
+  }
+  if (s.length < 20) return null;
+  const buckets = [[-1e9, 40], [40, 60], [60, 1e9]].map(function (rg) {
+    const sel = [];
+    for (let i = 0; i < s.length; i++) if (s[i] >= rg[0] && s[i] < rg[1]) sel.push(r[i]);
+    const mean = sel.length ? sel.reduce(function (a, b) { return a + b; }, 0) / sel.length : null;
+    const win = sel.length ? sel.filter(function (v) { return v > 0; }).length / sel.length : null;
+    return { n: sel.length, mean: mean, win: win };
+  });
+  const base = r.reduce(function (a, b) { return a + b; }, 0) / r.length;
+  const spear = pearson(rankAvg(s), rankAvg(r));
+  /* 重叠的前向窗口 → 相邻样本高度相关，n 不是有效样本量。
+   * 按「非重叠窗口数」n/h 折算，SE(IC) ≈ 1/√(n/h)，t = IC/SE。
+   * 不做这一步会把纯噪声读成「显著信号」，这是因子研究最常见的自欺。 */
+  const neff = Math.max(4, Math.floor(s.length / h));
+  const se = 1 / Math.sqrt(neff);
+  return {
+    h: h, n: s.length, base: base, buckets: buckets,
+    neff: neff, se: se, t: spear == null ? null : spear / se,
+    pear: pearson(s, r), spear: spear,
+  };
+}
+
+/* ---------- 拉数据 + 跑检验 ---------- */
+async function runHistoryCheck() {
+  const btn = $('histRun'), note = $('histNote');
+  if (!histUrl()) { if (note) note.textContent = '此功能需要 Worker 代理（/api/history）；当前为直连模式。'; return; }
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ 回放中…'; }
+  if (note) { note.textContent = '正在拉取 2 年历史序列（约 250KB）并用同一套因子代码逐日重放…'; note.style.color = 'var(--dim)'; }
+  try {
+    if (!state.histBundle) {
+      const d = await getJSON(histUrl(), 60000);
+      if (d.error || !d.btc) throw new Error(d.error || 'history empty');
+      state.histBundle = d;
+    }
+    const rep = replayHistory();
+    if (!rep) throw new Error('历史窗口不足（各序列公共区间太短）');
+    const ics = [];
+    for (let i = 0; i < IC_HORIZONS.length; i++) { const x = icFor(rep, IC_HORIZONS[i]); if (x) ics.push(x); }
+    if (!ics.length) throw new Error('样本不足以计算 IC');
+    state.hist = { rep: rep, ics: ics };
+    renderHistory();
+    if (note) note.textContent = '';
+  } catch (e) {
+    if (note) { note.textContent = '回放失败：' + ((e && e.message) || e); note.style.color = 'var(--red)'; }
+    console.warn('history check fail', (e && e.message) || e);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '↻ 重新回放'; }
+  }
+}
+
+/* ---------- 渲染 ---------- */
+function pctS(v, dp) { return v == null ? '—' : (v >= 0 ? '+' : '') + (v * 100).toFixed(dp == null ? 2 : dp) + '%'; }
+function sigMark(t) {
+  if (t == null) return '';
+  const a = Math.abs(t);
+  return a > 3 ? '<b class="sig">**</b>' : a > 2 ? '<b class="sig">*</b>' : '';
+}
+function icColor(x) { return x > 0.05 ? '#00e5a0' : x < -0.05 ? '#ff3d6e' : '#ffc107'; }
+
+function drawHistChart(cv, rep) {
+  if (!cv) return;
+  const W = cv.clientWidth || 900, HH = 230;
+  const dpr = window.devicePixelRatio || 1;
+  cv.width = Math.round(W * dpr); cv.height = Math.round(HH * dpr);
+  cv.style.height = HH + 'px';
+  const g = cv.getContext('2d'); if (!g) return;
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, W, HH);
+
+  const padL = 32, padR = 46, padT = 10, padB = 16;
+  const iw = W - padL - padR, ih = HH - padT - padB;
+  const N = rep.n - rep.start;
+  const x = i => padL + (i - rep.start) / Math.max(1, N - 1) * iw;
+  const y = s => padT + (100 - s) / 100 * ih;
+
+  // 40~60 中性带
+  g.fillStyle = 'rgba(255,193,7,.055)';
+  g.fillRect(padL, y(60), iw, y(40) - y(60));
+
+  // 网格 + 轴标签
+  g.strokeStyle = 'rgba(255,255,255,.06)'; g.lineWidth = 1;
+  g.font = '9px "JetBrains Mono", monospace'; g.fillStyle = '#4a6a8a'; g.textAlign = 'right';
+  [20, 40, 50, 60, 80].forEach(v => {
+    g.beginPath(); g.moveTo(padL, y(v)); g.lineTo(W - padR, y(v)); g.stroke();
+    g.fillText(v, padL - 5, y(v) + 3);
+  });
+  g.setLineDash([3, 3]); g.strokeStyle = 'rgba(255,193,7,.45)';
+  g.beginPath(); g.moveTo(padL, y(50)); g.lineTo(W - padR, y(50)); g.stroke();
+  g.setLineDash([]);
+
+  // BTC 价格（右轴，归一化，淡色）—— 只为肉眼比对，不参与 IC
+  const P = [];
+  for (let i = rep.start; i < rep.n; i++) if (rep.closes[i]) P.push(rep.closes[i]);
+  if (P.length > 2) {
+    const pmin = Math.min.apply(null, P), pmax = Math.max.apply(null, P);
+    const py = v => padT + (pmax - v) / Math.max(1e-9, pmax - pmin) * ih;
+    g.strokeStyle = 'rgba(139,92,246,.5)'; g.lineWidth = 1.2;
+    g.beginPath(); let first = true;
+    for (let i = rep.start; i < rep.n; i++) { const v = rep.closes[i]; if (!v) continue; const px = x(i), pv = py(v); if (first) { g.moveTo(px, pv); first = false; } else g.lineTo(px, pv); }
+    g.stroke();
+    g.fillStyle = 'rgba(139,92,246,.85)'; g.textAlign = 'left';
+    g.fillText(pmax >= 1000 ? (pmax / 1000).toFixed(0) + 'k' : pmax.toFixed(0), W - padR + 4, py(pmax) + 3);
+    g.fillText(pmin >= 1000 ? (pmin / 1000).toFixed(0) + 'k' : pmin.toFixed(0), W - padR + 4, py(pmin) + 3);
+  }
+
+  // 评分折线（按分值着色：绿=偏多 / 红=偏空 / 灰=中性）
+  g.lineWidth = 1.6;
+  for (let i = rep.start + 1; i < rep.n; i++) {
+    const a = rep.scores[i - 1], b = rep.scores[i];
+    if (a == null || b == null) continue;
+    const m = (a + b) / 2;
+    g.strokeStyle = m > 60 ? '#00e5a0' : m < 40 ? '#ff3d6e' : '#ffc107';
+    g.beginPath(); g.moveTo(x(i - 1), y(a)); g.lineTo(x(i), y(b)); g.stroke();
+  }
+
+  // 起止日期
+  g.fillStyle = '#4a6a8a'; g.textAlign = 'left';
+  g.fillText(new Date(rep.calTs[rep.start]).toISOString().slice(0, 10), padL, HH - 4);
+  g.textAlign = 'right';
+  g.fillText(new Date(rep.calTs[rep.n - 1]).toISOString().slice(0, 10), W - padR, HH - 4);
+}
+
+function renderHistory() {
+  const S = state.hist; if (!S) return;
+  const rep = S.rep, ics = S.ics;
+  const dstr = t => new Date(t).toISOString().slice(0, 10);
+  const hint = $('histHint');
+  if (hint) hint.textContent = dstr(rep.calTs[rep.start]) + ' → ' + dstr(rep.calTs[rep.n - 1]) + ' · ' + (rep.n - rep.start) + ' 个交易日 · 回放 ' + rep.nScored + ' 维';
+
+  const tb = $('icTable');
+  if (tb) {
+    const hd = '<div class="ic-row ic-hd"><span>周期</span><span>IC<br>Spearman</span><span>IC<br>Pearson</span><span>样本</span><span>评分&gt;60<br>平均收益</span><span>评分&lt;40<br>平均收益</span></div>';
+    tb.innerHTML = hd + ics.map(function (x) {
+      const up = x.buckets[2], dn = x.buckets[0], md = x.buckets[1];
+      return '<div class="ic-row"><span class="ic-h">' + x.h + '日</span>' +
+        '<span style="color:' + icColor(x.spear == null ? 0 : x.spear) + '">' + (x.spear == null ? '—' : x.spear.toFixed(3)) + sigMark(x.t) + '</span>' +
+        '<span>' + (x.pear == null ? '—' : x.pear.toFixed(3)) + '</span>' +
+        '<span class="ic-n">' + x.n + '</span>' +
+        '<span style="color:' + (up.mean == null ? '#5b7a9a' : up.mean >= 0 ? '#00e5a0' : '#ff3d6e') + '">' + pctS(up.mean) + '<i>n=' + up.n + '</i></span>' +
+        '<span style="color:' + (dn.mean == null ? '#5b7a9a' : dn.mean >= 0 ? '#00e5a0' : '#ff3d6e') + '">' + pctS(dn.mean) + '<i>n=' + dn.n + '</i></span>' +
+        '</div>';
+    }).join('') +
+      '<div class="ic-note">中性档（40~60）' + ics.map(function (x) { return x.h + '日 ' + pctS(x.buckets[1].mean); }).join(' · ') +
+      '<br>基准（全样本 ' + ics[0].h + ' 日前向收益）= ' + pctS(ics[0].base) + '。判定门槛：<b>分档要单调、要跑赢基准、IC 要通过显著性</b>。' +
+      '<br><b>*</b> = |t|&gt;2 · <b>*</b><b>*</b> = |t|&gt;3。t 按非重叠窗口数折算（有效样本 ≈ 样本/' + ics[0].h + ' 天），' +
+      '直接用 n 算会把重叠窗口的噪声读成信号 —— 这是因子研究里最常见的自欺。</div>';
+  }
+
+  const box = $('histBars');
+  if (box) {
+    const x10 = ics.find(function (v) { return v.h === 10; }) || ics[0];
+    const mx = Math.max.apply(null, x10.buckets.map(function (b) { return Math.abs(b.mean || 0); }).concat([1e-4]));
+    const names = ['偏空 <40', '中性 40~60', '偏多 >60'];
+    const cols = ['#ff3d6e', '#ffc107', '#00e5a0'];
+    box.innerHTML = '<div class="fttl" style="margin-bottom:6px">' + x10.h + ' 日前向收益 · 分档（含胜率）</div>' +
+      x10.buckets.map(function (b, i) {
+        const w = b.mean == null ? 0 : Math.abs(b.mean) / mx * 100;
+        const neg = (b.mean || 0) < 0;
+        return '<div class="brow"><span class="bn">' + names[i] + '</span>' +
+          '<span class="bw"><i style="width:' + w.toFixed(1) + '%;background:' + cols[i] + ';' + (neg ? 'opacity:.55' : '') + '"></i></span>' +
+          '<span class="bv" style="color:' + (b.mean == null ? '#5b7a9a' : neg ? '#ff3d6e' : '#00e5a0') + '">' + pctS(b.mean) + '</span>' +
+          '<span class="bc">' + (b.win == null ? '—' : (b.win * 100).toFixed(0) + '%') + '<i>n=' + b.n + '</i></span></div>';
+      }).join('');
+  }
+
+  const src = $('histSrc');
+  if (src) {
+    const s = rep.srcs || {};
+    const cov = state.histBundle && state.histBundle.coverage;
+    const covTxt = cov ? '覆盖度：最短序列 ' + cov.minKey + ' ' + cov.minLen + ' 点' + (cov.degraded ? '（降级·可能是某源偶发失败）' : '') + '，共 ' + cov.nSeries + ' 条。' : '';
+    src.textContent = covTxt + '回放因子子集（17 维）：情绪 / 算力 / 链上活跃 / 美元 / 美债10Y / 标普 / VIX / 黄金 / 原油 / 地缘代理 / 美联储2Y / 通胀预期 / 期限利差 / 美元日元 / 日债10Y / 技术面 / 动量。' +
+      '不含：5 个事件因子（无历史发布值）、资金费率与多空比（仅当日值）、BTC占比与稳定币占比（无历史总市值）。价格用 ' + (s.BTC || 'yahoo:BTC-USD') + '。';
+  }
+
+  drawHistChart($('histCanvas'), rep);
+}
+
 function renderStatus(ok) {
   const dot = $('netDot'); if (dot) { dot.className = 'net-dot ' + (ok ? 'ok' : ''); }
   if ($('lastUpd')) $('lastUpd').textContent = '更新 ' + new Date().toLocaleTimeString('zh-CN');
@@ -993,6 +1310,7 @@ function bindUI() {
   if (cv) cv.addEventListener('mousemove', e => { const rect = cv.getBoundingClientRect(); const k = state.klines['BTC' + state.interval]; if (!k) return; const i = Math.round((e.clientX - rect.left) / (rect.width) * (k.length - 1)); chartState.hover = Math.max(0, Math.min(k.length - 1, i)); renderChart(); });
   if (cv) cv.addEventListener('mouseleave', () => { chartState.hover = -1; const tt = $('chartTip'); if (tt) tt.style.display = 'none'; renderChart(); });
   const bt = $('btRun'); if (bt) bt.addEventListener('click', renderBacktest);
+  const hb = $('histRun'); if (hb) hb.addEventListener('click', runHistoryCheck);
   // 策略切换：原实现绑定的是 HTML 中并不存在的 #btStrat，导致点 RSI/突破毫无反应
   document.querySelectorAll('.bt-tab').forEach(tab => tab.addEventListener('click', () => {
     document.querySelectorAll('.bt-tab').forEach(x => x.classList.remove('on')); tab.classList.add('on');
@@ -1016,6 +1334,7 @@ window.addEventListener('load', async () => {
   setInterval(refreshAll, CONFIG.REFRESH_MS);
   window.addEventListener('resize', () => {
     renderChart();
+    if (state.hist) renderHistory();
     if (net) { net.W = $('netCanvas').clientWidth; net.H = $('netCanvas').clientHeight; net.idle = 0; if (!netRunning) { netRunning = true; animateNetwork(); } }
   });
 });

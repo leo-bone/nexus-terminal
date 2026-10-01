@@ -227,11 +227,106 @@ const near = (label, actual, expect, tol) => {
 
   // 关键：活因子全部 +2 时，评分必须只由活因子决定（不被死权重拉向 50）
   // 注意：dir=-1 的因子 z=+2 时贡献是 -2，所以要让每个活因子的「贡献」都等于 +2，z 必须带上方向符号
+  // 这里会临时改写 calc，必须原样还原，否则后面所有段落都会跑在被污染的因子表上
+  run("globalThis.__origCalc = FACTORS.map(f => f.calc); globalThis.__origState = { g: state.global, s: state.stableMcap, hr: state.chainSeries.hashrate };");
   run("FACTORS.forEach(f => { if (f.dir && f.id !== 'dom' && f.id !== 'stable' && f.id !== 'hr') { const zz = f.dir > 0 ? 2 : -2; f.calc = () => ({ z: zz, note: 'x' }); } });");
   const forced = call('computeNexusScore');
   chk('活因子全 +2 → 评分 94（不稀释）', forced.score, 94);
   // 对照：若按 v3.6 的旧逻辑（死因子也进分母），分母含 1.7 假权重 → 50 + 22*2*(24/25.6)= 91.4，会被拉低
   console.log('  (对照: 若死因子进分母应为 ' + Math.round(50 + 22 * 2 * (forced.nScored * 1 / (forced.nScored + 1.7))) + '，会被拉向 50)');
+
+  // 还原被污染的因子表与 state，保证 F 段对后续段落零副作用
+  run("FACTORS.forEach((f,i) => { f.calc = globalThis.__origCalc[i]; }); state.global = globalThis.__origState.g; state.stableMcap = globalThis.__origState.s; state.chainSeries.hashrate = globalThis.__origState.hr; delete globalThis.__origCalc; delete globalThis.__origState;");
+
+
+  console.log('\n===== G. 历史回放引擎 + IC 检验（v3.8）=====');
+
+  /* 构造一份「人工埋了信号」的合成历史包：所有宏观序列都带同一条正弦，
+   * 符号按各自 dir 选取，使 sig 上行时各因子贡献一致为正；BTC 收益也由同一条正弦驱动。
+   * 信号周期取 120 天 ≈ rollZ(120) 的一个窗口，目的是让 z 平滑摆动 ±1.4 而不是长期贴顶
+   * （周期远大于窗口时 (last−mean) 长期同号，z 会一直顶在 ±2，分档就全挤在一档）。 */
+  const mkHist = () => call(`(N) => {
+    const day = 86400000, t0 = Date.parse('2025-01-01');
+    const ts = Array.from({length: N}, (_, i) => t0 + i * day);
+    const mk = f => ({ ts: ts.slice(), closes: ts.map((_, i) => f(i)) });
+    const S  = i => Math.sin(i / 19.1);          // BTC 自身
+    const SP = i => Math.sin((i + 60) / 19.1);   // 预测因子：领先 BTC 半个周期
+    const K = 0.20;
+    const ser = {};
+    ser.DXY    = mk(i => 100  * (1 - K * SP(i)));   // dir -1
+    ser.US10Y  = mk(i => 5    * (1 - K * SP(i)));   // dir -1
+    ser.SPX    = mk(i => 5000 * (1 + K * SP(i)));   // dir +1
+    ser.VIX    = mk(i => 20   * (1 - K * SP(i)));   // dir -1
+    ser.GOLD   = mk(i => 4000 * (1 - K * SP(i)));   // dir -1
+    ser.OIL    = mk(i => 90   * (1 - K * SP(i)));   // dir -1
+    ser.BRENT  = mk(i => 95   * (1 - K * SP(i)));
+    ser.UST2Y  = mk(i => 5    * (1 - K * SP(i)));   // dir -1
+    ser.BEI10  = mk(i => 2.4  * (1 - K * SP(i)));   // dir -1
+    ser.T10Y2Y = mk(i => 0.5  * (1 + K * SP(i)));   // dir +1
+    ser.USDJPY = mk(i => 150  * (1 + K * SP(i)));   // dir +1
+    ser.JGB10Y = mk(i => 3    * (1 - K * SP(i)));   // dir -1
+    const fng = mk(i => 50 - 25 * SP(i));            // dir -1
+    const hr  = mk(i => 1e21 * (1 + 0.20 * SP(i)));  // dir +1
+    const tx  = mk(i => 500000 * (1 + 0.20 * SP(i)));// dir +1
+    const btc = mk(i => 30000 * Math.exp(0.0004 * i + 0.30 * S(i)));
+    return { macro: ser, fng, tx, hr, btc, srcs: { BTC: 'test:btc' } };
+  }`, 420);
+
+  run('state.asof = null; state.hist = null; state.histBundle = null;');
+  const liveBefore = call('computeNexusScore');
+  call('h => { state.histBundle = h; }', mkHist());
+  const rep = call('replayHistory');
+
+  chk('回放返回结果', !!rep, 'true');
+  if (rep) {
+    const win = rep.n - rep.start;
+    chk('回放窗口 ≥ 250 天', win >= 250, 'true');
+    chk('回放因子数 = 17', rep.nScored, 17);
+    chk('评分全部落在 [2,98]', rep.scores.slice(rep.start).every(x => x >= 2 && x <= 98), 'true');
+    const uniq = new Set(rep.scores.slice(rep.start)).size;
+    chk('评分有足够波动（非贴顶）', uniq > 20, 'true');
+    chk('评分未被钳到边界（既不恒 2 也不恒 98）', rep.scores.slice(rep.start).some(x => x > 5 && x < 95), 'true');
+
+    /* —— 无前视偏差（look-ahead bias）：篡改最后 60 天输入，历史评分必须一字不变 —— */
+    const H2 = mkHist();
+    const cut = 60, last = rep.n - 1;
+    for (let i = last - cut + 1; i <= last; i++) {
+      H2.macro.SPX.closes[i] *= 3;
+      H2.macro.DXY.closes[i] *= 0.4;
+      H2.macro.VIX.closes[i] *= 4;
+      H2.btc.closes[i] *= 2;
+    }
+    call('h => { state.histBundle = h; }', H2);
+    const rep2 = call('replayHistory');
+    let same = true;
+    for (let i = rep.start; i <= last - cut; i++) if (rep.scores[i] !== rep2.scores[i]) { same = false; break; }
+    chk('无前视偏差（篡改未来不改变历史评分）', same, 'true');
+
+    /* —— IC：应检出人工埋入的信号 —— */
+    const ic1 = call('icFor', rep, 1);
+    const ic5 = call('icFor', rep, 5);
+    const ic10 = call('icFor', rep, 10);
+    chk('有足够样本（10 日）', ic10.n >= 200, 'true');
+    chk('IC(1日) Spearman > 0', ic1.spear > 0, 'true');
+    chk('IC(5日) Spearman > 0', ic5.spear > 0, 'true');
+    chk('IC(10日) Spearman > 0', ic10.spear > 0, 'true');
+    chk('IC 在 [-1,1] 内', Math.abs(ic10.spear) <= 1 && Math.abs(ic10.pear) <= 1, 'true');
+
+    const up = ic10.buckets[2], mid = ic10.buckets[1], dn = ic10.buckets[0];
+    chk('偏多档有样本', up.n >= 5, 'true');
+    chk('偏空档有样本', dn.n >= 5, 'true');
+    chk('分档单调：>60 档收益 > 中性档 > <40 档', up.mean > mid.mean && mid.mean > dn.mean, 'true');
+    chk('偏多档胜率 > 偏空档胜率', up.win > dn.win, 'true');
+    console.log('   IC(10日)=' + ic10.spear.toFixed(3) + ' · 分档样本 ' + dn.n + '/' + mid.n + '/' + up.n +
+      ' · 10日平均收益 ' + (dn.mean * 100).toFixed(2) + '% / ' + (mid.mean * 100).toFixed(2) + '% / ' + (up.mean * 100).toFixed(2) + '%');
+  }
+
+  /* —— 回放不得污染实时状态 —— */
+  const liveAfter = call('computeNexusScore');
+  chk('回放后游标已复位', run('state.asof'), null);
+  chk('回放不污染实时评分', liveAfter.score, liveBefore.score);
+  chk('回放后实时评分仍为 28 维', Object.keys(liveAfter.out).length, 28);
+  run('state.histBundle = null;');
 
   console.log('\n' + (fail ? `❌ 失败 ${fail} 项` : '✅ 全部断言通过'));
   process.exit(fail ? 1 : 0);
