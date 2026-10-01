@@ -47,7 +47,7 @@ const state = {
   fg: null, fgSeries: [], fgDates: [],
   global: null, stableMcap: null,
   chainSeries: {}, chainDates: {},
-  deriv: {}, macro: null, macroSeries: null, macroDates: null,
+  deriv: {}, macro: null, macroSeries: null, macroDates: null, macroPrev: null,
   series: {}, seriesDates: {}, retMaps: {},
   lastUpdate: null, interval: '1h',
   positions: loadPositions(), equity: 10000,
@@ -224,7 +224,7 @@ async function fetchMacro() {
   if (!CONFIG.PROXY) { state.macro = null; state.macroSeries = null; state.macroDates = null; return false; }
   try {
     const d = await getJSON(CONFIG.PROXY + '/api/snapshot');
-    state.macro = d.macro; state.macroSeries = d.series; state.macroDates = d.dates; return true;
+    state.macro = d.macro; state.macroSeries = d.series; state.macroDates = d.dates; state.macroPrev = d._prev || null; return true;
   } catch (e) { console.warn('macro fail', e); return false; }
 }
 
@@ -489,7 +489,7 @@ function renderMacro() {
     return;
   }
   if (hint) hint.style.display = 'none';
-  const prev = state.macro && state.macro._prev;
+  const prev = state.macroPrev;
   box.innerHTML = MACRO_CARDS.map(([k, label, dp, unit]) => {
     const v = m[k];
     let valTxt = '—', subTxt = '—', subCls = 'mval';
