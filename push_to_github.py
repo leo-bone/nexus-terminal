@@ -12,7 +12,7 @@ GitHub 仅作源码镜像，不对公服务；对外服务由 Cloudflare 两个 
     - 跳过根目录 public/（旧 GitHub Pages 构建产物，已废弃；真正静态资源在 frontend/public/）
     - Cloudflare 凭据走本机 ~/.wrangler/config/default.toml 的 OAuth token（wrangler 自管）
 """
-import os, sys, base64, json, urllib.request, subprocess
+import os, sys, re, base64, json, urllib.request, subprocess
 
 OWNER = "leo-bone"
 REPO = "nexus-terminal"
@@ -90,19 +90,30 @@ st, jt = req("POST", f"/repos/{OWNER}/{REPO}/git/trees", {"tree": tree})
 new_tree = jt["sha"]
 print("TREE", new_tree)
 
-# commit message：版本号从 README 首行自动读取，避免提交信息过期
+# commit message：版本号 + 最新变更要点，全部从 README 自动读取，避免提交信息过期
 VERSION = "Nexus Terminal"
+DETAIL = ""
 try:
     with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as fh:
-        _first = fh.readline().strip()
+        _txt = fh.read()
+    _first = _txt.splitlines()[0].strip()
     if _first.startswith("# "):
         VERSION = _first[2:].strip()
+    # 取最靠前的「## vX.Y 变更」章节里的第一条要点
+    _m = re.search(r"^##\s+v[\d.]+\s*变更[^\n]*\n(.*?)(?=^##\s|\Z)", _txt, re.S | re.M)
+    if _m:
+        for _l in _m.group(1).splitlines():
+            _l = _l.strip()
+            if not _l:
+                continue
+            if _l[0].isdigit() or _l[0] in "*-" or _l.startswith("**"):
+                DETAIL = re.sub(r"^\d+[.)]\s*", "", re.sub(r"[*`]", "", _l))
+                break
 except Exception:
     pass
-MSG = sys.argv[1] if len(sys.argv) > 1 else (
-    VERSION + ": 新增事件因子(非农/失业率/初请/核心PCE/CPI) + 美国经济日历面板"
-    " + 原油双源(WTI+布伦特) + 数据源主备调换(Yahoo 主 / Stooq 兜底)"
-)
+if len(DETAIL) > 180:
+    DETAIL = DETAIL[:180].rstrip() + "…"
+MSG = sys.argv[1] if len(sys.argv) > 1 else (VERSION + ("：" + DETAIL if DETAIL else ""))
 st, jc = req("POST", f"/repos/{OWNER}/{REPO}/git/commits", {
     "message": MSG,
     "tree": new_tree,
