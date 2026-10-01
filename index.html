@@ -172,7 +172,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
   </div>
 
   <div class="panel">
-    <div class="phdr"><span class="icon">🧠</span><span class="lbl">因子模型 · Nexus Score（20 维）</span><span class="hint">Z-Score 加权合成 · 实时</span></div>
+    <div class="phdr"><span class="icon">🧠</span><span class="lbl">因子模型 · Nexus Score</span><span id="fCount" class="hint">21 维</span><span class="hint">Z-Score 加权合成 · 实时</span></div>
     <div class="fpanel">
       <div class="fhdr">
         <span class="fttl">综合多空评分</span>
@@ -197,21 +197,14 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
   </div>
 
   <div class="panel">
-    <div class="phdr"><span class="icon">🏦</span><span class="lbl">宏观仪表盘</span><span class="hint">需 Cloudflare Worker（见 README）</span></div>
-    <div class="mgrid">
-      <div class="mcard"><div class="mname">美元指数 DXY</div><div id="m_DXY" class="mval">需Worker</div><div id="m_DXY_d" class="msub">—</div></div>
-      <div class="mcard"><div class="mname">美债10Y</div><div id="m_US10Y" class="mval">需Worker</div><div id="m_US10Y_d" class="msub">—</div></div>
-      <div class="mcard"><div class="mname">黄金 (USD)</div><div id="m_GOLD" class="mval">需Worker</div><div id="m_GOLD_d" class="msub">—</div></div>
-      <div class="mcard"><div class="mname">标普500</div><div id="m_SPX" class="mval">需Worker</div><div id="m_SPX_d" class="msub">—</div></div>
-      <div class="mcard"><div class="mname">VIX 恐慌</div><div id="m_VIX" class="mval">需Worker</div><div id="m_VIX_d" class="msub">—</div></div>
-      <div class="mcard"><div class="mname">状态</div><div class="mval n" style="font-size:13px">BTC 相关性</div><div class="msub">见上方关系网络</div></div>
-    </div>
-    <div id="macroHint" class="macro-hint">未配置 Cloudflare Worker：宏观数据暂不可用。部署 Worker 后自动启用（详见 README）。</div>
+    <div class="phdr"><span class="icon">🏦</span><span class="lbl">宏观 · 政策 · 通胀 · 大宗</span><span class="hint">Stooq/Yahoo + NY Fed + 美财政部</span></div>
+    <div id="macroGrid" class="mgrid"></div>
+    <div id="macroHint" class="macro-hint">未配置 Cloudflare Worker：宏观数据暂不可用（详见 README）。</div>
   </div>
 
   <div class="main-grid">
     <div class="panel">
-      <div class="phdr"><span class="icon">⛓</span><span class="lbl">链上数据</span><span class="hint">CryptoCompare</span></div>
+      <div class="phdr"><span class="icon">⛓</span><span class="lbl">链上数据</span><span class="hint">mempool.space + blockchain.info</span></div>
       <div class="mgrid">
         <div class="mcard"><div class="mname">全网算力</div><div id="oc_hr" class="mval">—</div></div>
         <div class="mcard"><div class="mname">日交易笔数</div><div id="oc_tx" class="mval">—</div></div>
@@ -222,7 +215,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
       </div>
     </div>
     <div class="panel">
-      <div class="phdr"><span class="icon">🎯</span><span class="lbl">衍生品</span><span class="hint">Binance FAPI</span></div>
+      <div class="phdr"><span class="icon">🎯</span><span class="lbl">衍生品</span><span class="hint">Bybit（永续合约）</span></div>
       <div class="mgrid">
         <div class="mcard"><div class="mname">资金费率</div><div id="dv_fund" class="mval">—</div></div>
         <div class="mcard"><div class="mname">持仓量</div><div id="dv_oi" class="mval">—</div></div>
@@ -282,7 +275,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
   </div>
 
   <div class="footer">
-    NEXUS TERMINAL v3 · 纯前端实时加密终端 · 数据源: Binance / CryptoCompare / CoinGecko / alternative.me / Cloudflare Worker<br>
+    NEXUS TERMINAL v3.3 · 纯前端实时加密终端 · 数据源: Bybit / CoinPaprika / DefiLlama / blockchain.info / alternative.me / mempool.space / NY Fed / U.S. Treasury / Stooq<br>
     仅供研究与教育，不构成投资建议。加密资产风险极高，请独立判断。
   </div>
 </div>
