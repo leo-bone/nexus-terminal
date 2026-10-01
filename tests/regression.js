@@ -83,6 +83,7 @@ const state = vm.runInContext('state', sandbox);
 const run = expr => vm.runInContext(expr, sandbox);
 const call = (expr, ...args) => vm.runInContext('(' + expr + ')', sandbox)(...args);
 
+const fDate2 = t => { const d = new Date(t); return d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0') + '-' + String(d.getUTCDate()).padStart(2, '0'); };
 let fail = 0;
 const chk = (label, actual, expect) => {
   const ok = String(actual) === String(expect);
@@ -376,6 +377,167 @@ const near = (label, actual, expect, tol) => {
 
     const top5 = facs.slice(0, 5).map(r => r.id + ' ' + r.per[10].ic.toFixed(3)).join(' · ');
     console.log('   归因前 5：' + top5);
+  }
+
+  /* =================================================================
+   *  I. 十年窗口 · 因子动态可用性 · 极端行情归因 · 分体制（v3.11）
+   *  -----------------------------------------------------------------
+   *  v3.8~v3.10 全在 2 年窗口上做，因子还没走完一个周期，IC 恒 ≈ 0。
+   *  v3.11 把窗口拉到 10 年，随之必须回答四个新问题：
+   *    ① 早期很多序列还不存在（情绪指数 / 永续溢价 / 持仓量都是后来才有的），
+   *       回放能不能在「缺数据」的情况下照样跑起来、且缺数据不稀释评分？
+   *    ② 为了不让 10 年 × 22 因子把主线程冻住，z 值改成了预计算查表 ——
+   *       表里的值必须与原函数**逐位相等**，否则「回放与实时同一套代码」不成立
+   *    ③ 暴涨暴跌能不能被程序自己找出来，并挂到正确的外生事件上？
+   *    ④ 同一批因子，在平静期和极端期作用方式一样吗？
+   * ================================================================= */
+  console.log('\n===== I. 十年复盘：动态可用性 / 极端行情 / 分体制（v3.11）=====');
+
+  /* 合成 2900 个交易日（≈ 8 年）的「错位上线」历史：
+   *  核心宏观 + 链上从一开始就有（撑起回放骨架）；
+   *  情绪指数第 400 天、永续溢价第 1800 天、持仓量第 2400 天才上线；
+   *  MVRV / 活跃地址整段缺席 —— 复刻真实世界里「限速源拿不到」的处境；
+   *  波动率分三段（平静 0.006 / 震荡 0.030 / 极端 0.075），用于分体制对比；
+   *  在 312 与特朗普当选两个真实事件日附近各注入一次暴跌 / 暴涨，
+   *  用来检验极端行情识别能不能自己找出来、并挂到正确的事件上。 */
+  const mkHistLong = () => call(`(N) => {
+    const day = 86400000, t0 = Date.parse('2019-01-01');
+    const ts = Array.from({length: N}, (_, i) => t0 + i * day);
+    const mk = (f, from) => { const a = from == null ? 0 : from;
+      return { ts: ts.slice(a), closes: ts.slice(a).map((_, j) => f(j + a)) }; };
+    /* 确定性伪随机（LCG + Box-Muller），保证每次跑出来的数完全一样 */
+    let seed = 20261001;
+    const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+    const Z = new Array(N);
+    for (let i = 0; i < N; i++) {
+      let u = 0, v = 0; while (u === 0) u = rnd(); while (v === 0) v = rnd();
+      Z[i] = Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+    }
+    const sig = i => (i >= 1200 && i < 1291) ? 0.075
+                  : (i >= 2200 && i < 2291) ? 0.068
+                  : ((i >= 600 && i < 1001) || (i >= 1600 && i < 2001)) ? 0.030
+                  : 0.006;
+    const S  = i => Math.sin(i / 19.1);          // BTC 自身周期
+    const SP = i => Math.sin((i + 60) / 19.1);   // 预测因子（与 G 段同一配方）
+    const K = 0.20;
+    const inc = new Array(N).fill(0);
+    inc[0] = Math.log(30000);
+    for (let i = 1; i < N; i++) inc[i] = 0.0004 + 0.30 * (S(i) - S(i - 1)) + sig(i) * Z[i];
+    const inject = (a, b, tot) => { for (let i = a; i <= b; i++) inc[i] = tot / (b - a + 1); };
+    inject(436, 440, Math.log(0.65));    // 2020-03-12 附近 · 5 日 -35%（312 崩盘）
+    inject(2135, 2139, Math.log(1.42));  // 2024-11-05 附近 · 5 日 +42%（特朗普当选）
+    const px = []; let acc = 0;
+    for (let i = 0; i < N; i++) { acc += inc[i]; px.push(Math.exp(acc)); }
+    const ser = {};
+    ser.DXY    = mk(i => 100  * (1 - K * SP(i)));
+    ser.US10Y  = mk(i => 5    * (1 - K * SP(i)));
+    ser.SPX    = mk(i => 5000 * (1 + K * SP(i)));
+    ser.VIX    = mk(i => 20   * (1 - K * SP(i)));
+    ser.GOLD   = mk(i => 4000 * (1 - K * SP(i)));
+    ser.OIL    = mk(i => 90   * (1 - K * SP(i)));
+    ser.BRENT  = mk(i => 95   * (1 - K * SP(i)));
+    ser.UST2Y  = mk(i => 5    * (1 - K * SP(i)));
+    ser.BEI10  = mk(i => 2.4  * (1 - K * SP(i)));
+    ser.REAL10Y= mk(i => 1.8  * (1 - K * SP(i)));
+    ser.T10Y2Y = mk(i => 0.5  * (1 + K * SP(i)));
+    ser.USDJPY = mk(i => 150  * (1 + K * SP(i)));
+    ser.JGB10Y = mk(i => 3    * (1 - K * SP(i)));
+    ser.FEE    = mk(i => 5e5  * (1 + K * SP(i)));
+    ser.PREM   = mk(i => 0.0004 * (1 - 2 * K * SP(i)), 1800);   // 第 1800 天才上线
+    ser.OIH    = mk(i => 8e8  * (1 - K * SP(i)), 2400);         // 第 2400 天才上线
+    return { macro: ser, fng: mk(i => 50 - 25 * SP(i), 400),
+             tx: mk(i => 500000 * (1 + 0.20 * SP(i))),
+             hr: mk(i => 1e21   * (1 + 0.20 * SP(i))),
+             btc: { ts: ts.slice(), closes: px }, srcs: { BTC: 'test:long' } };
+  }`, 2900);
+
+  run('state.asof = null; state.hist = null; state.histBundle = null;');
+  call('h => { state.histBundle = h; }', mkHistLong());
+  const repL = call('replayHistory');
+
+  chk('十年窗口回放成功', !!repL, 'true');
+  if (repL) {
+    const winL = repL.n - repL.start;
+    chk('回放窗口 ≥ 2800 天（≈ 8 年）', winL >= 2800, 'true');
+    chk('起点不被"最短序列"绑死（< 200 天）', repL.start < 200, 'true');
+    chk('末日参与评分的因子数 ≥ 18', repL.nScored >= 18, 'true');
+    chk('评分全部落在 [2,98]', repL.scores.slice(repL.start).every(x => x >= 2 && x <= 98), 'true');
+
+    /* —— ① 动态可用性：因子按自己的可见长度进出分母 —— */
+    const firstAt = a => { if (!a) return -1; for (let i = 0; i < a.length; i++) if (a[i] != null) return i; return -1; };
+    const fPrem = firstAt(repL.fvals.prem), fOih = firstAt(repL.fvals.oih), fDxy = firstAt(repL.fvals.dxy);
+    chk('核心因子一开始就参与（DXY 起点 < 200）', fDxy >= 0 && fDxy < 200, 'true');
+    chk('永续溢价晚于核心因子上线（第 1800 天后）', fPrem >= 1800, 'true');
+    chk('持仓量晚于永续溢价上线（第 2400 天后）', fOih >= 2400, 'true');
+    chk('上线顺序：DXY → 溢价 → 持仓量', fDxy < fPrem && fPrem < fOih, 'true');
+    chk('MVRV / 活跃地址整段缺席（限速源拿不到）', !repL.fvals.mrv && !repL.fvals.adr, 'true');
+    chk('早期参与因子数 < 末期（动态可用性生效）', repL.nAct[repL.start] < repL.nAct[repL.n - 1], 'true');
+    console.log('   起点 ' + fDate2(repL.calTs[repL.start]) + ' → 末日 ' + fDate2(repL.calTs[repL.n - 1]) +
+      ' · ' + winL + ' 个交易日 · 参与因子数 ' + repL.nAct[repL.start] + ' → ' + repL.nAct[repL.n - 1]);
+    console.log('   因子上线：DXY 第 ' + fDxy + ' 天 · 溢价 第 ' + fPrem + ' 天 · 持仓量 第 ' + fOih + ' 天');
+
+    /* —— ② 预计算 z 表必须与原函数逐位相等 —— */
+    const raw = run('state.histBundle.macro.US10Y.closes');
+    const tabR = call('preRollZ', raw, 120);
+    const tabC = call('preChgZ', raw, 60, 120);
+    let maxR = 0, maxC = 0, nCmp = 0;
+    for (let i = 40; i < raw.length; i += 97) {
+      const a = call('rollZ', raw.slice(0, i + 1), 120);
+      const b = call('chgZ', raw.slice(0, i + 1), 60, 120);
+      maxR = Math.max(maxR, Math.abs(tabR[i] - a));
+      maxC = Math.max(maxC, Math.abs(tabC[i] - b));
+      nCmp++;
+    }
+    chk('查表 vs 原函数：rollZ 逐位一致（<1e-9）', maxR < 1e-9, 'true');
+    chk('查表 vs 原函数：chgZ 逐位一致（<1e-9）', maxC < 1e-9, 'true');
+    /* 退化窗口：120 个全同值（利率平台期）。滑窗版会因大数相消算出与 rollZ 差 1.0 的 z */
+    const flat = new Array(300).fill(5.33);
+    const flatTab = call('preRollZ', flat, 120);
+    let maxF = 0;
+    for (let i = 130; i < 300; i += 17) maxF = Math.max(maxF, Math.abs(flatTab[i] - call('rollZ', flat.slice(0, i + 1), 120)));
+    chk('退化窗口（全同值）也不出现 ±1.0 偏差（<1e-9）', maxF < 1e-9, 'true');
+    console.log('   预计算表比对 ' + nCmp + ' 个采样点 · rollZ 最大偏差 ' + maxR.toExponential(1) +
+      ' · chgZ 最大偏差 ' + maxC.toExponential(1) + ' · 退化窗口 ' + maxF.toExponential(1));
+
+    /* —— ③ 极端行情：程序自己找出来，并挂到外生事件上 —— */
+    const ext = call('findExtremes', repL).map(e => {
+      const m = call('matchEvent', repL, e);
+      e.hit = m ? m.ev : null; return e;
+    });
+    chk('识别出极端行情窗口', ext.length >= 2, 'true');
+    chk('抓到 312 级别的暴跌（5 日 ≤ -28%）', ext.some(x => x.r5 <= -0.28), 'true');
+    chk('抓到特朗普当选级别的暴涨（5 日 ≥ +30%）', ext.some(x => x.r5 >= 0.30), 'true');
+    chk('每波极端行情都带"事件前因子状态"快照', ext.every(x => x.preScore != null && (x.topZ || []).length > 0), 'true');
+    chk('至少一波能挂到外生事件日历上', ext.filter(x => x.hit).length >= 1, 'true');
+    chk('312 那一波挂到"疫情全球崩盘"', ext.some(x => x.hit && /疫情/.test(x.hit.t)), 'true');
+    console.log('   极端行情 ' + ext.length + ' 波 · 命中事件 ' + ext.filter(x => x.hit).length + ' 波');
+    ext.slice(0, 4).forEach(x => console.log('     ' + fDate2(x.ts) + '  5日 ' + (x.r5 * 100).toFixed(1) + '%' +
+      (x.hit ? '  ← ' + x.hit.t : '  ← 无对应事件') + '  · 前 20 日评分 ' + x.preScore.toFixed(1)));
+
+    /* —— ④ 分体制：平静 / 震荡 / 极端 —— */
+    const regL = call('regimeTest', repL);
+    ['calm', 'chop', 'wild'].forEach(k => {
+      const r = regL.byRegime[k];
+      chk('分体制「' + r.label + '」样本 ≥ 30', r.n >= 30, 'true');
+      chk('分体制「' + r.label + '」IC 有界', r.ic == null || Math.abs(r.ic) <= 1, 'true');
+    });
+    const sumN = ['calm', 'chop', 'wild'].reduce((a, k) => a + regL.byRegime[k].n, 0);
+    chk('三档样本数不超过回放窗口', sumN <= winL, 'true');
+    chk('因子体制画像覆盖全部活跃因子（≥ 18）', Object.keys(regL.byFactor).length >= 18, 'true');
+    chk('因子的体制画像三档齐全', Object.keys(regL.byFactor).every(id =>
+      ['calm', 'chop', 'wild'].every(k => regL.byFactor[id][k] == null || typeof regL.byFactor[id][k].ic === 'number')), 'true');
+    console.log('   分体制 IC(10日)：' + ['calm', 'chop', 'wild'].map(k => {
+      const r = regL.byRegime[k];
+      return r.label + ' n=' + r.n + ' IC=' + (r.ic == null ? '—' : r.ic.toFixed(3));
+    }).join(' · '));
+
+    /* —— ⑤ 分期：全样本 IC 是不是只由某一年拉起来 —— */
+    const perL = call('periodIC', repL);
+    chk('分期覆盖 ≥ 6 年', perL.length >= 6, 'true');
+    chk('每一期都够 60 个交易日', perL.every(r => r.n >= 60), 'true');
+    chk('年份连续递增', perL.every((r, i) => i === 0 || r.y === perL[i - 1].y + 1), 'true');
+    chk('每期 IC 有界', perL.every(r => r.ic == null || Math.abs(r.ic) <= 1), 'true');
+    console.log('   逐年 IC(10日)：' + perL.map(r => r.y + ' ' + (r.ic == null ? '—' : r.ic.toFixed(2))).join(' · '));
   }
 
   /* —— 回放不得污染实时状态 —— */

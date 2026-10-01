@@ -127,7 +127,11 @@ async function fetchYahoo(symbol, range = '1y') {
 
 /* ---------- NY Fed 联邦基金有效利率 EFFR → {ts,closes} ---------- */
 async function fetchEFFR() {
-  const url = 'https://markets.newyorkfed.org/api/rates/unsecured/effr/search.json?startDate=2024-01-01&endDate=2030-01-01';
+  /* v3.11: start pulled back from 2024-01-01 to 2015-01-01.
+   * NY Fed only has official EFFR from 2017-04 onward; earlier dates simply come
+   * back empty -> the frontend treats "series not yet started" as ok:false and
+   * drops the factor from the denominator instead of polluting the score. */
+  const url = 'https://markets.newyorkfed.org/api/rates/unsecured/effr/search.json?startDate=2015-01-01&endDate=2030-01-01';
   const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NexusTerminal/3.4)', 'Accept': 'application/json' } });
   if (!r.ok) throw new Error('nyfed ' + r.status);
   const j = await r.json();
@@ -191,17 +195,71 @@ function mergeTreasury(parts) {
   return { ts: outTs, cols };
 }
 
+/* ---------- US Treasury yields covering the 10y window (v3.11) ----------
+ * Only the per-year CSV entry point works:
+ *   - the "all" endpoint (/csv/all/all?field_tdr_date_value=all) is WAF-blocked (403)
+ *   - FRED's keyless fredgraph.csv multi-series endpoint is unreachable from here
+ *   - Stooq answers non-browser requests with a JS challenge page
+ * So it is per-year: 2016..now = 11y x 2 series = 22 subrequests.
+ *
+ * Those 22 must be lifted OUT of "rebuild the history bundle" path: the free tier
+ * caps a single invocation at 50 subrequests, and adding Yahoo/on-chain/sentiment/
+ * Bybit (~20 more) blows straight through it (measured error:
+ * "Too many subrequests by single Worker invocation").
+ * Same shape as bitdataWithCache -- the data updates daily, so cache it daily
+ * (success 12h / failure 30min cooldown).
+ *
+ * Retries are disabled for the batch (tries=1): 11 concurrent years x 3 attempts
+ * = up to 33 subrequests on a bad day, which would hit the cap again. Transient
+ * failures are absorbed by the 30-minute cooldown retry instead.
+ */
+const TS_CACHE_KEY = 'https://nexus-cache.internal/treasury-v1';
+function histYears() {
+  const now = new Date().getUTCFullYear(); const ys = [];
+  for (let y = HIST_START_YEAR; y <= now; y++) ys.push(y);
+  return ys;
+}
 async function fetchTreasuryNominal(years) {
   const ys = years || [new Date().getUTCFullYear()];
-  const parts = (await Promise.all(ys.map(y => fetchTreasuryCsvYear(y, 'daily_treasury_yield_curve', ['2 Yr', '10 Yr']).catch(() => null)))).filter(Boolean);
+  const parts = (await Promise.all(ys.map(y => fetchTreasuryCsvYear(y, 'daily_treasury_yield_curve', ['2 Yr', '10 Yr'], 1).catch(() => null)))).filter(Boolean);
   if (!parts.length) throw new Error('treasury nominal empty');
   return parts.length === 1 ? parts[0] : mergeTreasury(parts);
 }
 async function fetchTreasuryReal(years) {
   const ys = years || [new Date().getUTCFullYear()];
-  const parts = (await Promise.all(ys.map(y => fetchTreasuryCsvYear(y, 'daily_treasury_real_yield_curve', ['10 YR']).catch(() => null)))).filter(Boolean);
+  const parts = (await Promise.all(ys.map(y => fetchTreasuryCsvYear(y, 'daily_treasury_real_yield_curve', ['10 YR'], 1).catch(() => null)))).filter(Boolean);
   if (!parts.length) throw new Error('treasury real empty');
   return parts.length === 1 ? parts[0] : mergeTreasury(parts);
+}
+async function fetchTreasuryLong() {
+  const ys = histYears();
+  const nom = await fetchTreasuryNominal(ys);
+  if (nom.ts.length < 1500) throw new Error('treasury long short: ' + nom.ts.length);
+  const real = await fetchTreasuryReal(ys).catch(e => { console.warn('treasury real long fail', e.message); return null; });
+  return { nom: nom, real: real };
+}
+async function treasuryWithCache() {
+  const cache = caches.default, key = new Request(TS_CACHE_KEY);
+  try {
+    const hit = await cache.match(key);
+    if (hit) { const j = await hit.json(); return j.failed ? null : j; }
+  } catch (e) { /* cache read failure -> treat as miss */ }
+  try {
+    const val = await fetchTreasuryLong();
+    await cache.put(key, new Response(JSON.stringify(val), { headers: { 'Cache-Control': 'public, max-age=43200' } }));
+    return val;
+  } catch (e) {
+    console.warn('treasury long fail, cooldown 30min:', e.message);
+    await cache.put(key, new Response(JSON.stringify({ failed: true, err: e.message, t: Date.now() }), { headers: { 'Cache-Control': 'public, max-age=1800' } }));
+    return null;
+  }
+}
+/* keep the last n points (snapshot only needs ~3y, history wants everything) */
+function tailCols(p, n) {
+  if (!p || !p.ts) return null;
+  const k = Math.max(0, p.ts.length - n);
+  const cols = {}; Object.keys(p.cols).forEach(c => cols[c] = p.cols[c].slice(k));
+  return { ts: p.ts.slice(k), cols: cols };
 }
 
 /* 两个 {ts,cols} 按日期对齐相减 */
@@ -244,10 +302,20 @@ async function fetchJgbCsv(url, cacheTtl) {
   if (cacheTtl > 0) await caches.default.put(key, new Response(txt, { headers: { 'Cache-Control': `public, max-age=${cacheTtl}` } }));
   return txt;
 }
+/* v3.11 optimisation: jgbcm_all.csv is 1.2MB / ~10k lines and regex-parsing it
+ * line by line is a CPU hog. The old code cached the raw TEXT, so every rebuild of
+ * the history bundle re-parsed all 10k lines. Cache the parsed result instead --
+ * only one real parse per 6 hours. */
+const JGB_PARSED_KEY = 'https://nexus-cache.internal/jgb-parsed-v1';
 async function fetchJGB() {
+  const cache = caches.default;
+  try {
+    const hit = await cache.match(new Request(JGB_PARSED_KEY));
+    if (hit) { const j = await hit.json(); if (j && j.ts && j.ts.length >= 60) return j; }
+  } catch (e) { /* treat as miss */ }
+
   const rows = [];
   const push = txt => txt.split(/\r?\n/).forEach(l => { const p = parseJgbLine(l); if (p) rows.push(p); });
-  // 完整历史大文件（1.2MB）边缘缓存 6 小时；当月小文件（2KB）实时取，取最新几天
   const [hist, mon] = await Promise.allSettled([
     fetchJgbCsv(JGB_URL_ALL, 21600),
     fetchJgbCsv(JGB_URL_MONTH, 0),
@@ -257,9 +325,10 @@ async function fetchJGB() {
   const map = new Map(); rows.forEach(r => map.set(r.t, r.c));
   const ts = [...map.keys()].sort((a, b) => a - b);
   if (ts.length < 60) throw new Error('jgb insufficient (' + ts.length + ')');
-  const keep = 900;   // 约 3.5 年日频
-  const kt = ts.slice(-keep);
-  return { ts: kt, closes: kt.map(t => map.get(t)) };
+  const kt = ts.slice(-HIST_KEEP);
+  const out = { ts: kt, closes: kt.map(t => map.get(t)) };
+  try { await cache.put(new Request(JGB_PARSED_KEY), new Response(JSON.stringify(out), { headers: { 'Cache-Control': 'public, max-age=21600' } })); } catch (e) { }
+  return out;
 }
 
 async function loadSimple(key) {
@@ -426,13 +495,20 @@ const HIST_YAHOO = {
   DXY: 'DX-Y.NYB', US10Y: '^TNX', GOLD: 'GC=F', SPX: '^GSPC', VIX: '^VIX',
   OIL: 'CL=F', BRENT: 'BZ=F', USDJPY: 'JPY=X', BTC: 'BTC-USD',
 };
-const HIST_KEEP = 600;          // 每条序列最多保留 600 个日频点（约 1.6 年）
-const HIST_TTL = 3600;          // 成功缓存 1 小时
-const HIST_MIN_RETRY = 900;     // 失败退避 15 分钟
-/* 注意：改动本端点的「负载结构或语义」时必须同步提升 vN，否则会被上一次的
- * 边缘缓存挡住，表现为「改了代码但线上数据没变」（实测踩过）。 */
-const HIST_DATA_KEY = 'https://nexus-cache.internal/history-v7';
-const HIST_META_KEY = 'https://nexus-cache.internal/history-meta-v7';
+/* v3.11: window 2y -> 10y (from 2016-10).
+ * Yahoo's range=max returns MONTHLY sampling for indices (^GSPC gives only 169
+ * points), so range=10y must be explicit -- measured: BTC 3653 / DXY 3037 /
+ * other macro 2500+ points, exactly covering the target window. */
+const HIST_RANGE = '10y';
+const HIST_START_YEAR = 2016;   // first year for the per-year Treasury fetch
+const HIST_KEEP = 3900;         // max ~10.7y of daily points per series
+const HIST_TTL = 3600;          // success cache 1h
+const HIST_MIN_RETRY = 900;     // failure backoff 15min
+/* NOTE: bump vN whenever this endpoint's payload shape or semantics change,
+ * otherwise the previous edge cache masks the change and it looks like the new
+ * code never shipped (hit this twice in practice). */
+const HIST_DATA_KEY = 'https://nexus-cache.internal/history-v9';
+const HIST_META_KEY = 'https://nexus-cache.internal/history-meta-v9';
 
 const trimS = (s, n = HIST_KEEP) => {
   if (!s || !s.ts || !s.ts.length) return null;
@@ -486,7 +562,7 @@ async function fetchBitDataAll() {
     if (rows.length < 400) throw new Error('bitdata short: ' + rows.length);
     return { ts: rows.map(x => x.t), closes: rows.map(x => x.c) };
   };
-  const get = ep => fetch('https://bitcoin-data.com/v1/' + ep, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NexusTerminal/3.10)' } })
+  const get = ep => fetch('https://bitcoin-data.com/v1/' + ep, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NexusTerminal/3.11)' } })
     .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); });
   /* 串行两个请求，尊重免费档限速（8 次/小时）；429 时直接失败走降级 */
   const mrv = await get('mvrv');
@@ -495,8 +571,9 @@ async function fetchBitDataAll() {
 }
 
 async function fetchFeeHist() {
-  const r = await fetch('https://api.blockchain.info/charts/transaction-fees-usd?timespan=2years&format=json',
-    { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NexusTerminal/3.10)' } });
+  // v3.11: same as Tx/HR, switch to all (2009-now) to cover the 10y window
+  const r = await fetch('https://api.blockchain.info/charts/transaction-fees-usd?timespan=all&sampled=false&format=json',
+    { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NexusTerminal/3.11)' } });
   if (!r.ok) throw new Error('HTTP ' + r.status);
   const vals = (await r.json()).values || [];
   const rows = vals.map(x => ({ t: +x.x * 1000, c: +x.y })).filter(x => isFinite(x.t) && isFinite(x.c)).sort((a, b) => a.t - b.t);
@@ -504,9 +581,31 @@ async function fetchFeeHist() {
   return { ts: rows.map(x => x.t), closes: rows.map(x => x.c) };
 }
 
+/* Bybit premium / open-interest history: daily data, naturally shallow depth
+ * (1000d / 600d). No reason to re-hit them on every bundle rebuild -- a 6h cache
+ * removes those 4 subrequests from the steady-state path too. */
+const BYBIT_CACHE_KEY = 'https://nexus-cache.internal/bybit-hist-v1';
+async function bybitHistWithCache() {
+  const cache = caches.default, key = new Request(BYBIT_CACHE_KEY);
+  try {
+    const hit = await cache.match(key);
+    if (hit) { const j = await hit.json(); return j.failed ? null : j; }
+  } catch (e) { }
+  try {
+    const val = await Promise.all([fetchPremiumHist(), fetchOIHist()]);
+    const out = { PREM: val[0], OIH: val[1] };
+    await cache.put(key, new Response(JSON.stringify(out), { headers: { 'Cache-Control': 'public, max-age=21600' } }));
+    return out;
+  } catch (e) {
+    console.warn('bybit hist fail, cooldown 30min:', e.message);
+    await cache.put(key, new Response(JSON.stringify({ failed: true, err: e.message, t: Date.now() }), { headers: { 'Cache-Control': 'public, max-age=1800' } }));
+    return null;
+  }
+}
+
 async function fetchPremiumHist() {
   const r = await fetch('https://api.bybit.com/v5/market/premium-index-price-kline?category=linear&symbol=BTCUSDT&interval=D&limit=1000',
-    { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NexusTerminal/3.10)' } });
+    { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NexusTerminal/3.11)' } });
   if (!r.ok) throw new Error('HTTP ' + r.status);
   const d = await r.json();
   if (d.retCode !== 0) throw new Error('bybit ' + d.retMsg);
@@ -525,7 +624,7 @@ async function fetchOIHist() {
   for (let p = 0; p < 3; p++) {
     const start = end - 200 * day;
     const r = await fetch('https://api.bybit.com/v5/market/open-interest?category=linear&symbol=BTCUSDT&intervalTime=1d&limit=200&startTime=' + start + '&endTime=' + end,
-      { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NexusTerminal/3.10)' } });
+      { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NexusTerminal/3.11)' } });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const d = await r.json();
     if (d.retCode !== 0) throw new Error('bybit ' + d.retMsg);
@@ -549,7 +648,7 @@ async function fetchHistoryBundle() {
   // —— Yahoo 2 年日频 ——
   await Promise.all(Object.keys(HIST_YAHOO).map(async (k) => {
     try {
-      const d = await fetchYahoo(HIST_YAHOO[k], '2y');
+      const d = await fetchYahoo(HIST_YAHOO[k], HIST_RANGE);
       const t = trimS(d);
       if (!t) throw new Error('empty');
       if (k === 'BTC') { out.btc = t; out.srcs.BTC = 'yahoo:BTC-USD'; }
@@ -557,37 +656,37 @@ async function fetchHistoryBundle() {
     } catch (e) { console.warn('hist yahoo fail', k, e.message); }
   }));
 
-  // —— 利率类（复用 live 抓取器，它们本身就返回全历史）——
-  const Y = new Date().getUTCFullYear(), YS = [Y - 1, Y];
-  const [effr, nom, real, jgb] = await Promise.allSettled([fetchEFFR(), fetchTreasuryNominal(YS), fetchTreasuryReal(YS), fetchJGB()]);
+  // ---- rates: Treasury goes through its own long-lived cache (22 subrequests) ----
+  const [effr, jgb, tsr] = await Promise.allSettled([fetchEFFR(), fetchJGB(), treasuryWithCache()]);
   const putM = (k, v, src) => { const t = trimS(v); if (t) { out.macro[k] = t; out.srcs[k] = src; } };
 
   if (effr.status === 'fulfilled') putM('EFFR', effr.value, 'nyfed');
+  else console.warn('hist effr fail', effr.reason && effr.reason.message);
   if (jgb.status === 'fulfilled') putM('JGB10Y', jgb.value, 'mof');
-  if (nom.status === 'fulfilled') {
-    const n = nom.value;
+  else console.warn('hist jgb fail', jgb.reason && jgb.reason.message);
+  if (tsr.status === 'fulfilled' && tsr.value) {
+    const n = tsr.value.nom, rr = tsr.value.real;
     putM('UST2Y', { ts: n.ts, closes: n.cols['2 Yr'] }, 'treasury');
     putM('T10Y2Y', { ts: n.ts, closes: n.ts.map((_, i) => n.cols['10 Yr'][i] - n.cols['2 Yr'][i]) }, 'treasury');
-    if (real.status === 'fulfilled') {
-      const rr = real.value;
+    if (rr) {
       putM('REAL10Y', { ts: rr.ts, closes: rr.cols['10 YR'] }, 'treasury');
       const bei = alignSubtract(n.ts, n.cols['10 Yr'], rr.ts, rr.cols['10 YR']);
       putM('BEI10', { ts: bei.ts, closes: bei.v }, 'treasury');
     }
-  }
+  } else console.warn('hist treasury unavailable (cooldown or fail)');
 
   // —— v3.10: 本质输入（链上估值/使用量/需求 + 衍生品结构）——
   /* 与宏观源分开 allSettled：这 5 条缺了不该拖垮整个历史包，
    * 前端对缺失因子的处理是 ok:false 退出分母（v3.7 已有此机制）。 */
-  const [bd, fee, prem, oih] = await Promise.allSettled([bitDataWithCache(), fetchFeeHist(), fetchPremiumHist(), fetchOIHist()]);
+  const [bd, fee, bb] = await Promise.allSettled([bitDataWithCache(), fetchFeeHist(), bybitHistWithCache()]);
   if (bd.status === 'fulfilled' && bd.value) { putM('MRV', bd.value.MRV, 'bitcoin-data'); putM('ADR', bd.value.ADR, 'bitcoin-data'); }
   else console.warn('hist bitdata unavailable (rate-limit cooldown or fail)');
   if (fee.status === 'fulfilled') putM('FEE', fee.value, 'blockchain.info:fees-usd');
   else console.warn('hist fee fail', fee.reason && fee.reason.message);
-  if (prem.status === 'fulfilled') putM('PREM', prem.value, 'bybit:premium');
-  else console.warn('hist prem fail', prem.reason && prem.reason.message);
-  if (oih.status === 'fulfilled') putM('OIH', oih.value, 'bybit:oi');
-  else console.warn('hist oih fail', oih.reason && oih.reason.message);
+  if (bb.status === 'fulfilled' && bb.value) {
+    if (bb.value.PREM) putM('PREM', bb.value.PREM, 'bybit:premium');
+    if (bb.value.OIH) putM('OIH', bb.value.OIH, 'bybit:oi');
+  } else console.warn('hist bybit unavailable (cooldown or fail)');
 
   // —— 链上 / 情绪 ——
   await Promise.all([
@@ -604,7 +703,9 @@ async function fetchHistoryBundle() {
     })(),
     (async () => {
       try {
-        const r = await fetch('https://api.blockchain.info/charts/n-transactions?timespan=2years&format=json', { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NexusTerminal/3.8)' } });
+        // v3.11: blockchain.info supports timespan=all (2009-now, ~6455 points) which
+        // covers the 10y window; the old 2years locked on-chain factors to the tail
+        const r = await fetch('https://api.blockchain.info/charts/n-transactions?timespan=all&sampled=false&format=json', { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NexusTerminal/3.11)' } });
         if (!r.ok) throw new Error('HTTP ' + r.status);
         const vals = (await r.json()).values || [];
         const rows = vals.map(x => ({ t: +x.x * 1000, c: +x.y })).filter(x => isFinite(x.t) && isFinite(x.c)).sort((a, b) => a.t - b.t);
@@ -615,8 +716,9 @@ async function fetchHistoryBundle() {
     })(),
     (async () => {
       try {
-        // mempool 只提供 1y 算力（会成为回放窗口的瓶颈），历史包改用 blockchain.info 的 2 年算力
-        const r = await fetch('https://api.blockchain.info/charts/hash-rate?timespan=2years&format=json', { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NexusTerminal/3.8)' } });
+        // mempool only serves 1y of hashrate (would bottleneck the replay window),
+        // so the history bundle uses blockchain.info's all-range hashrate
+        const r = await fetch('https://api.blockchain.info/charts/hash-rate?timespan=all&sampled=false&format=json', { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NexusTerminal/3.11)' } });
         if (!r.ok) throw new Error('HTTP ' + r.status);
         const vals = (await r.json()).values || [];
         const rows = vals.map(x => ({ t: +x.x * 1000, c: +x.y })).filter(x => isFinite(x.t) && isFinite(x.c)).sort((a, b) => a.t - b.t);
@@ -628,17 +730,40 @@ async function fetchHistoryBundle() {
   ]);
 
   const nKeys = Object.keys(out.macro).length;
-  if (nKeys < 8 || !out.btc) throw new Error('history insufficient (macro=' + nKeys + ', btc=' + !!out.btc + ')');
+  if (nKeys < 10 || !out.btc) throw new Error('history insufficient (macro=' + nKeys + ', btc=' + !!out.btc + ')');
 
-  /* 关键：某个源偶发失败时（如美债只抓到当年那一份 → 序列从 437 点塌成 188 点），
-   * 如果照样按 1 小时缓存，就会出现「窗口莫名从 15 个月缩到 3 个月，且一小时不恢复」。
-   * 这里检测最短序列，降级时改用短 TTL，让下一次请求有机会补全。 */
-  const lens = [];
-  Object.keys(out.macro).forEach(k => lens.push({ k: k, n: out.macro[k].ts.length }));
-  ['fng', 'tx', 'hr', 'btc'].forEach(k => { if (out[k]) lens.push({ k: k.toUpperCase(), n: out[k].ts.length }); });
-  lens.sort((a, b) => a.n - b.n);
-  out.coverage = { minLen: lens[0].n, minKey: lens[0].k, degraded: lens[0].n < 380, nSeries: lens.length };
-  if (out.coverage.degraded) console.warn('history degraded', lens[0].k, lens[0].n);
+  /* Layered coverage (v3.11).
+   *
+   * The old version looked only at "shortest series" (threshold 380), which was
+   * designed for a 2y window. In a 10y window Bybit OI naturally has only 600
+   * points and MVRV only ~4 years -- they would ALWAYS be the shortest, so coverage
+   * would be permanently flagged degraded -> TTL degrades to 5 minutes -> every
+   * rebuild re-hits every external source.
+   *
+   * So: core = long-history series that form the replay backbone;
+   *     aux  = reinforcement series whose depth is naturally limited.
+   * Only a core collapse counts as real degradation. */
+  const CORE = new Set(['DXY', 'US10Y', 'GOLD', 'SPX', 'VIX', 'OIL', 'BRENT', 'USDJPY',
+    'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'JGB10Y', 'EFFR']);
+  const core = [], aux = [];
+  Object.keys(out.macro).forEach(k => (CORE.has(k) ? core : aux).push({ k: k, n: out.macro[k].ts.length }));
+  ['fng', 'tx', 'hr', 'btc'].forEach(k => { if (out[k]) core.push({ k: k.toUpperCase(), n: out[k].ts.length }); });
+  const byLen = (a, b) => a.n - b.n;
+  core.sort(byLen); aux.sort(byLen);
+  const c0 = core[0] || { k: '-', n: 0 };
+  /* A healthy 10y core should have 2500+ points (Yahoo 10y yields 2500~3653).
+   * Below 1500 means a backbone source collapsed (e.g. Treasury only got 1-2 years). */
+  const spans = {};
+  const sp = (k, s2) => { spans[k] = { n: s2.ts.length, t0: s2.ts[0], t1: s2.ts[s2.ts.length - 1] }; };
+  Object.keys(out.macro).forEach(k => sp(k, out.macro[k]));
+  ['fng', 'tx', 'hr', 'btc'].forEach(k => { if (out[k]) sp(k.toUpperCase(), out[k]); });
+  out.coverage = {
+    minLen: c0.n, minKey: c0.k, degraded: c0.n < 1500,
+    core: core.length, nSeries: core.length + aux.length,
+    auxMinLen: aux.length ? aux[0].n : null, auxMinKey: aux.length ? aux[0].k : null,
+    spans: spans,
+  };
+  if (out.coverage.degraded) console.warn('history degraded(core)', c0.k, c0.n);
   return out;
 }
 
@@ -678,23 +803,23 @@ async function buildSnapshot() {
     catch (e) { put(k, null); console.warn('simple fail', k, e.message); }
   }));
 
-  const [effr, nom, real, jgb] = await Promise.allSettled([fetchEFFR(), fetchTreasuryNominal(), fetchTreasuryReal(), fetchJGB()]);
+  /* v3.11: Treasury now uses the same 12h cache as /api/history (taking the tail
+   * ~800 trading days = 3.2y). Two wins: the live snapshot no longer issues its own
+   * subrequests, and both endpoints read the same data instead of disagreeing. */
+  const [effr, tsc, jgb] = await Promise.allSettled([fetchEFFR(), treasuryWithCache(), fetchJGB()]);
   if (effr.status === 'fulfilled') put('EFFR', effr.value, 'nyfed'); else { put('EFFR', null); console.warn('effr fail'); }
   if (jgb.status === 'fulfilled') put('JGB10Y', jgb.value, 'mof'); else { put('JGB10Y', null); console.warn('jgb fail', jgb.reason && jgb.reason.message); }
 
-  if (nom.status === 'fulfilled') {
-    const n = nom.value;
+  if (tsc.status === 'fulfilled' && tsc.value) {
+    const n = tailCols(tsc.value.nom, 800), rr = tailCols(tsc.value.real, 800);
     put('UST2Y', { ts: n.ts, closes: n.cols['2 Yr'] }, 'treasury');
-    // 10Y-2Y 期限利差
     put('T10Y2Y', { ts: n.ts, closes: n.ts.map((_, i) => n.cols['10 Yr'][i] - n.cols['2 Yr'][i]) }, 'treasury');
-    if (real.status === 'fulfilled') {
-      const rr = real.value;
+    if (rr) {
       put('REAL10Y', { ts: rr.ts, closes: rr.cols['10 YR'] }, 'treasury');
-      // 市场隐含通胀预期 = 名义10Y − 实际10Y
       const bei = alignSubtract(n.ts, n.cols['10 Yr'], rr.ts, rr.cols['10 YR']);
       put('BEI10', { ts: bei.ts, closes: bei.v }, 'treasury');
-    } else { put('REAL10Y', null); put('BEI10', null); console.warn('treasury real fail'); }
-  } else { put('UST2Y', null); put('T10Y2Y', null); put('REAL10Y', null); put('BEI10', null); console.warn('treasury nominal fail'); }
+    } else { put('REAL10Y', null); put('BEI10', null); console.warn('treasury real unavailable'); }
+  } else { put('UST2Y', null); put('T10Y2Y', null); put('REAL10Y', null); put('BEI10', null); console.warn('treasury unavailable (cooldown)'); }
 
   const prev = {};
   Object.keys(series).forEach(k => { const a = series[k]; if (a && a.length >= 2) prev[k] = a[a.length - 2]; });
@@ -769,7 +894,7 @@ export default {
     }
 
     if (url.pathname === '/' || url.pathname === '/health') {
-      return jsonResp({ name: 'nexus-proxy', version: '3.10', status: 'ok', source: 'yahoo+stooq+nyfed+treasury+mof+coinlore+finforexfactory+coinmetrics+bybit+proxy', symbols: Object.keys(SIMPLE).concat(['EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'JGB10Y']) });
+      return jsonResp({ name: 'nexus-proxy', version: '3.11', status: 'ok', source: 'yahoo+stooq+nyfed+treasury+mof+coinlore+finforexfactory+bitcoin-data+bybit+proxy', symbols: Object.keys(SIMPLE).concat(['EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'JGB10Y']) });
     }
 
     return new Response('Not Found', { status: 404, headers: CORS });

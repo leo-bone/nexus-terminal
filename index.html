@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Nexus Terminal · 加密货币因子关系终端 v3.10</title>
+<title>Nexus Terminal · 加密货币因子关系终端 v3.11</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -164,6 +164,37 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
 .bw{background:rgba(255,255,255,.05);height:8px;border-radius:3px;overflow:hidden;display:block}
 .bw i{display:block;height:100%;border-radius:3px}
 .hsrc{padding:0 14px 11px;font-size:9px;color:var(--dim);line-height:1.7}
+
+/* ---------- v3.11 十年复盘 ---------- */
+.rg-sub{font-size:9px;color:var(--dim);line-height:1.7;padding:9px 0 6px;border-top:1px solid rgba(255,255,255,.045);margin-top:9px}
+.rg-tbl{font-size:10px;font-family:"JetBrains Mono",monospace}
+.rg-hd,.rg-row{display:grid;grid-template-columns:1.25fr .5fr 1.05fr 1fr 1fr .8fr;gap:5px;align-items:center}
+.rg-hd{padding:4px 3px;font-size:8.5px;color:var(--dim);border-bottom:1px solid var(--border);line-height:1.35;letter-spacing:.2px}
+.rg-hd>span,.rg-row>span{text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rg-hd>span:first-child,.rg-row>span:first-child{text-align:left}
+.rg-row{padding:5px 3px;border-bottom:1px solid rgba(255,255,255,.04);color:var(--text2)}
+.rg-row:hover{background:rgba(0,180,255,.04)}
+.rg-nm{color:var(--text3);font-family:'Inter',sans-serif;font-size:9.5px}
+.rg-row i{font-style:normal;color:var(--dim);font-size:7.5px;margin-left:2px}
+.rg-g{color:var(--green);font-weight:600}
+.rg-r{color:var(--red);font-weight:600}
+.rg-y{color:var(--yellow)}
+.rg-dim{color:var(--dim)}
+.ex-wrap{padding:0 14px 12px;display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:8px}
+.ex-card{background:var(--bg);border:1px solid var(--border);border-left-width:3px;border-radius:7px;padding:8px 10px;transition:border-color .2s,transform .2s}
+.ex-card:hover{transform:translateX(2px);border-color:var(--border2)}
+.ex-up{border-left-color:var(--green)}
+.ex-dn{border-left-color:var(--red)}
+.ex-h{display:flex;align-items:center;gap:7px;flex-wrap:wrap;font-family:"JetBrains Mono",monospace;font-size:10px}
+.ex-d{color:var(--text4);font-weight:700}
+.ex-up .ex-r{color:var(--green)}.ex-dn .ex-r{color:var(--red)}
+.ex-r{font-weight:700;font-size:11px}
+.ex-r2{color:var(--text2);font-size:9.5px}
+.ex-k{margin-left:auto;font-family:'Inter',sans-serif;font-size:8.5px;padding:2px 6px;border-radius:9px;background:rgba(0,180,255,.09);color:var(--blue);border:1px solid rgba(0,180,255,.2);white-space:nowrap}
+.ex-ev{font-family:'Inter',sans-serif;font-size:9px;color:var(--text2);margin-top:5px;line-height:1.55}
+.ex-ev i{font-style:normal;color:var(--dim);font-size:8px;margin-left:3px}
+.ex-nohit{color:var(--dim);font-style:italic}
+.ex-z{font-size:8.5px;color:var(--dim);margin-top:4px;line-height:1.65;font-family:"JetBrains Mono",monospace}
 </style>
 </head>
 <body>
@@ -171,7 +202,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
   <div class="header">
     <div class="logo">NEXUS <em>TERMINAL</em></div>
     <div class="tagline">CRYPTO FACTOR TERMINAL</div>
-    <div class="live-badge"><span class="live-dot"></span> LIVE · v3.10</div>
+    <div class="live-badge"><span class="live-dot"></span> LIVE · v3.11</div>
     <div class="hdr-right">
       <span class="net-lbl">数据源</span><span id="netDot" class="net-dot"></span>
       <span id="lastUpd" class="last-upd">—</span>
@@ -240,10 +271,10 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
   <div class="panel">
     <div class="phdr"><span class="icon">🧪</span><span class="lbl">评分历史与有效性检验</span><span id="histHint" class="hint">未运行</span></div>
     <div class="hintro">
-      <span>把 2 年的宏观 / 链上 / 情绪序列取回来，用<b>与实时完全相同</b>的因子代码逐日重放，得到历史 Nexus Score。不仅检验分数有没有用，还把它<b>拆到因子级别</b>：哪个在做事、哪个方向设反了、哪个只是噪声；并用<b>样本外验证</b>防止自欺。<b>这是终端第一次能自证有没有用。</b></span>
+      <span>把 <b>10 年</b>（2016 → 今）的宏观 / 链上 / 情绪序列取回来，用<b>与实时完全相同</b>的因子代码逐日重放，得到历史 Nexus Score。不仅检验分数有没有用，还把它<b>拆到因子级别</b>：哪个在做事、哪个方向设反了、哪个只是噪声；并用<b>样本外验证</b>防止自欺。<b>这是终端第一次能自证有没有用。</b></span>
       <button id="histRun" class="hbtn">▶ 运行历史回放</button>
     </div>
-    <div id="histNote" class="macro-hint">点右侧按钮开始（首次需拉取约 250KB 历史序列，5~10 秒）。跑完会得到：合成分数 IC · 单项因子 IC 归因 · 样本内/外验证 · 滚动 IC。</div>
+    <div id="histNote" class="macro-hint">点右侧按钮开始（首次需拉取约 1.5MB 历史序列，5~15 秒）。跑完会得到：合成分数 IC · 单项因子 IC 归因 · 样本内/外验证 · 滚动 IC。</div>
     <div class="chart-wrap" style="padding:8px"><canvas id="histCanvas"></canvas></div>
     <div class="hgrid">
       <div class="hbox"><div class="fttl" style="margin-bottom:7px">合成分数 IC 检验 · 评分 vs 未来收益</div><div id="icTable"></div></div>
@@ -266,6 +297,19 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
       </div>
     </div>
     <div id="histSrc" class="hsrc">—</div>
+  </div>
+
+  <div class="panel">
+    <div class="phdr"><span class="icon">📜</span><span class="lbl">十年复盘 · 平静 vs 极端</span><span id="extHint" class="hint">未运行</span></div>
+    <div class="hintro">
+      <span>把 10 年的因子与 BTC 实际走向对齐：<b>程序化找出每一波暴涨暴跌</b>（不靠人工挑），再把它拆成两半 —— <b>模型里有的因子</b>（当时各自偏离多大）和 <b>模型没有纳入的外生冲击</b>（关税突袭、疫情、战争、监管禁令）。分「平静 / 震荡 / 极端」三种市场状态对比同一批因子的作用方式，回答一个关键问题：<b>平时管用的因子，在极端行情里还管用吗？</b></span>
+    </div>
+    <div class="hgrid">
+      <div class="hbox"><div class="fttl" style="margin-bottom:7px">④ 分体制对比 · 评分 vs 未来 10 日收益</div><div id="regBox"></div></div>
+      <div class="hbox"><div class="fttl" style="margin-bottom:7px">⑤ 分期稳定性 · 逐年 IC</div><div id="perBox"></div></div>
+    </div>
+    <div class="fttl" style="padding:14px 14px 7px">⑥ 极端行情 · 事件归因（哪些是因子推的，哪些是外部打进来的）</div>
+    <div id="extList" class="ex-wrap"></div>
   </div>
 
   <div class="panel">

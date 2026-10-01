@@ -75,7 +75,7 @@ const state = {
   series: {}, seriesDates: {}, retMaps: {},
   econ: [], econTs: null, macroSrc: null,
   lastUpdate: null, interval: '1h',
-  asof: null, histBundle: null, hist: null,
+  asof: null, histBundle: null, hist: null, zT: null, btcZ: null, klIdx: null,
   positions: [], acct: null, btStrat: 'ma',
 };
 
@@ -153,16 +153,158 @@ function chgZ(a, days = 60, n = 120) {
 }
 /* 历史回放游标（v3.8）：state.asof = { DXY: 123, ... } 时，下列读取器只看到该下标
  * 之前的数据，从而能用「同一套因子代码」逐日重放历史评分（无前视偏差）。
- * state.asof === null 表示用最新值 —— 即正常实时模式。 */
+ * state.asof === null 表示用最新值 —— 即正常实时模式。
+ *
+ * v3.11：回放窗口 2y → 10y（3653 个交易日 × 22 个因子）。原来的实现用
+ * asofCut() 做 slice() 复制数组、再让 rollZ/chgZ 遍历一遍，总量约
+ * 3653 × 22 × 1800 ≈ 1.4 亿次元素拷贝 —— 主线程会冻结好几秒。
+ *
+ * 关键洞察：回放是**按时间顺序**推进的，某个因子的 z 只依赖它自己序列的前缀。
+ * 所以「截至下标 i 的 z」可以一次 O(n) 滑窗预计算，回放时 O(1) 查表：
+ * 总代价从 O(n²) 降到 O(n)，快约三个数量级。
+ *
+ * 数值口径必须与 rollZ/chgZ 完全一致 —— 否则「回放跑的是与实时同一套因子代码」
+ * 这个前提就没了。回归测试 I 段用随机序列断言查表值 == 原函数值。 */
 function asofCut(a, key) {
   if (!a) return a;
   if (!state.asof || state.asof[key] == null) return a;
   const i = Math.min(state.asof[key], a.length - 1);
   return i < 0 ? [] : a.slice(0, i + 1);
 }
-const mZ = (key, n = 120) => { const a = asofCut(state.macroSeries && state.macroSeries[key], key); return a ? rollZ(a, n) : 0; };
-const mChgZ = (key, days = 60, n = 120) => { const a = asofCut(state.macroSeries && state.macroSeries[key], key); return a ? chgZ(a, days, n) : 0; };
-const mV = key => { const a = asofCut(state.macroSeries && state.macroSeries[key], key); return a && a.length ? a[a.length - 1] : null; };
+/* 统一序列访问：HR/TX 挂在 chainSeries，其余都在 macroSeries */
+function seriesOf(key) {
+  if (key === 'HR') return state.chainSeries && state.chainSeries.hashrate;
+  if (key === 'TX') return state.chainSeries && state.chainSeries.n_tx;
+  return state.macroSeries && state.macroSeries[key];
+}
+/* 截至游标可见的点数 —— 因子 ok 判定用它，而不是「序列总长度」 */
+const mLen = key => {
+  const v = seriesOf(key);
+  if (!v || !v.length) return 0;
+  if (state.asof && state.asof[key] != null) return Math.max(0, Math.min(state.asof[key], v.length - 1) + 1);
+  return v.length;
+};
+const mZ = (key, n = 120) => {
+  const v = seriesOf(key);
+  if (!v || !v.length) return 0;
+  if (state.asof && state.asof[key] != null && state.zT) {
+    const t = zTabGet(key, n === 90 ? 'r90' : 'r120');
+    if (t) { const i = Math.min(state.asof[key], t.length - 1); return i < 0 ? 0 : t[i]; }
+  }
+  return rollZ(v, n);
+};
+const mChgZ = (key, days = 60, n = 120) => {
+  const v = seriesOf(key);
+  if (!v || !v.length) return 0;
+  if (state.asof && state.asof[key] != null && state.zT) {
+    const t = zTabGet(key, 'c' + days);
+    if (t) { const i = Math.min(state.asof[key], t.length - 1); return i < 0 ? 0 : t[i]; }
+  }
+  return chgZ(v, days, n);
+};
+const mV = key => {
+  const v = seriesOf(key);
+  if (!v || !v.length) return null;
+  if (state.asof && state.asof[key] != null) { const i = Math.min(state.asof[key], v.length - 1); return i < 0 ? null : v[i]; }
+  return v[v.length - 1];
+};
+
+/* ---------- 预计算 z 表 ----------
+ * out[i] 必须**逐位等于** rollZ(v.slice(0, i+1), n) —— 「回放跑的是与实时同一套
+ * 因子代码」是本功能的全部前提，表里的值只要有一点口径差异，整套结论就不成立。
+ *
+ * 这里踩过一个隐蔽的坑：一个 120 点全同值的窗口（EFFR / 日债这类利率平台期）
+ * 真实方差是 0。原 rollZ 用 sqrt(sum((x-mean)^2)/n) 算 sd，平坦窗口下得到的是
+ * ~3.5e-15 而不是 0，于是 z = (x-mean)/3.5e-15 = **-1** —— 纯浮点噪声决定的符号。
+ * 而滑窗版用 (s2/n - mean^2) 求方差，同样的窗口因大数相消变成负数，走到 `|| 1`
+ * 兜底，算出 z ≈ 0。两者相差整整 1.0（退化窗口下 z 的全部取值区间）。
+ *
+ * 所以放弃增量，改为**每步精确重算窗口**，并且保持与原实现相同的求和顺序
+ * （两遍：先求和得 mean，再求偏差平方和得 sd）。窗口只有 90/120 宽，
+ * 表又是按 (序列, 模式) 懒构建的，总代价远小于「每天重建 K 线切片跑 ema/rsi」。
+ * 回归测试 I 段用真实序列断言最大偏差 < 1e-9。 */
+function preRollZ(v, n) {
+  const L = v.length, out = new Float64Array(L);
+  for (let i = 0; i < L; i++) {
+    const m = i + 1 < n ? i + 1 : n;
+    if (m < 10) continue;                       // 与 rollZ 的 length<10 -> 0 一致
+    const lo = i - m + 1;
+    let s = 0;
+    for (let k = lo; k <= i; k++) s += v[k];
+    const mean = s / m;
+    let acc = 0;
+    for (let k = lo; k <= i; k++) { const d = v[k] - mean; acc += d * d; }
+    const sd = Math.sqrt(acc / m) || 1;
+    out[i] = (v[i] - mean) / sd;
+  }
+  return out;
+}
+/* 滑窗版 chgZ：先算差分序列，再对差分做滑窗 rollZ，结果写回原下标。 */
+function preChgZ(v, days, n) {
+  const L = v.length, out = new Float64Array(L);
+  if (L < days + 15) return out;                // 与 chgZ 的前置判定一致
+  const chg = [], idx = [];
+  for (let i = days; i < L; i++) {
+    const q = v[i - days];
+    if (!q) continue;                           // 与 chgZ 的 `if (p)` 过滤一致
+    chg.push((v[i] - q) / Math.abs(q));
+    idx.push(i);
+  }
+  if (chg.length < 15) return out;
+  for (let k = 0; k < chg.length; k++) {
+    const m = k + 1 < n ? k + 1 : n;
+    if (m < 10) continue;
+    const lo = k - m + 1;
+    let s = 0;
+    for (let j = lo; j <= k; j++) s += chg[j];
+    const mean = s / m;
+    let acc = 0;
+    for (let j = lo; j <= k; j++) { const d = chg[j] - mean; acc += d * d; }
+    const sd = Math.sqrt(acc / m) || 1;
+    out[idx[k]] = (chg[k] - mean) / sd;
+  }
+  return out;
+}
+const Z_SPEC = { r120: [0, 120], r90: [0, 90], c30: [30, 120], c60: [60, 120], c90: [90, 120] };
+/* 按需构建并缓存：只有真正被读到的 (序列, 模式) 组合才会算（实际约 18 个）。 */
+function zTabGet(key, spec) {
+  const T = state.zT;
+  if (!T) return null;
+  const id = key + '|' + spec;
+  if (T[id] !== undefined) return T[id];
+  const v = seriesOf(key);
+  const sp = Z_SPEC[spec];
+  if (!v || v.length < 20 || !sp) { T[id] = null; return null; }
+  T[id] = sp[0] ? preChgZ(v, sp[0], sp[1]) : preRollZ(v, sp[1]);
+  return T[id];
+}
+
+/* ---------- tech / mom 的预计算（v3.11）----------
+ * 这两个因子是唯一依赖 K 线的。回放原实现每天重建一次 K 线切片、再跑
+ * ema(20)/ema(50)/rsi(14)，是 10 年窗口下最大的一笔开销（实测占总回放时间一半以上）。
+ * ema 与 rsi 都是递推式，可以一次 O(n) 算出「截至第 i 根 K 线」的值。
+ * 实时模式仍走 klines 原路径（state.btcZ 只在回放期间存在）。 */
+function buildBtcZ(closes) {
+  const L = closes.length;
+  const e20 = new Float64Array(L), e50 = new Float64Array(L), rr = new Float64Array(L);
+  const tech = new Float64Array(L), mom = new Float64Array(L), out = new Float64Array(L);
+  const k20 = 2 / 21, k50 = 2 / 51;
+  let g = 0, l = 0;                       // rsi(14) 的递推累加器，与 rsi() 内一致
+  for (let i = 0; i < L; i++) {
+    if (i === 0) { e20[0] = e50[0] = closes[0]; rr[0] = 50; tech[0] = 0; mom[0] = 0; continue; }
+    e20[i] = closes[i] * k20 + e20[i - 1] * (1 - k20);
+    e50[i] = closes[i] * k50 + e50[i - 1] * (1 - k50);
+    const d = closes[i] - closes[i - 1];
+    const up = Math.max(d, 0), dn = Math.max(-d, 0);
+    g = (g * 13 + up) / 14; l = (l * 13 + dn) / 14;
+    rr[i] = l === 0 ? 100 : 100 - 100 / (1 + g / l);
+    tech[i] = (e20[i] - e50[i]) / (e50[i] || 1) * 30 + (rr[i] - 50) / 12;
+    /* pctChange(c.slice(-30)) 是「最近 30 个元素的首尾差」= 29 个间隔 */
+    mom[i] = i >= 29 ? ((closes[i] - closes[i - 29]) / closes[i - 29] * 100) / 8 : 0;
+  }
+  return { tech, mom, rsi: rr };
+}
+
 function dailyReturnsMap(ts, vals) {
   const out = new Map(); if (!ts || !vals || ts.length < 5) return out;
   const byDay = new Map();
@@ -392,15 +534,15 @@ const META = {
  * ------------------------------------------------------------------- */
 const FACTORS = [
   /* —— 情绪 / 仓位拥挤（反向指标）—— */
-  { id: 'fng', name: '😱 恐惧贪婪', group: 'sentiment', w: 1.0, dir: -1, calc: () => { const v = state.fg ? +state.fg.value : 50; return { z: (v - 50) / 18, note: 'F&G ' + v + ' · 反向' }; } },
+  { id: 'fng', name: '😱 恐惧贪婪', group: 'sentiment', w: 1.0, dir: -1, calc: () => { if (!state.fg) return { z: 0, ok: false, note: '无数据' }; const v = +state.fg.value; return { z: (v - 50) / 18, note: 'F&G ' + v + ' · 反向' }; } },
   { id: 'fund', name: '💸 资金费率', group: 'deriv', w: 0.9, dir: -1, calc: () => { const f = state.deriv.funding; if (f == null) return { z: 0, note: '—' }; return { z: f / 0.03, note: f.toFixed(4) + '% · 反向' }; } },
   { id: 'ls', name: '⚖️ 多空比', group: 'deriv', w: 0.7, dir: -1, calc: () => { const l = state.deriv.ls; if (l == null) return { z: 0, note: '—' }; return { z: (l - 50) / 10, note: l.toFixed(1) + '%多 · 反向' }; } },
   { id: 'oi', name: '📊 合约持仓', group: 'deriv', w: 0.6, dir: -1, calc: () => { const a = state.deriv.oiSeries; if (!a || !a.length) return { z: 0, note: '—' }; return { z: rollZ(a, 120), note: fmtBig(state.deriv.oi) + ' BTC' }; } },
   /* —— 结构 / 流动性 —— */
   { id: 'dom', name: '👑 BTC占比', group: 'market', w: 0.6, dir: -1, calc: () => { const d = state.global && state.global.market_cap_percentage.btc; if (d == null) return { z: 0, ok: false, note: '无数据' }; return { z: (d - 56) / 5, note: d.toFixed(1) + '%' }; } },
   { id: 'stable', name: '🪙 稳定币占比', group: 'market', w: 0.5, dir: 1, calc: () => { const st = state.stableMcap, tot = state.global && state.global.total_market_cap.usd; if (!st || !tot) return { z: 0, ok: false, note: '无数据' }; const r = st / tot * 100; return { z: (r - 11) / 3, note: r.toFixed(1) + '% · 场外购买力' }; } },
-  { id: 'hr', name: '⛏ 算力趋势', group: 'onchain', w: 0.6, dir: 1, calc: () => { const a = asofCut(state.chainSeries.hashrate, 'HR'); if (!a || a.length < 120) return { z: 0, ok: false, note: '无数据' }; const z = chgZ(a, 90, 120); return { z, note: '近90日' + (z >= 0 ? '加速' : '放缓') }; } },
-  { id: 'tx', name: '🔗 链上活跃', group: 'onchain', w: 0.5, dir: 1, calc: () => { const a = asofCut(state.chainSeries.n_tx, 'TX'); if (!a || !a.length) return { z: 0, ok: false, note: '无数据' }; return { z: rollZ(a, 90), note: fmtBig(a[a.length - 1]) + '笔/日' }; } },
+  { id: 'hr', name: '⛏ 算力趋势', group: 'onchain', w: 0.6, dir: 1, calc: () => { if (mLen('HR') < 190) return { z: 0, ok: false, note: '无数据' }; const z = mChgZ('HR', 90); return { z, note: '近90日' + (z >= 0 ? '加速' : '放缓') }; } },
+  { id: 'tx', name: '🔗 链上活跃', group: 'onchain', w: 0.5, dir: 1, calc: () => { if (mLen('TX') < 100) return { z: 0, ok: false, note: '无数据' }; return { z: mZ('TX', 90), note: fmtBig(mV('TX')) + '笔/日' }; } },
   /* —— 美元 / 风险资产 —— */
   /* —— v3.10 回放专用因子（replayOnly）：只有历史序列、无实时源 ——
    * computeNexusScore 在实时模式（不带 ids）跳过它们；回放模式计入子集。
@@ -433,9 +575,54 @@ const FACTORS = [
   { id: 'pce', name: '💵 核心PCE', group: 'event', w: 0.6, dir: -1, calc: () => econFactor({ re: /^Core PCE Price Index m\/m$/i, std: 0.08 }) },
   { id: 'cpi', name: '🔥 CPI月率', group: 'event', w: 0.5, dir: -1, calc: () => econFactor({ re: /^CPI m\/m$/i, std: 0.12 }) },
   /* —— 技术面（BTC 自身）—— */
-  { id: 'tech', name: '📐 技术面', group: 'tech', w: 1.0, dir: 1, calc: () => { const k = state.klines['BTC' + state.interval]; if (!k) return { z: 0, note: '—' }; const c = k.map(x => x.c); const e20 = ema(c, 20), e50 = ema(c, 50), r = rsi(c); const z = (e20[e20.length - 1] - e50[e50.length - 1]) / (e50[e50.length - 1] || 1) * 30 + (r[r.length - 1] - 50) / 12; return { z, note: 'RSI ' + r[r.length - 1].toFixed(0) }; } },
-  { id: 'mom', name: '🚀 动量', group: 'tech', w: 0.8, dir: 1, calc: () => { const k = state.klines['BTC' + state.interval]; if (!k) return { z: 0, note: '—' }; const c = k.map(x => x.c); const pc = pctChange(c.slice(-30)) || 0; return { z: pc / 8, note: pc.toFixed(1) + '%' }; } },
+  /* tech / mom：回放期间走预计算表（state.btcZ），实时模式走 K 线原路径 */
+  { id: 'tech', name: '📐 技术面', group: 'tech', w: 1.0, dir: 1, calc: () => { const bz = state.btcZ; if (bz) { const i = state.klIdx == null ? bz.tech.length - 1 : state.klIdx; if (i < 100) return { z: 0, ok: false, note: '无数据' }; return { z: bz.tech[i], note: 'RSI ' + bz.rsi[i].toFixed(0) }; } const k = state.klines['BTC' + state.interval]; if (!k) return { z: 0, note: '—' }; const c = k.map(x => x.c); const e20 = ema(c, 20), e50 = ema(c, 50), r = rsi(c); const z = (e20[e20.length - 1] - e50[e50.length - 1]) / (e50[e50.length - 1] || 1) * 30 + (r[r.length - 1] - 50) / 12; return { z, note: 'RSI ' + r[r.length - 1].toFixed(0) }; } },
+  { id: 'mom', name: '🚀 动量', group: 'tech', w: 0.8, dir: 1, calc: () => { const bz = state.btcZ; if (bz) { const i = state.klIdx == null ? bz.mom.length - 1 : state.klIdx; if (i < 100) return { z: 0, ok: false, note: '无数据' }; const pc = bz.mom[i] * 8; return { z: bz.mom[i], note: pc.toFixed(1) + '%' }; } const k = state.klines['BTC' + state.interval]; if (!k) return { z: 0, note: '—' }; const c = k.map(x => x.c); const pc = pctChange(c.slice(-30)) || 0; return { z: pc / 8, note: pc.toFixed(1) + '%' }; } },
 ];
+
+/* ---------- 因子级数据可用性（v3.11）----------
+ * 10 年窗口下，早期根本不存在某些序列：情绪指数从 2018-02、MVRV 从 2022、
+ * 永续持仓量从 2025-02。这里有两个会让「无数据因子」伪装成「中性观点」的陷阱：
+ *   ① 多数 calc 写成 `if (v == null) return { z: 0, note: '—' }` —— 没设 ok:false，
+ *      于是 z=0 被计入分母，把评分系统性拉向 50（越早期的年份越严重）；
+ *   ② rollZ/chgZ 在数据不足时返回 0 而不是失败，同样伪装成中性。
+ * 所以在 computeNexusScore 里统一加一道闸门：因子依赖的序列「截至当日可见长度」
+ * 不够，直接判 ok:false 退出分母。实时模式下可见长度 = 全长，不会误伤。
+ *
+ * 第二列的门槛口径是「这个因子的 z 算法所需的最低数据量」，**不是**「z 窗口被填满」：
+ *   rollZ(120)     -> 60    （算法硬门槛是 10，60 点已经能给出有意义的偏离）
+ *   rollZ(90)      -> 50
+ *   chgZ(60,120)   -> 80    （要先攒够 days 个基点，再对差分做 z）
+ *   chgZ(90,120)   -> 110
+ *   chgZ(30,120)   -> 50
+ * 一开始用了「窗口填满」的口径（180/210），结果冒烟测试立刻抓出问题：模拟宏观序列
+ * 只有 160 点，spx/gold/geo/jpy/jgb 被静默判死。窗口没填满时 z 的噪声更大，但仍是
+ * 有效值 —— 而且实时模式在序列刚开始时本来就是这么算的，两者必须一致。 */
+const FACTOR_DEP = {
+  /* 注意：fng 不在这里 —— 它的数据挂在 state.fg 上、不是 macroSeries 里的序列，
+   * 由它自己的 calc 判 `!state.fg -> ok:false`；放进这张表会被 mLen('FNG') 恒判 0。 */
+  hr:    ['HR',    110],
+  tx:    ['TX',     50],
+  mrv:   ['MRV',    60],
+  adr:   ['ADR',    80],
+  fee:   ['FEE',    80],
+  prem:  ['PREM',   60],
+  oih:   ['OIH',    60],
+  dxy:   ['DXY',    60],
+  us10y: ['US10Y',  60],
+  spx:   ['SPX',    80],
+  vix:   ['VIX',    60],
+  gold:  ['GOLD',   80],
+  oil:   ['OIL',    50],
+  geo:   ['VIX',    80],
+  fed:   ['UST2Y',  60],
+  bei:   ['BEI10',  60],
+  curve: ['T10Y2Y', 60],
+  jpy:   ['USDJPY', 80],
+  jgb:   ['JGB10Y',110],
+  tech:  [null,      0],   // 依赖 K 线，由 calc 自查（回放时读预计算表）
+  mom:   [null,      0],
+};
 
 function computeNexusScore(ids) {
   const set = ids ? new Set(ids) : null;      // ids 非空 → 只算这个子集（历史回放用）
@@ -444,7 +631,12 @@ function computeNexusScore(ids) {
     if (set && !set.has(f.id)) return;
     if (!set && f.replayOnly) return;    // 回放专用因子不进实时评分
     const r = f.calc();
-    const has = r.ok !== false;                     // 无数据的因子不进分母，避免把评分拉向 50
+    let has = r.ok !== false;                       // 无数据的因子不进分母，避免把评分拉向 50
+    const dep = FACTOR_DEP[f.id];
+    if (has && dep) {
+      if (dep[0] === null) has = ((state.klines['BTC' + state.interval] || []).length >= dep[1]);
+      else has = mLen(dep[0]) >= dep[1];
+    }
     const z = clampZ(r.z);
     const contribution = Math.max(-2.5, Math.min(2.5, (f.dir || 0) * z));   // 方向化贡献
     out[f.id] = { z, contribution, dir: f.dir || 0, note: r.note, ok: has };
@@ -1003,7 +1195,27 @@ function renderFactors() {
  * ===================================================================== */
 const REPLAY_IDS = ['fng', 'hr', 'tx', 'mrv', 'adr', 'fee', 'prem', 'oih', 'dxy', 'us10y', 'spx', 'vix', 'gold', 'oil', 'geo', 'fed', 'bei', 'curve', 'jpy', 'jgb', 'tech', 'mom'];
 const REPLAY_MIN_LOOKBACK = 130;   // 每条序列至少要有这么多回看点（rollZ(120) 与 chgZ(90) 都够）
+/* v3.11：起点不再要求「所有序列都可用」。
+ *
+ * 原实现是 `keys.every(k => asof[k][i] >= 130)` —— 起点被**最短的那条序列**决定。
+ * 10 年窗口下 Bybit 持仓量只有 600 天，会把整个 2016~2024 直接砍掉，
+ * 而这轮的全部意义恰恰是复盘那十年。
+ *
+ * 改为按「当天有多少个因子存活」判定：够多就开始回放；之后每一天，每个因子
+ * 由自己的可见长度决定它在不在分母里（FACTOR_DEP + ok:false）。分子分母同步变化，
+ * 评分含义保持「当日可用因子的加权平均观点」—— 但这意味着**早期与近期的绝对值
+ * 不可直接比较**，面板会同时显示当天实际参与评分的因子数。
+ */
+const REPLAY_MIN_ACTIVE = 14;
 const IC_HORIZONS = [1, 5, 10, 20];
+
+/* 某条序列从哪一天起达到「可回放长度」 */
+function asofActiveAt(asof, key, need) {
+  const a = asof[key]; if (!a) return null;
+  const L = a.length, out = new Uint8Array(L);
+  for (let i = 0; i < L; i++) out[i] = (a[i] + 1 >= need) ? 1 : 0;
+  return out;
+}
 
 function histUrl() { return CONFIG.PROXY ? CONFIG.PROXY + '/api/history' : null; }
 
@@ -1038,8 +1250,21 @@ function replayHistory() {
   const { calTs, ser, asof, n } = buildAsOf(H);
   const keys = Object.keys(asof);
 
+  /* ---- 每天的「存活因子数」---- */
+  const depKeys = [];
+  REPLAY_IDS.forEach(id => { const d = FACTOR_DEP[id]; if (d && d[0]) depKeys.push([d[0], d[1]]); });
+  const actCache = {};
+  depKeys.forEach(t => { if (!actCache[t[0]]) actCache[t[0]] = asofActiveAt(asof, t[0], t[1]); });
+  const nActiveAt = i => {
+    let c = 0;
+    for (let q = 0; q < depKeys.length; q++) { const A = actCache[depKeys[q][0]]; if (A && A[i]) c++; }
+    if (i + 1 >= 100) c += 2;                                   // tech / mom 只依赖 K 线
+    if (H.fng && asof.FNG && asof.FNG[i] + 1 >= 90) c += 1;     // 情绪指数
+    return c;
+  };
+
   let start = -1;
-  for (let i = 0; i < n; i++) { if (keys.every(k => asof[k][i] >= REPLAY_MIN_LOOKBACK)) { start = i; break; } }
+  for (let i = 0; i < n; i++) { if (nActiveAt(i) >= REPLAY_MIN_ACTIVE) { start = i; break; } }
   if (start < 0 || n - start < 60) return null;
 
   const closes = H.btc.closes;
@@ -1052,16 +1277,22 @@ function replayHistory() {
   const keep = {
     interval: state.interval, kl: state.klines['BTC1d'], asof: state.asof, fg: state.fg,
     hr: state.chainSeries.hashrate, tx: state.chainSeries.n_tx, series: state.macroSeries,
+    zT: state.zT, btcZ: state.btcZ, klIdx: state.klIdx,
   };
   const hs = {};
   for (let q = 0; q < mk.length; q++) hs[mk[q]] = ser[mk[q]].v;
   state.macroSeries = hs;
+  /* v3.11：z 表改为按需懒构建（state.zT 作为空注册表）。
+   * 全量预建会白算大量用不到的组合；懒建只在首次读取某个 (序列, 模式) 时算一次。 */
+  state.zT = {};
+  state.btcZ = buildBtcZ(closes);
+
   const scores = new Array(n).fill(null);
+  const nAct = new Array(n).fill(0);
   /* v3.9：逐日收集「每个因子的方向化贡献」，用于单项因子 IC 归因。
-   * 只测合成分数的 IC ≈ 0，只回答了「现在没用」，回答不了
-   * 「哪个因子在做事、哪个在制造噪声、哪个方向设反了」。有了因子级别的表，
-   * 改因子/改权重才有依据，而不是凭感觉调。 */
-  const fvals = {};
+   * v3.11：同时收集原始 z —— 极端行情归因要回答的是「这次暴跌，是哪些因子
+   * 处在极端位置」，看的是 z 本身，而不是已经乘过方向、被裁剪到 ±2.5 的贡献。 */
+  const fvals = {}, fzs = {};
   let nScored = 0;
   state.interval = '1d';
   if (ser.HR) state.chainSeries.hashrate = ser.HR.v;
@@ -1072,15 +1303,16 @@ function replayHistory() {
       for (let q = 0; q < keys.length; q++) cur[keys[q]] = asof[keys[q]][i];
       state.asof = cur;
       state.fg = (H.fng && asof.FNG && asof.FNG[i] >= 0) ? { value: ser.FNG.v[asof.FNG[i]] } : null;
-      state.klines['BTC1d'] = klFull.slice(0, i + 1);
+      state.klIdx = i;
       const r = computeNexusScore(REPLAY_IDS);
       scores[i] = r.score;
-      nScored = r.nScored;
+      nScored = r.nScored; nAct[i] = r.nScored;
       for (const fid in r.out) {
         const o = r.out[fid];
         if (o.dir && o.ok) {
-          if (!fvals[fid]) fvals[fid] = new Array(n).fill(null);
+          if (!fvals[fid]) { fvals[fid] = new Array(n).fill(null); fzs[fid] = new Array(n).fill(null); }
           fvals[fid][i] = o.contribution;
+          fzs[fid][i] = o.z;
         }
       }
     }
@@ -1088,9 +1320,11 @@ function replayHistory() {
     state.interval = keep.interval; state.klines['BTC1d'] = keep.kl;
     state.asof = keep.asof; state.fg = keep.fg;
     state.chainSeries.hashrate = keep.hr; state.chainSeries.n_tx = keep.tx;
-    state.macroSeries = keep.series;
+    state.macroSeries = keep.series; state.zT = keep.zT;
+    state.btcZ = keep.btcZ; state.klIdx = keep.klIdx;
   }
-  return { calTs, closes, scores, fvals, start, n, nScored, srcs: H.srcs || {} };
+  return { calTs, closes, scores, fvals, fzs, start, n, nScored, nAct,
+    minActive: REPLAY_MIN_ACTIVE, activeAt: nActiveAt, srcs: H.srcs || {} };
 }
 
 /* 平均秩（并列取平均），用于 Spearman */
@@ -1168,10 +1402,12 @@ async function runHistoryCheck() {
   const btn = $('histRun'), note = $('histNote');
   if (!histUrl()) { if (note) note.textContent = '此功能需要 Worker 代理（/api/history）；当前为直连模式。'; return; }
   if (btn) { btn.disabled = true; btn.textContent = '⏳ 回放中…'; }
-  if (note) { note.textContent = '正在拉取 2 年历史序列（约 250KB）并用同一套因子代码逐日重放…'; note.style.color = 'var(--dim)'; }
+  if (note) { note.textContent = '正在拉取 10 年历史序列（约 1.5MB）并用同一套因子代码逐日重放…'; note.style.color = 'var(--dim)'; }
   try {
+    /* v3.11：窗口从 2 年变成 10 年，浏览器里可能残留着旧的 2 年包 —— 按 BTC 点数判一下重拉。 */
+    if (state.histBundle && (!state.histBundle.btc || (state.histBundle.btc.ts || []).length < 2000)) state.histBundle = null;
     if (!state.histBundle) {
-      const d = await getJSON(histUrl(), 60000);
+      const d = await getJSON(histUrl(), 120000);
       if (d.error || !d.btc) throw new Error(d.error || 'history empty');
       state.histBundle = d;
     }
@@ -1184,8 +1420,17 @@ async function runHistoryCheck() {
     const facs = factorICRows(rep);
     const oos = oosTest(rep);
     const roll = rollingIC(rep, ROLL_WIN, OOS_H);
-    state.hist = { rep: rep, ics: ics, facs: facs, oos: oos, roll: roll };
+    /* v3.11 三件套：④ 极端行情识别 + 外生事件对照 ⑤ 分体制对比 ⑥ 分期稳定性 */
+    const ext = findExtremes(rep).map(function (e) {
+      const m = matchEvent(rep, e);
+      e.hit = m ? m.ev : null; e.dist = m ? m.dist : null;
+      return e;
+    });
+    const reg = regimeTest(rep);
+    const per = periodIC(rep);
+    state.hist = { rep: rep, ics: ics, facs: facs, oos: oos, roll: roll, ext: ext, reg: reg, per: per };
     renderHistory();
+    renderReview();
     if (note) note.textContent = '';
   } catch (e) {
     if (note) { note.textContent = '回放失败：' + ((e && e.message) || e); note.style.color = 'var(--red)'; }
@@ -1193,6 +1438,316 @@ async function runHistoryCheck() {
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = '↻ 重新回放'; }
   }
+}
+
+/* =====================================================================
+ *  v3.11：十年复盘 —— 极端行情识别、外生事件归因、分体制对比
+ *
+ *  目的：回答一个比「IC 是多少」更有用的问题 ——
+ *    平静时期这些因子怎么作用？极端时期又怎么作用？
+ *    那些极端行情里，有多少是**模型里有的因子**推的，
+ *    有多少是**模型根本没有的东西**（关税突袭、疫情、战争、某人的一句话）？
+ *
+ *  方法：先程序化找出十年里的极端窗口（客观事实，不依赖任何人工叙事），
+ *  再把「当时的因子状态」与「当时真实发生的外生冲击」并排摆出来。
+ * ===================================================================== */
+
+/* ---------- 外生事件日历（模型未纳入的冲击）----------
+ * 这些不是「因子」，因为它们在发生的那一刻无法用历史分布定位 —— z-score 对
+ * 「一百年来第一次加征 100% 关税」没有意义，而且多数没有连续可用的历史序列。
+ * 它们的作用是给极端行情提供**归因锚点**：把模型看到的因子状态与当时真实发生的
+ * 冲击并排放，才能区分「因子已经预警了」与「被外部事件突袭了」。
+ * 日期为人工整理，仅供对照，不作为交易信号。 */
+const EVENTS = [
+  { d: '2016-06-17', t: 'The DAO 被攻击', k: 'chain', n: '约 360 万 ETH 被盗，以太坊硬分叉' },
+  { d: '2016-08-02', t: 'Bitfinex 被盗', k: 'chain', n: '约 12 万 BTC 失窃，交易所偿付危机' },
+  { d: '2017-09-04', t: '中国 ICO/交易所禁令', k: 'reg', n: '七部委定性 ICO 非法，境内交易所关停' },
+  { d: '2017-12-17', t: '上一轮周期顶部', k: 'cycle', n: 'CME 期货上线后见顶约 $19,800' },
+  { d: '2018-02-05', t: '2018 崩盘', k: 'cycle', n: '从 $17,000 一路阴跌至 $6,000' },
+  { d: '2018-11-14', t: 'BCH 算力战', k: 'chain', n: '分叉算力战引发抛售，BTC 腰斩至 $3,200' },
+  { d: '2019-10-24', t: '中国高层表态支持区块链', k: 'policy', n: '单日急拉，情绪驱动为主' },
+  { d: '2020-03-12', t: '疫情全球崩盘（312）', k: 'macro', n: '全球流动性危机，BTC 单日 -40%' },
+  { d: '2020-05-11', t: '第三次减半', k: 'cycle', n: '区块奖励 12.5 → 6.25 BTC' },
+  { d: '2020-08-11', t: '上市公司开始配置 BTC', k: 'flow', n: '微策略首次买入，机构叙事起点' },
+  { d: '2021-02-08', t: '特斯拉买入 15 亿美元', k: 'flow', n: '企业资产负债表入场' },
+  { d: '2021-05-12', t: '特斯拉暂停 BTC 支付', k: 'event', n: '马斯克一条推文，市场急挫' },
+  { d: '2021-05-19', t: '中国挖矿与交易禁令', k: 'reg', n: '算力大迁移，BTC 单日一度 -30%' },
+  { d: '2021-11-10', t: '通胀破 6% 见顶', k: 'macro', n: 'BTC 见顶约 $69,000' },
+  { d: '2022-05-09', t: 'LUNA/UST 崩盘', k: 'chain', n: '算法稳定币死亡螺旋，传染全市场' },
+  { d: '2022-06-15', t: '美联储加息 75bp', k: 'macro', n: '1994 年以来最大单次加息' },
+  { d: '2022-06-30', t: '三箭资本爆雷', k: 'credit', n: 'Celsius 冻结提款，信贷链断裂' },
+  { d: '2022-11-08', t: 'FTX 破产', k: 'credit', n: '交易所信用崩塌，BTC 跌至 $15,500' },
+  { d: '2023-03-10', t: '硅谷银行倒闭', k: 'macro', n: 'USDC 一度脱锚，避险与宽松预期并存' },
+  { d: '2023-06-05', t: 'SEC 起诉币安/Coinbase', k: 'reg', n: '监管冲击，但市场迅速消化' },
+  { d: '2024-01-10', t: '现货 ETF 获批', k: 'flow', n: '11 只现货 ETF 通过，结构性资金入口打开' },
+  { d: '2024-04-20', t: '第四次减半', k: 'cycle', n: '区块奖励 6.25 → 3.125 BTC' },
+  { d: '2024-08-05', t: '日元套息平仓', k: 'macro', n: '日央行加息+美国就业走弱，全球风险资产同跌' },
+  { d: '2024-11-05', t: '特朗普当选', k: 'policy', n: '加密友好预期，BTC 从 $68,000 急拉破 $90,000' },
+  { d: '2025-02-01', t: '关税第一轮', k: 'tariff', n: '关税公告把 BTC 压回 $82,000 下方' },
+  { d: '2025-04-02', t: '对等关税「解放日」', k: 'tariff', n: '48 小时内 BTC -8%，风险资产同步去杠杆' },
+  { d: '2025-05-12', t: '中美关税休战', k: 'tariff', n: '风险偏好修复，BTC 重回 $100,000 上方' },
+  { d: '2025-10-10', t: '100% 关税 + 史上最大清算', k: 'tariff', n: '约 190 亿美元杠杆被清算、160 万账户，BTC 数小时内 -14.5%，永续持仓量骤降 43%' },
+  { d: '2025-10-10', t: '本轮周期顶部', k: 'cycle', n: 'BTC 见顶约 $126,200 后未再收复' },
+  { d: '2026-02-15', t: '跌破 $60,000', k: 'cycle', n: 'ETF 持续净流出，较顶部腰斩' },
+  { d: '2026-04-15', t: '关税第二轮', k: 'tariff', n: '单季 -29%，2018 年以来最差季度' },
+  { d: '2026-05-20', t: '美联储换帅转鹰', k: 'policy', n: 'Warsh 接任并取消前瞻指引，实际利率高企' },
+  { d: '2026-06-17', t: '美联储第四次暂停', k: 'policy', n: '维持 3.50~3.75%，多数官员预期年内还要加息' },
+  { d: '2026-07-15', t: '美伊战争推高通胀', k: 'war', n: '油价上行，美国通胀升至三年新高 4.2%' },
+];
+
+/* 把一个事件日期映射到主日历下标（最近的一个交易日） */
+function eventIdx(rep, ds) {
+  const t = Date.parse(ds + 'T00:00:00Z');
+  if (isNaN(t)) return -1;
+  let best = -1, bd = Infinity;
+  for (let i = rep.start; i < rep.n; i++) {
+    const d = Math.abs(rep.calTs[i] - t);
+    if (d < bd) { bd = d; best = i; }
+  }
+  return bd <= 6 * 86400000 ? best : -1;   // 只认 ±6 天内的
+}
+
+/* ---------- 极端行情识别 ----------
+ * 客观口径：以 5 日滚动收益为尺子，|r5| 超过阈值就算候选；把时间上挨得近的
+ * 候选合并成一波（同一轮暴跌不该被记成五次），每波取幅度最大的那天作为主峰。
+ * 完全不依赖人工叙事 —— 事件日历只用来事后贴标签。 */
+function findExtremes(rep, minAbs, gap) {
+  const c = rep.closes, n = rep.n, s0 = rep.start;
+  const ma = minAbs == null ? 0.15 : minAbs, gp = gap == null ? 12 : gap;
+  const fwd = h => { const a = new Array(n).fill(null); for (let i = s0; i + h < n; i++) { const p = c[i]; if (p) a[i] = c[i + h] / p - 1; } return a; };
+  const r1 = fwd(1), r5 = fwd(5), r10 = fwd(10), r20 = fwd(20);
+  const cand = [];
+  for (let i = s0; i + 5 < n; i++) if (r5[i] != null && Math.abs(r5[i]) >= ma) cand.push(i);
+  /* 聚类：间距 <= gap 归为同一波 */
+  const groups = [];
+  cand.forEach(i => {
+    const g = groups[groups.length - 1];
+    if (g && i - g[g.length - 1] <= gp) g.push(i); else groups.push([i]);
+  });
+  const out = [];
+  groups.forEach(g => {
+    let peak = g[0];
+    for (const i of g) if (Math.abs(r5[i]) > Math.abs(r5[peak])) peak = i;
+    /* 事件前的因子状态：前 20 个交易日的评分均值 + 各因子平均 z */
+    let sc = 0, cnt = 0;
+    for (let k = Math.max(s0, peak - 20); k < peak; k++) { const v = rep.scores[k]; if (v != null) { sc += v; cnt++; } }
+    const preScore = cnt ? sc / cnt : null;
+    const zAvg = [];
+    Object.keys(rep.fzs || {}).forEach(fid => {
+      const a = rep.fzs[fid]; let s2 = 0, c2 = 0;
+      for (let k = Math.max(s0, peak - 20); k < peak; k++) { const v = a[k]; if (v != null) { s2 += v; c2++; } }
+      if (c2) zAvg.push({ id: fid, z: s2 / c2 });
+    });
+    zAvg.sort((a, b) => Math.abs(b.z) - Math.abs(a.z));
+    /* 事件后的评分回升/继续恶化 */
+    let postSc = 0, pc = 0;
+    for (let k = peak; k < Math.min(n, peak + 20); k++) { const v = rep.scores[k]; if (v != null) { postSc += v; pc++; } }
+    out.push({
+      i: peak, ts: rep.calTs[peak],
+      r1: r1[peak], r5: r5[peak], r10: r10[peak], r20: r20[peak],
+      preScore: preScore, postScore: pc ? postSc / pc : null,
+      n: g.length, topZ: zAvg.slice(0, 5),
+    });
+  });
+  out.sort((a, b) => Math.abs(b.r5) - Math.abs(a.r5));
+  return out;
+}
+
+/* 找离某个极端日最近的、时间上对得上的外生事件 */
+function matchEvent(rep, ev) {
+  let best = null, bd = Infinity;
+  EVENTS.forEach(E => {
+    const i = eventIdx(rep, E.d);
+    if (i < 0) return;
+    const d = Math.abs(i - ev.i);
+    if (d < bd) { bd = d; best = E; }
+  });
+  return bd <= 10 ? { ev: best, dist: bd } : null;
+}
+
+/* ---------- 分体制（平静 / 震荡 / 极端）对比 ----------
+ * 用 BTC 自身的 20 日已实现年化波动率切档。回答的是：
+ * 「同一套因子，在没风浪的时候和在狂风里，作用方式一样吗？」
+ * 每档内分别算 IC 与分档收益 —— 这才是「平常 vs 极端」的定量答案。 */
+const REGIMES = [
+  { k: 'calm', label: '平静', lo: 0, hi: 0.45 },
+  { k: 'chop', label: '震荡', lo: 0.45, hi: 0.80 },
+  { k: 'wild', label: '极端', lo: 0.80, hi: 1e9 },
+];
+function realizedVol(rep, win) {
+  const c = rep.closes, n = rep.n, w = win || 20;
+  const out = new Array(n).fill(null);
+  for (let i = rep.start; i < n; i++) {
+    if (i - w < 0) continue;
+    const rs = [];
+    for (let k = i - w + 1; k <= i; k++) { const p = c[k - 1]; if (p) rs.push(c[k] / p - 1); }
+    if (rs.length < w - 1) continue;
+    const m = rs.reduce((a, b) => a + b, 0) / rs.length;
+    const v = rs.reduce((a, b) => a + (b - m) * (b - m), 0) / rs.length;
+    out[i] = Math.sqrt(v) * Math.sqrt(365);
+  }
+  return out;
+}
+/* 在指定体制下重跑 IC（复用 icCore 的区间过滤能力） */
+function regimeTest(rep, ids) {
+  const vol = realizedVol(rep, 20);
+  const H = 10;
+  const res = {};
+  REGIMES.forEach(R => {
+    const sel = [];
+    for (let i = rep.start; i + H < rep.n; i++) {
+      const v = vol[i];
+      if (v == null || v < R.lo || v >= R.hi) continue;
+      if (rep.scores[i] == null) continue;
+      const p0 = rep.closes[i]; if (!p0) continue;
+      sel.push({ i, s: rep.scores[i], r: rep.closes[i + H] / p0 - 1 });
+    }
+    if (sel.length < 30) { res[R.k] = { label: R.label, n: sel.length, ic: null, t: null, up: null, dn: null, win: null, base: null }; return; }
+    const sc = sel.map(x => x.s), rr = sel.map(x => x.r);
+    const spear = pearson(rankAvg(sc), rankAvg(rr));
+    const neff = Math.max(4, Math.floor(sel.length / H));
+    const base = rr.reduce((a, b) => a + b, 0) / rr.length;
+    const up = sel.filter(x => x.s >= 60), dn = sel.filter(x => x.s < 40);
+    const avg = a => a.length ? a.reduce((x, y) => x + y.r, 0) / a.length : null;
+    const wr = a => a.length ? a.filter(x => x.r > 0).length / a.length : null;
+    res[R.k] = {
+      label: R.label, n: sel.length, ic: spear, t: spear == null ? null : spear / (1 / Math.sqrt(neff)),
+      up: avg(up), dn: avg(dn), upN: up.length, dnN: dn.length, win: wr(up), base: base,
+    };
+  });
+  /* 每个因子在各体制下的 IC —— 看「谁只在极端时有效、谁在平静时就有效」 */
+  const facs = {};
+  Object.keys(rep.fvals || {}).forEach(fid => {
+    const a = rep.fvals[fid];
+    const row = {};
+    REGIMES.forEach(R => {
+      const sub = []; const subN = new Array(rep.n).fill(null);
+      for (let i = rep.start; i < rep.n; i++) {
+        const v = vol[i];
+        if (v == null || v < R.lo || v >= R.hi) { subN[i] = null; continue; }
+        subN[i] = a[i];
+      }
+      const c = icCore(subN, rep, H, rep.start, rep.n);
+      row[R.k] = c ? { ic: c.spear, n: c.n } : null;
+    });
+    facs[fid] = row;
+  });
+  return { byRegime: res, byFactor: facs, vol: vol };
+}
+
+/* ---------- 分期 IC：把十年切成几段，看 IC 是不是只在某一段成立 ----------
+ * 全样本 IC = 0.14 可能只是「某一年特别准」拉起来的。分期之后才看得出来。 */
+function periodIC(rep, ids) {
+  const y0 = new Date(rep.calTs[rep.start]).getUTCFullYear();
+  const y1 = new Date(rep.calTs[rep.n - 1]).getUTCFullYear();
+  const out = [];
+  for (let y = y0; y <= y1; y++) {
+    let lo = -1, hi = -1;
+    for (let i = rep.start; i < rep.n; i++) {
+      const yy = new Date(rep.calTs[i]).getUTCFullYear();
+      if (yy === y) { if (lo < 0) lo = i; hi = i; }
+    }
+    if (lo < 0 || hi - lo < 60) continue;
+    const c = icCore(rep.scores, rep, 10, lo, hi + 1);
+    out.push({
+      y: y, n: hi - lo + 1,
+      ic: c ? c.spear : null, t: c ? c.t : null,
+      ret: c ? c.base : null,
+    });
+  }
+  return out;
+}
+
+/* ---------- v3.11 十年复盘的渲染 ---------- */
+const fPct = v => v == null ? '—' : (v >= 0 ? '+' : '') + (v * 100).toFixed(2) + '%';
+const fDate = t => { const d = new Date(t); return d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0') + '-' + String(d.getUTCDate()).padStart(2, '0'); };
+function fName(id) { const f = FACTORS.find(x => x.id === id); return f ? f.name : id; }
+
+function renderReview() {
+  const h = state.hist;
+  const rb = $('regBox'), eb = $('extList'), pb = $('perBox'), hint = $('extHint');
+  if (!rb || !eb || !pb) return;
+  if (!h || !h.reg) { rb.innerHTML = '<div class="macro-hint">先运行上方的历史回放。</div>'; eb.innerHTML = ''; pb.innerHTML = ''; return; }
+
+  /* ---- ① 分体制 ---- */
+  const R = h.reg.byRegime;
+  let html = '<div class="rg-tbl">' +
+    '<div class="rg-hd"><span>市场状态</span><span>样本</span><span>评分 IC(10日)</span><span>高分档 &gt;60</span><span>低分档 &lt;40</span><span>基准</span></div>';
+  ['calm', 'chop', 'wild'].forEach(function (k) {
+    const r = R[k]; if (!r) return;
+    const t = r.t == null ? '' : ' (' + r.t.toFixed(2) + ')';
+    const cls = r.ic == null ? '' : (r.ic > 0.05 ? 'rg-g' : (r.ic < -0.05 ? 'rg-r' : 'rg-y'));
+    html += '<div class="rg-row"><span class="rg-nm">' + r.label + '</span>' +
+      '<span>' + (r.n || 0) + '</span>' +
+      '<span class="' + cls + '">' + (r.ic == null ? '—' : r.ic.toFixed(3)) + t + '</span>' +
+      '<span class="' + (r.up == null ? '' : (r.up >= 0 ? 'rg-g' : 'rg-r')) + '">' + fPct(r.up) + '<i>' + (r.upN ? ' n=' + r.upN : '') + '</i></span>' +
+      '<span class="' + (r.dn == null ? '' : (r.dn >= 0 ? 'rg-g' : 'rg-r')) + '">' + fPct(r.dn) + '<i>' + (r.dnN ? ' n=' + r.dnN : '') + '</i></span>' +
+      '<span class="rg-dim">' + fPct(r.base) + '</span></div>';
+  });
+  html += '</div>';
+  /* 因子的体制画像：只看 |IC| 最大的几个，避免一屏塞满 */
+  const bf = h.reg.byFactor || {};
+  const rows = Object.keys(bf).map(function (id) {
+    const r = bf[id];
+    const a = ['calm', 'chop', 'wild'].map(function (k) { return r[k] ? r[k].ic : null; });
+    if (a.every(function (x) { return x == null; })) return null;
+    return { id: id, a: a, mx: Math.max.apply(null, a.map(function (x) { return x == null ? 0 : Math.abs(x); })) };
+  }).filter(Boolean).sort(function (x, y) { return y.mx - x.mx; }).slice(0, 12);
+  if (rows.length) {
+    html += '<div class="rg-sub">因子在各体制下的 IC(10日) —— 左上角越靠前，说明它的作用越依赖于「有没有风浪」</div>';
+    html += '<div class="rg-tbl"><div class="rg-hd"><span>因子</span><span>平静</span><span>震荡</span><span>极端</span><span></span><span></span></div>';
+    rows.forEach(function (r) {
+      html += '<div class="rg-row"><span class="rg-nm">' + fName(r.id) + '</span>';
+      r.a.forEach(function (v) {
+        html += '<span class="' + (v == null ? 'rg-dim' : (Math.abs(v) > 0.15 ? 'rg-g' : (v > 0 ? 'rg-y' : 'rg-r'))) + '">' + (v == null ? '—' : v.toFixed(3)) + '</span>';
+      });
+      html += '<span></span><span></span></div>';
+    });
+    html += '</div>';
+  }
+  rb.innerHTML = html;
+
+  /* ---- ② 极端行情 ---- */
+  const ext = h.ext || [];
+  if (!ext.length) { eb.innerHTML = '<div class="macro-hint">未识别到极端窗口。</div>'; }
+  else {
+    let e = '';
+    ext.slice(0, 14).forEach(function (x) {
+      const up = x.r5 >= 0;
+      const hit = x.hit;
+      const pre = x.preScore;
+      /* 可预警性判定：事件前 20 日评分已经站到极值区，就算「因子有预警」；
+       * 否则是「外生突袭」—— 因子当时没觉得有事，是外部冲击打进来的。 */
+      const warned = pre != null && (pre >= 60 || pre <= 40);
+      const kind = warned ? (pre >= 60 ? '因子已在高温区' : '因子已在低温区') : '外生突袭（因子当时中性）';
+      e += '<div class="ex-card ' + (up ? 'ex-up' : 'ex-dn') + '">' +
+        '<div class="ex-h"><span class="ex-d">' + fDate(x.ts) + '</span>' +
+        '<span class="ex-r">5日 ' + fPct(x.r5) + '</span>' +
+        '<span class="ex-r2">20日 ' + fPct(x.r20) + '</span>' +
+        '<span class="ex-k">' + kind + '</span></div>' +
+        (hit ? '<div class="ex-ev">📌 ' + hit.t + ' <i>' + hit.k + '</i> · ' + hit.n + '</div>'
+             : '<div class="ex-ev ex-nohit">📌 无对应外生事件（可能是模型内因子自身走完的行情）</div>') +
+        '<div class="ex-z">事件前 20 日评分 ' + (pre == null ? '—' : pre.toFixed(1)) +
+        ' → 事件后 20 日 ' + (x.postScore == null ? '—' : x.postScore.toFixed(1)) +
+        ' ｜ 当时最偏离的因子：' + (x.topZ || []).map(function (z) { return fName(z.id).replace(/^[^ ]+ /, '') + ' ' + (z.z >= 0 ? '+' : '') + z.z.toFixed(1); }).join(' · ') +
+        '</div></div>';
+    });
+    eb.innerHTML = e;
+  }
+
+  /* ---- ③ 分期稳定性 ---- */
+  const per = h.per || [];
+  let ph = '<div class="rg-tbl"><div class="rg-hd"><span>年份</span><span>交易日</span><span>评分 IC(10日)</span><span>BTC 10日基准</span><span></span><span></span></div>';
+  per.forEach(function (r) {
+    const cls = r.ic == null ? 'rg-dim' : (r.ic > 0.08 ? 'rg-g' : (r.ic < -0.08 ? 'rg-r' : 'rg-y'));
+    ph += '<div class="rg-row"><span class="rg-nm">' + r.y + '</span><span>' + r.n + '</span>' +
+      '<span class="' + cls + '">' + (r.ic == null ? '—' : r.ic.toFixed(3)) + (r.t == null ? '' : ' (' + r.t.toFixed(2) + ')') + '</span>' +
+      '<span>' + fPct(r.ret) + '</span><span></span><span></span></div>';
+  });
+  ph += '</div>';
+  pb.innerHTML = ph;
+
+  if (hint) hint.textContent = h.ext ? (h.ext.length + ' 波极端行情') : '已完成';
 }
 
 /* ---------- 渲染 ---------- */
