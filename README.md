@@ -92,6 +92,13 @@ python3 -m http.server 8899
 
 也可直接双击 `index.html`（file:// 协议，数据走远程 API）。
 
+改完代码跑一遍回归测试（无需浏览器，纯 Node）：
+
+```bash
+node tests/smoke.js        # 数据流 / 因子 / 相关网络 / 回测 / 模拟盘 冒烟
+node tests/regression.js   # 回测 + 模拟盘的数值断言
+```
+
 ---
 
 ## 部署（Cloudflare Workers 整站）
@@ -161,6 +168,9 @@ nexus-terminal/
 ├── worker/           # 数据代理 Cloudflare Worker（白名单代理 + 宏观 Yahoo/Stooq + 经济日历 + 边缘缓存）
 │   ├── worker.js     # /api/snapshot + /api/calendar + /api/fetch + /api/probe（CORS 代理）
 │   └── wrangler.toml # 绑定 nexus-api.uichain.org 自定义域
+├── tests/            # 回归测试（改代码后必跑）
+│   ├── smoke.js      # vm 沙箱冒烟：数据流 / 26 因子 z 值 / 相关网络 / 回测 / 模拟盘
+│   └── regression.js # 回测 + 模拟盘的数值断言（读真实渲染结果）
 ├── nexus.html        # v1 历史版本（保留）
 ├── nexus_v2.html     # v2 历史版本（保留）
 └── README.md
