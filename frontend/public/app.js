@@ -976,7 +976,7 @@ function renderFactors() {
   const cnt = $('fCount'); if (cnt) cnt.textContent = FACTORS.length + ' 维 · ' + nScored + ' 参与评分' + (nDead ? ' · ' + nDead + ' 无数据' : '');
 }
 /* =====================================================================
- *  历史回放 · IC 有效性检验（v3.8）
+ *  历史回放 · IC 有效性检验 / 因子归因（v3.8 → v3.9）
  *
  *  为什么不需要数据库：Nexus Score 的每一个输入本身就是历史序列，所以只要把
  *  长历史序列取回来，就能用**同一套因子代码**逐日重放，算出历史上每一天的评分。
@@ -1044,6 +1044,11 @@ function replayHistory() {
   for (let q = 0; q < mk.length; q++) hs[mk[q]] = ser[mk[q]].v;
   state.macroSeries = hs;
   const scores = new Array(n).fill(null);
+  /* v3.9：逐日收集「每个因子的方向化贡献」，用于单项因子 IC 归因。
+   * 只测合成分数的 IC ≈ 0，只回答了「现在没用」，回答不了
+   * 「哪个因子在做事、哪个在制造噪声、哪个方向设反了」。有了因子级别的表，
+   * 改因子/改权重才有依据，而不是凭感觉调。 */
+  const fvals = {};
   let nScored = 0;
   state.interval = '1d';
   if (ser.HR) state.chainSeries.hashrate = ser.HR.v;
@@ -1058,6 +1063,13 @@ function replayHistory() {
       const r = computeNexusScore(REPLAY_IDS);
       scores[i] = r.score;
       nScored = r.nScored;
+      for (const fid in r.out) {
+        const o = r.out[fid];
+        if (o.dir && o.ok) {
+          if (!fvals[fid]) fvals[fid] = new Array(n).fill(null);
+          fvals[fid][i] = o.contribution;
+        }
+      }
     }
   } finally {
     state.interval = keep.interval; state.klines['BTC1d'] = keep.kl;
@@ -1065,7 +1077,7 @@ function replayHistory() {
     state.chainSeries.hashrate = keep.hr; state.chainSeries.n_tx = keep.tx;
     state.macroSeries = keep.series;
   }
-  return { calTs, closes, scores, start, n, nScored, srcs: H.srcs || {} };
+  return { calTs, closes, scores, fvals, start, n, nScored, srcs: H.srcs || {} };
 }
 
 /* 平均秩（并列取平均），用于 Spearman */
@@ -1093,24 +1105,21 @@ function pearson(x, y) {
   return sxy / Math.sqrt(sxx * syy);
 }
 
-function icFor(rep, h) {
+/* 通用 IC 核：对任意与 rep 对齐的序列（合成分数 / 单个因子的贡献）算 Spearman/Pearson。
+ * lo/hi 允许只在子区间上算 —— 这是样本内/样本外验证的基础：
+ * 在样本内挑出来的因子，必须拿到没见过的区间上再验一次，否则只是在拟合噪声。 */
+function icCore(series, rep, h, lo, hi) {
   const s = [], r = [];
-  for (let i = rep.start; i < rep.n; i++) {
-    if (rep.scores[i] == null) continue;
+  for (let i = lo; i < hi; i++) {
+    const v = series[i];
+    if (v == null) continue;
     const j = i + h;
     if (j >= rep.n) break;
     const p0 = rep.closes[i];
     if (!p0) continue;
-    s.push(rep.scores[i]); r.push(rep.closes[j] / p0 - 1);
+    s.push(v); r.push(rep.closes[j] / p0 - 1);
   }
   if (s.length < 20) return null;
-  const buckets = [[-1e9, 40], [40, 60], [60, 1e9]].map(function (rg) {
-    const sel = [];
-    for (let i = 0; i < s.length; i++) if (s[i] >= rg[0] && s[i] < rg[1]) sel.push(r[i]);
-    const mean = sel.length ? sel.reduce(function (a, b) { return a + b; }, 0) / sel.length : null;
-    const win = sel.length ? sel.filter(function (v) { return v > 0; }).length / sel.length : null;
-    return { n: sel.length, mean: mean, win: win };
-  });
   const base = r.reduce(function (a, b) { return a + b; }, 0) / r.length;
   const spear = pearson(rankAvg(s), rankAvg(r));
   /* 重叠的前向窗口 → 相邻样本高度相关，n 不是有效样本量。
@@ -1119,9 +1128,25 @@ function icFor(rep, h) {
   const neff = Math.max(4, Math.floor(s.length / h));
   const se = 1 / Math.sqrt(neff);
   return {
-    h: h, n: s.length, base: base, buckets: buckets,
-    neff: neff, se: se, t: spear == null ? null : spear / se,
-    pear: pearson(s, r), spear: spear,
+    h: h, n: s.length, base: base, neff: neff, se: se,
+    t: spear == null ? null : spear / se, pear: pearson(s, r), spear: spear, s: s, r: r,
+  };
+}
+
+function icFor(rep, h) {
+  const c = icCore(rep.scores, rep, h, rep.start, rep.n);
+  if (!c) return null;
+  const s = c.s, r = c.r;
+  const buckets = [[-1e9, 40], [40, 60], [60, 1e9]].map(function (rg) {
+    const sel = [];
+    for (let i = 0; i < s.length; i++) if (s[i] >= rg[0] && s[i] < rg[1]) sel.push(r[i]);
+    const mean = sel.length ? sel.reduce(function (a, b) { return a + b; }, 0) / sel.length : null;
+    const win = sel.length ? sel.filter(function (v) { return v > 0; }).length / sel.length : null;
+    return { n: sel.length, mean: mean, win: win };
+  });
+  return {
+    h: c.h, n: c.n, base: c.base, buckets: buckets,
+    neff: c.neff, se: c.se, t: c.t, pear: c.pear, spear: c.spear,
   };
 }
 
@@ -1142,7 +1167,11 @@ async function runHistoryCheck() {
     const ics = [];
     for (let i = 0; i < IC_HORIZONS.length; i++) { const x = icFor(rep, IC_HORIZONS[i]); if (x) ics.push(x); }
     if (!ics.length) throw new Error('样本不足以计算 IC');
-    state.hist = { rep: rep, ics: ics };
+    /* v3.9 三件套：① 拆到因子级别 ② 样本内挑 / 样本外验 ③ 滚动 IC 看漂移 */
+    const facs = factorICRows(rep);
+    const oos = oosTest(rep);
+    const roll = rollingIC(rep, ROLL_WIN, OOS_H);
+    state.hist = { rep: rep, ics: ics, facs: facs, oos: oos, roll: roll };
     renderHistory();
     if (note) note.textContent = '';
   } catch (e) {
@@ -1277,7 +1306,212 @@ function renderHistory() {
       '不含：5 个事件因子（无历史发布值）、资金费率与多空比（仅当日值）、BTC占比与稳定币占比（无历史总市值）。价格用 ' + (s.BTC || 'yahoo:BTC-USD') + '。';
   }
 
+  renderFacRank(S.facs);
+  renderOOS(S.oos);
+  drawRollChart($('rollCanvas'), S.roll);
   drawHistChart($('histCanvas'), rep);
+}
+
+
+/* =====================================================================
+ *  v3.9 · 把「评分 IC ≈ 0」拆开
+ *  ---------------------------------------------------------------------
+ *  v3.8 只证明了「合成分数没用」，这是一个没有行动价值的结论。
+ *  v3.9 回答三个能指导决策的问题：
+ *    ① 哪个因子在做正贡献、哪个在制造噪声、哪个方向可能设反了（归因）
+ *    ② 如果在历史前半段挑因子，后半段还能不能用（样本外，防过拟合自欺）
+ *    ③ IC 是常数还是随市场状态漂移（滚动 IC）
+ * ===================================================================== */
+
+/* ① 单项因子 IC 归因：IC 的符号就是「方向设对没有」的答案 */
+function factorICRows(rep) {
+  const rows = [];
+  Object.keys(rep.fvals || {}).forEach(function (fid) {
+    const f = FACTORS.find(function (x) { return x.id === fid; });
+    if (!f) return;
+    const per = {};
+    IC_HORIZONS.forEach(function (h) {
+      const c = icCore(rep.fvals[fid], rep, h, rep.start, rep.n);
+      per[h] = c ? { ic: c.spear, t: c.t, n: c.n } : null;
+    });
+    rows.push({ id: fid, name: f.name, dir: f.dir, w: f.w, per: per });
+  });
+  /* 按 |IC(10日)| 排序 —— 一眼看出谁在做事、谁在空转 */
+  rows.sort(function (x, y) {
+    const A = x.per[10] && x.per[10].ic != null ? Math.abs(x.per[10].ic) : -1;
+    const B = y.per[10] && y.per[10].ic != null ? Math.abs(y.per[10].ic) : -1;
+    return B - A;
+  });
+  return rows;
+}
+
+/* 把若干因子的方向化贡献等权合成一条序列（样本内外对比用；
+ * 分数本身是加权平均，这里用等权是为了把「选因子」的影响单独隔离出来） */
+function compositeSeries(rep, ids) {
+  const n = rep.n, out = new Array(n).fill(null);
+  for (let i = rep.start; i < n; i++) {
+    let s = 0, c = 0;
+    for (let q = 0; q < ids.length; q++) {
+      const arr = rep.fvals[ids[q]];
+      if (!arr) continue;
+      const v = arr[i];
+      if (v != null) { s += v; c++; }
+    }
+    if (c) out[i] = s / c;
+  }
+  return out;
+}
+
+/* ② 样本内挑因子 → 样本外检验。
+ * 只保留「样本内 IC > 0」的因子（不翻方向 —— 翻方向属于数据窥探，很容易自欺）。
+ * 如果优选组合的样本外 IC 明显衰减甚至转负，说明样本内的挑选只是拟合了噪声。 */
+const OOS_SPLIT = 0.6, OOS_H = 10;
+function oosTest(rep) {
+  const span = rep.n - rep.start;
+  const cut = rep.start + Math.round(span * OOS_SPLIT);
+  if (cut - rep.start < 80 || rep.n - cut < 60) return null;
+  const rows = factorICRows(rep);
+  const allIds = [], keptIds = [];
+  rows.forEach(function (row) {
+    const arr = rep.fvals[row.id];
+    if (!arr) return;
+    const tr = icCore(arr, rep, OOS_H, rep.start, cut);
+    const te = icCore(arr, rep, OOS_H, cut, rep.n);
+    row.tr = tr ? tr.spear : null;
+    row.te = te ? te.spear : null;
+    allIds.push(row.id);
+    if (tr && tr.spear != null && tr.spear > 0) keptIds.push(row.id);
+  });
+  const mk = function (ids) {
+    const series = compositeSeries(rep, ids);
+    const tr = icCore(series, rep, OOS_H, rep.start, cut);
+    const te = icCore(series, rep, OOS_H, cut, rep.n);
+    return { tr: tr ? tr.spear : null, te: te ? te.spear : null, n: ids.length };
+  };
+  const ltr = icCore(rep.scores, rep, OOS_H, rep.start, cut);
+  const lte = icCore(rep.scores, rep, OOS_H, cut, rep.n);
+  return {
+    cut: cut, h: OOS_H, nTrain: cut - rep.start, nTest: rep.n - cut,
+    nAll: allIds.length, nKept: keptIds.length, kept: keptIds,
+    live: { tr: ltr ? ltr.spear : null, te: lte ? lte.spear : null, n: rep.nScored },
+    equal: mk(allIds), pick: mk(keptIds),
+  };
+}
+
+/* ③ 滚动 IC：IC 不是常数，是随市场状态漂移的。
+ * 一个「平均 IC ≈ 0」的因子，可能在前半段很强、后半段反向 —— 平均会把这件事藏起来。 */
+const ROLL_WIN = 60;
+function rollingIC(rep, win, h) {
+  const out = [];
+  for (let e = rep.start + win; e <= rep.n - h; e++) {
+    const c = icCore(rep.scores, rep, h, e - win, e);
+    out.push({ i: e, ic: c ? c.spear : null });
+  }
+  return out;
+}
+
+/* ---------- 渲染：① 归因表 ---------- */
+function facVerdict(p) {
+  if (!p || p.t == null || p.ic == null) return '<span style="color:#5b7a9a">· 样本少</span>';
+  const a = Math.abs(p.t);
+  if (a > 2 && p.ic > 0) return '<span style="color:#00e5a0">✔ 有效</span>';
+  if (a > 2 && p.ic < 0) return '<span style="color:#ff3d6e">✘ 方向反了</span>';
+  return '<span style="color:#ffc107">~ 噪声</span>';
+}
+function renderFacRank(facs) {
+  const box = $('facRank'); if (!box) return;
+  if (!facs || !facs.length) { box.innerHTML = '<div class="ic-note">—</div>'; return; }
+  const cells = function (r) {
+    return [1, 5, 10, 20].map(function (h) {
+      const p = r.per[h];
+      if (!p || p.ic == null) return '<span style="color:#5b7a9a">—</span>';
+      return '<span style="color:' + icColor(p.ic) + '">' + p.ic.toFixed(3) + '</span>';
+    }).join('');
+  };
+  const hd = '<div class="ic-row ic-hd fr"><span>因子（按 |IC(10日)| 排序）</span><span>dir·w</span>' +
+    '<span>IC(1)</span><span>IC(5)</span><span>IC(10)</span><span>IC(20)</span><span>t(10)</span><span>判定</span></div>';
+  box.innerHTML = hd + facs.map(function (r) {
+    const p10 = r.per[10];
+    return '<div class="ic-row fr"><span class="fname">' + r.name + '</span>' +
+      '<span class="ic-n">' + (r.dir > 0 ? '+' : '\u2212') + '·' + r.w.toFixed(1) + '</span>' +
+      cells(r) +
+      '<span>' + (p10 && p10.t != null ? p10.t.toFixed(1) + sigMark(p10.t) : '—') + '</span>' +
+      '<span>' + facVerdict(p10) + '</span></div>';
+  }).join('') +
+    '<div class="ic-note">IC = 该因子「<b>方向化贡献</b>」与未来收益的 Spearman 秩相关（贡献 = dir × z，所以它已经把方向算进去了）。' +
+    '<b>IC &gt; 0 说明当前 dir 设对了；IC &lt; 0 说明这个因子在本窗口内的实际方向与设定相反</b> —— 要么方向表设错，要么它在这个市场里是反向指标。' +
+    '<br>t 同样按非重叠窗口折算，|t| &gt; 2 才敢说「不是噪声」。<b>判定为「噪声」的因子，权重再大也只是在稀释评分。</b></div>';
+}
+
+/* ---------- 渲染：② 样本内外 ---------- */
+function renderOOS(o) {
+  const box = $('oosBox'); if (!box) return;
+  if (!o) { box.innerHTML = '<div class="ic-note">样本不足，无法切分样本内 / 样本外。</div>'; return; }
+  const rep = state.hist.rep;
+  const dstr = function (t) { return new Date(t).toISOString().slice(0, 10); };
+  const cell = function (v) {
+    if (v == null) return '<span style="color:#5b7a9a">—</span>';
+    return '<span style="color:' + icColor(v) + '">' + v.toFixed(3) + '</span>';
+  };
+  const rows = [
+    ['现状：' + o.live.n + ' 维 · 原权重', o.live.tr, o.live.te],
+    ['等权：' + o.equal.n + ' 维 · 不筛选', o.equal.tr, o.equal.te],
+    ['优选：' + o.pick.n + ' 维 · 仅样本内 IC&gt;0', o.pick.tr, o.pick.te],
+  ];
+  box.innerHTML =
+    '<div class="ic-row ic-hd oos"><span>组合</span><span>样本内 IC</span><span>样本外 IC</span><span>衰减</span></div>' +
+    rows.map(function (r) {
+      const d = (r[1] == null || r[2] == null) ? null : r[2] - r[1];
+      const dcol = d == null ? '#5b7a9a' : d < -0.05 ? '#ff3d6e' : d > 0.05 ? '#00e5a0' : '#5b7a9a';
+      return '<div class="ic-row oos"><span class="fname">' + r[0] + '</span>' + cell(r[1]) + cell(r[2]) +
+        '<span style="color:' + dcol + '">' + (d == null ? '—' : (d >= 0 ? '+' : '') + d.toFixed(3)) + '</span></div>';
+    }).join('') +
+    '<div class="ic-note">样本内 <b>' + dstr(rep.calTs[rep.start]) + ' → ' + dstr(rep.calTs[o.cut - 1]) + '</b>（' + o.nTrain + ' 天）挑因子；' +
+    '样本外 <b>' + dstr(rep.calTs[o.cut]) + ' → ' + dstr(rep.calTs[rep.n - 1]) + '</b>（' + o.nTest + ' 天）检验；前向 ' + o.h + ' 日。<br>' +
+    '<b>盯「衰减」这一列：如果样本内优选（哪怕样本内 IC 很高）拿到样本外就衰减甚至转负，说明挑出来的只是噪声。</b> ' +
+    '样本外的数字才是这套因子真实能力的上限估计 —— 样本内的数字永远好看，没有信息量。</div>';
+}
+
+/* ---------- 渲染：③ 滚动 IC ---------- */
+function drawRollChart(cv, roll) {
+  if (!cv || !roll || !roll.length) return;
+  const W = cv.clientWidth || 460, HH = 150;
+  const dpr = window.devicePixelRatio || 1;
+  cv.width = Math.round(W * dpr); cv.height = Math.round(HH * dpr);
+  cv.style.height = HH + 'px';
+  const g = cv.getContext('2d'); if (!g) return;
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, W, HH);
+
+  const padL = 30, padR = 8, padT = 8, padB = 14;
+  const iw = W - padL - padR, ih = HH - padT - padB;
+  const LIM = 0.5;
+  const y = function (v) { return padT + (LIM - Math.max(-LIM, Math.min(LIM, v))) / (2 * LIM) * ih; };
+  const x = function (q) { return padL + q / Math.max(1, roll.length - 1) * iw; };
+
+  g.fillStyle = 'rgba(255,193,7,.06)';
+  g.fillRect(padL, y(0.1), iw, y(-0.1) - y(0.1));
+  g.strokeStyle = 'rgba(255,255,255,.07)'; g.lineWidth = 1;
+  g.font = '9px "JetBrains Mono", monospace'; g.fillStyle = '#4a6a8a'; g.textAlign = 'right';
+  [0.4, 0.2, 0, -0.2, -0.4].forEach(function (v) {
+    g.beginPath(); g.moveTo(padL, y(v)); g.lineTo(W - padR, y(v)); g.stroke();
+    g.fillText(v.toFixed(1), padL - 4, y(v) + 3);
+  });
+  g.setLineDash([3, 3]); g.strokeStyle = 'rgba(255,255,255,.28)';
+  g.beginPath(); g.moveTo(padL, y(0)); g.lineTo(W - padR, y(0)); g.stroke();
+  g.setLineDash([]);
+
+  g.lineWidth = 1.5;
+  for (let q = 1; q < roll.length; q++) {
+    const p = roll[q - 1].ic, b = roll[q].ic;
+    if (p == null || b == null) continue;
+    g.strokeStyle = (p + b) / 2 > 0 ? '#00e5a0' : '#ff3d6e';
+    g.beginPath(); g.moveTo(x(q - 1), y(p)); g.lineTo(x(q), y(b)); g.stroke();
+  }
+  g.fillStyle = '#4a6a8a'; g.textAlign = 'left';
+  g.fillText(ROLL_WIN + ' 日滚动窗 · 前向 ' + OOS_H + ' 日', padL, HH - 3);
+  g.textAlign = 'right';
+  g.fillText('绿 = 该窗口内分数与未来收益正相关', W - padR, HH - 3);
 }
 
 function renderStatus(ok) {

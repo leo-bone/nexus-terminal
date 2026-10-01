@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Nexus Terminal · 加密货币因子关系终端 v3.8</title>
+<title>Nexus Terminal · 加密货币因子关系终端 v3.9</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -82,6 +82,10 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
 .net-wrap{display:grid;grid-template-columns:1fr 360px;gap:10px}
 @media(max-width:1100px){.net-wrap{grid-template-columns:1fr}}
 #histCanvas{display:block;width:100%;height:230px;background:var(--bg)}
+#rollCanvas{display:block;width:100%;height:150px;background:var(--bg)}
+.ic-row.fr{grid-template-columns:1.5fr 52px 54px 54px 54px 54px 48px 72px}
+.ic-row.oos{grid-template-columns:1.9fr 1fr 1fr 1fr}
+.ic-row .fname{text-align:left;color:var(--text2);font-family:'Inter',sans-serif;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #netCanvas{display:block;width:100%;height:420px;background:radial-gradient(circle at 50% 45%,#0d1828,#060c18)}
 .heat{overflow:auto;padding:10px}.heat-grid{display:grid;gap:2px}
 .hm-h{font-size:8px;color:var(--dim);display:flex;align-items:center;justify-content:center;padding:2px;text-align:center;overflow:hidden;white-space:nowrap}
@@ -167,7 +171,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
   <div class="header">
     <div class="logo">NEXUS <em>TERMINAL</em></div>
     <div class="tagline">CRYPTO FACTOR TERMINAL</div>
-    <div class="live-badge"><span class="live-dot"></span> LIVE · v3.8</div>
+    <div class="live-badge"><span class="live-dot"></span> LIVE · v3.9</div>
     <div class="hdr-right">
       <span class="net-lbl">数据源</span><span id="netDot" class="net-dot"></span>
       <span id="lastUpd" class="last-upd">—</span>
@@ -236,14 +240,30 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
   <div class="panel">
     <div class="phdr"><span class="icon">🧪</span><span class="lbl">评分历史与有效性检验</span><span id="histHint" class="hint">未运行</span></div>
     <div class="hintro">
-      <span>把 2 年的宏观 / 链上 / 情绪序列取回来，用<b>与实时完全相同</b>的因子代码逐日重放，得到历史 Nexus Score，再检验它与「未来 1 / 5 / 10 / 20 日 BTC 收益」是否真的相关。<b>这是终端第一次能自证有没有用。</b></span>
+      <span>把 2 年的宏观 / 链上 / 情绪序列取回来，用<b>与实时完全相同</b>的因子代码逐日重放，得到历史 Nexus Score。不仅检验分数有没有用，还把它<b>拆到因子级别</b>：哪个在做事、哪个方向设反了、哪个只是噪声；并用<b>样本外验证</b>防止自欺。<b>这是终端第一次能自证有没有用。</b></span>
       <button id="histRun" class="hbtn">▶ 运行历史回放</button>
     </div>
-    <div id="histNote" class="macro-hint">点右侧按钮开始（首次需拉取约 250KB 历史序列，5~10 秒）。</div>
+    <div id="histNote" class="macro-hint">点右侧按钮开始（首次需拉取约 250KB 历史序列，5~10 秒）。跑完会得到：合成分数 IC · 单项因子 IC 归因 · 样本内/外验证 · 滚动 IC。</div>
     <div class="chart-wrap" style="padding:8px"><canvas id="histCanvas"></canvas></div>
     <div class="hgrid">
-      <div class="hbox"><div class="fttl" style="margin-bottom:7px">IC 检验 · 评分 vs 未来收益</div><div id="icTable"></div></div>
+      <div class="hbox"><div class="fttl" style="margin-bottom:7px">合成分数 IC 检验 · 评分 vs 未来收益</div><div id="icTable"></div></div>
       <div class="hbox" id="histBars"></div>
+    </div>
+    <div class="hgrid">
+      <div class="hbox" style="grid-column:1/-1">
+        <div class="fttl" style="margin-bottom:7px">① 单项因子 IC 归因 · 按 |IC(10日)| 排序（IC 符号 = 方向设对没有）</div>
+        <div id="facRank"></div>
+      </div>
+    </div>
+    <div class="hgrid">
+      <div class="hbox">
+        <div class="fttl" style="margin-bottom:7px">② 样本内 / 样本外验证</div>
+        <div id="oosBox"></div>
+      </div>
+      <div class="hbox">
+        <div class="fttl" style="margin-bottom:7px">③ 滚动 IC（60 日窗 · 10 日前向）</div>
+        <div class="chart-wrap" style="padding:4px"><canvas id="rollCanvas"></canvas></div>
+      </div>
     </div>
     <div id="histSrc" class="hsrc">—</div>
   </div>
@@ -365,7 +385,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
   </div>
 
   <div class="footer">
-    NEXUS TERMINAL v3.8 · 纯前端实时加密终端 · 26 维实时 + 17 维历史回放 · 数据源: Bybit / CoinLore / DefiLlama / blockchain.info / alternative.me / mempool.space / Yahoo Finance / NY Fed / U.S. Treasury / Japan MOF / Forex Factory<br>
+    NEXUS TERMINAL v3.9 · 纯前端实时加密终端 · 28 维实时 + 17 维历史回放 + 因子 IC 归因 · 数据源: Bybit / CoinLore / DefiLlama / blockchain.info / alternative.me / mempool.space / Yahoo Finance / NY Fed / U.S. Treasury / Japan MOF / Forex Factory<br>
     仅供研究与教育，不构成投资建议。加密资产风险极高，请独立判断。
   </div>
 </div>

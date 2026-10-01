@@ -321,6 +321,57 @@ const near = (label, actual, expect, tol) => {
       ' · 10日平均收益 ' + (dn.mean * 100).toFixed(2) + '% / ' + (mid.mean * 100).toFixed(2) + '% / ' + (up.mean * 100).toFixed(2) + '%');
   }
 
+  /* =================================================================
+   *  H. 单项因子 IC 归因 + 样本内外验证 + 滚动 IC（v3.9）
+   *  -----------------------------------------------------------------
+   *  v3.8 只证明了「合成分数没用」。v3.9 必须能回答：
+   *    ① 哪个因子在做正贡献（归因表必须指出人工埋入信号的那批因子）
+   *    ② 样本内挑出来的因子，样本外还能不能用
+   *    ③ IC 是常数还是随市场状态漂移
+   * ================================================================= */
+  console.log('\n===== H. 因子 IC 归因 / 样本内外 / 滚动 IC（v3.9）=====');
+  if (rep) {
+    const facs = call('factorICRows', rep);
+    chk('归因表覆盖全部回放因子（17）', facs.length, 17);
+    chk('每个因子都有 IC(1/5/10/20) 且有足够样本',
+      facs.every(r => [1, 5, 10, 20].every(h => r.per[h] && r.per[h].n >= 100)), 'true');
+    const pos = facs.filter(r => r.per[10] && r.per[10].ic > 0).length;
+    chk('多数因子 IC(10日) > 0（合成数据埋了信号，归因必须能指出来）', pos >= 8, 'true');
+    chk('排序首位 |IC(10)| > 0.15（确实挑出了在做事的因子）', Math.abs(facs[0].per[10].ic) > 0.15, 'true');
+    chk('归因表按 |IC(10)| 降序',
+      facs.every((r, i) => i === 0 || Math.abs(facs[i - 1].per[10].ic) >= Math.abs(r.per[10].ic) - 1e-12), 'true');
+    chk('每个因子都带 dir 与权重', facs.every(r => (r.dir === 1 || r.dir === -1) && r.w > 0), 'true');
+
+    const oos = call('oosTest', rep);
+    chk('样本内外切分成功', !!oos, 'true');
+    if (oos) {
+      chk('样本内 + 样本外 = 回放窗口', oos.nTrain + oos.nTest, rep.n - rep.start);
+      chk('优选维数在 [1, 全部]', oos.nKept >= 1 && oos.nKept <= oos.nAll, 'true');
+      chk('样本内优选 IC > 0（筛选在样本内必须有效）', oos.pick.tr > 0, 'true');
+      chk('样本外优选 IC > 0（合成信号平稳，必须能延续）', oos.pick.te > 0, 'true');
+      chk('样本内/外 IC 均在 [-1,1]',
+        [oos.live.tr, oos.live.te, oos.equal.tr, oos.equal.te, oos.pick.tr, oos.pick.te]
+          .filter(v => v != null).every(v => Math.abs(v) <= 1), 'true');
+      chk('三组组合（现状/等权/优选）都有结果',
+        oos.live.tr != null && oos.equal.tr != null && oos.pick.tr != null, 'true');
+      console.log('   样本内 ' + oos.nTrain + ' 天 / 样本外 ' + oos.nTest + ' 天 · 优选 ' + oos.nKept + '/' + oos.nAll +
+        ' 维 · 优选 IC ' + oos.pick.tr.toFixed(3) + ' → ' + oos.pick.te.toFixed(3) +
+        ' · 现状 IC ' + (oos.live.tr == null ? '—' : oos.live.tr.toFixed(3)) + ' → ' + (oos.live.te == null ? '—' : oos.live.te.toFixed(3)));
+    }
+
+    const roll = call('rollingIC', rep, 60, 10);
+    const rv = roll.map(x => x.ic).filter(v => v != null);
+    chk('滚动 IC 有足够窗口', roll.length > 100, 'true');
+    chk('滚动 IC 全部有界', rv.every(v => Math.abs(v) <= 1), 'true');
+    chk('滚动 IC 有波动（IC 不是常数）', new Set(rv.map(v => v.toFixed(3))).size > 20, 'true');
+    chk('滚动窗口全部有值', rv.length, roll.length);
+    console.log('   滚动 IC ' + rv.length + ' 个窗口 · 最小 ' + Math.min.apply(null, rv).toFixed(3) +
+      ' / 最大 ' + Math.max.apply(null, rv).toFixed(3));
+
+    const top5 = facs.slice(0, 5).map(r => r.id + ' ' + r.per[10].ic.toFixed(3)).join(' · ');
+    console.log('   归因前 5：' + top5);
+  }
+
   /* —— 回放不得污染实时状态 —— */
   const liveAfter = call('computeNexusScore');
   chk('回放后游标已复位', run('state.asof'), null);
