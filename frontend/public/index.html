@@ -201,6 +201,11 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
 .regime-badge.calm{color:var(--green);border-color:rgba(0,229,160,.3);background:rgba(0,229,160,.07)}
 .regime-badge.chop{color:var(--yellow);border-color:rgba(255,193,7,.3);background:rgba(255,193,7,.07)}
 .regime-badge.wild{color:var(--red);border-color:rgba(255,61,110,.35);background:rgba(255,61,110,.09)}
+.dvol-alarm{margin:6px 10px 0;padding:6px 10px;border-radius:9px;font-weight:600;font-size:12px;border:1px solid var(--border)}
+.dvol-alarm.panic{color:#fff;background:rgba(255,61,110,.92);border-color:rgba(255,61,110,.6);animation:dvolpulse 1.4s ease-in-out infinite}
+.dvol-alarm.elevated{color:var(--yellow);border-color:rgba(255,193,7,.4);background:rgba(255,193,7,.1)}
+.dvol-alarm.calm{color:var(--green);border-color:rgba(0,229,160,.3);background:rgba(0,229,160,.07)}
+@keyframes dvolpulse{0%,100%{opacity:1}50%{opacity:.62}}
 .extsub{margin:9px 0 2px;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:9px 11px;transition:border-color .2s}
 .extsub.active{border-color:rgba(255,61,110,.4);box-shadow:0 0 14px rgba(255,61,110,.08)}
 .extsub-h{display:flex;align-items:center;gap:8px;margin-bottom:7px}
@@ -273,6 +278,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
 
   <div class="panel">
     <div class="phdr"><span class="icon">🧠</span><span class="lbl">因子模型 · Nexus Score</span><span id="fCount" class="hint">28 维</span><span class="hint">方向加权合成 · 实时</span><span id="regimeBadge" class="hint regime-badge">体制 —</span></div>
+      <div id="dvolAlarm" class="dvol-alarm" style="display:none"></div>体制 —</span></div>
     <div class="fpanel">
       <div class="fhdr">
         <span class="fttl">综合多空评分</span>
@@ -295,7 +301,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
   <div class="panel">
     <div class="phdr"><span class="icon">🧪</span><span class="lbl">评分历史与有效性检验</span><span id="histHint" class="hint">未运行</span></div>
     <div class="hintro">
-      <span>把 <b>10 年</b>（2016 → 今）的宏观 / 链上 / 情绪序列取回来，用<b>与实时完全相同</b>的因子代码逐日重放，得到历史 Nexus Score。不仅检验分数有没有用，还把它<b>拆到因子级别</b>：哪个在做事、哪个方向设反了、哪个只是噪声；并用<b>样本外验证</b>防止自欺。<b>这是终端第一次能自证有没有用。</b></span>
+      <span>把 <b>BTC 日线延至 ~2014</b>（但因子齐全的 IC 窗口约 2016 → 今）的宏观 / 链上 / 情绪序列取回来，用<b>与实时完全相同</b>的因子代码逐日重放，得到历史 Nexus Score。不仅检验分数有没有用，还把它<b>拆到因子级别</b>：哪个在做事、哪个方向设反了、哪个只是噪声；并用<b>样本外验证</b>防止自欺。<b>这是终端第一次能自证有没有用。</b>（注：2009–2014 为「创世纪元」——有链上数据但无可靠 BTC 价格，不参与加权，见 ⑧）</span>
       <button id="histRun" class="hbtn">▶ 运行历史回放</button>
     </div>
     <div id="histNote" class="macro-hint">点右侧按钮开始（首次需拉取约 1.5MB 历史序列，5~15 秒）。跑完会得到：合成分数 IC · 单项因子 IC 归因 · 样本内/外验证 · 滚动 IC。</div>

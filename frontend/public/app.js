@@ -1209,6 +1209,34 @@ function renderFactors() {
     }
   }
 }
+/* v3.14: Deribit DVOL 实时波动率恐慌警报（风险护栏，不是预测）。
+ * 从 /api/dvol 取当前 DVOL 的近1年百分位 + 60日 z，红/黄/绿三档提示。失败静默（增强项）。 */
+async function refreshDvolAlarm() {
+  const el = $('dvolAlarm'); if (!el) return;
+  if (!CONFIG.PROXY) { el.style.display = 'none'; return; }
+  try {
+    const s = await getJSON(CONFIG.PROXY + '/api/dvol', 8000);
+    if (!s || s.latest == null) { el.style.display = 'none'; return; }
+    const pct = s.pctTrailing1y, z = s.z60, v = s.latest;
+    const pctTxt = (pct * 100).toFixed(0) + '%';
+    const rg = currentRegime(); const wild = rg && rg.key === 'wild';
+    let level, msg;
+    if (pct >= 0.90 || z >= 2) {
+      level = 'panic';
+      msg = '⚠ 期权市场恐慌 · DVOL ' + v.toFixed(0) + '（近1年高位 ' + pctTxt + (wild ? ' · 叠加极端波动体制' : '') + '）：建议降杠杆 / 减仓 / 不追高';
+    } else if (pct >= 0.75 || z >= 1.3) {
+      level = 'elevated';
+      msg = '波动率偏高 · DVOL ' + v.toFixed(0) + '（近1年 ' + pctTxt + (wild ? ' · 注意极端波动' : '') + '）';
+    } else {
+      level = 'calm';
+      msg = '波动率正常 · DVOL ' + v.toFixed(0) + '（近1年 ' + pctTxt + '）';
+    }
+    el.textContent = msg;
+    el.className = 'dvol-alarm ' + level;
+    el.style.display = '';
+  } catch (e) { /* DVOL 警报是增强项，失败不影响主面板 */ }
+}
+
 /* =====================================================================
  *  历史回放 · IC 有效性检验 / 因子归因（v3.8 → v3.9）
  *
@@ -1433,7 +1461,7 @@ async function runHistoryCheck() {
   const btn = $('histRun'), note = $('histNote');
   if (!histUrl()) { if (note) note.textContent = '此功能需要 Worker 代理（/api/history）；当前为直连模式。'; return; }
   if (btn) { btn.disabled = true; btn.textContent = '⏳ 回放中…'; }
-  if (note) { note.textContent = '正在拉取 10 年历史序列（约 1.5MB）并用同一套因子代码逐日重放…'; note.style.color = 'var(--dim)'; }
+  if (note) { note.textContent = '正在拉取 10 年历史序列（BTC 延至 ~2014，约 1.6MB）并用同一套因子代码逐日重放…'; note.style.color = 'var(--dim)'; }
   try {
     /* v3.11：窗口从 2 年变成 10 年，浏览器里可能残留着旧的 2 年包 —— 按 BTC 点数判一下重拉。 */
     if (state.histBundle && (!state.histBundle.btc || (state.histBundle.btc.ts || []).length < 2000)) state.histBundle = null;
@@ -1802,7 +1830,22 @@ function auxRegimeIC(rep, key) {
     }
     byRegime[R.k] = icCore(sub, rep, H, rep.start, rep.n);
   });
-  return { key: key, full: full, byRegime: byRegime };
+  // v3.14: 当前 DVOL 值（对齐序列最后一个非 null）+ 近1年百分位 + 60日 z，用于恐慌区标注（与 /api/dvol 同口径）
+  let lastIdx = -1;
+  for (let i = aligned.length - 1; i >= 0; i--) { if (aligned[i] != null) { lastIdx = i; break; } }
+  let latest = null, pctTrailing1y = null, z60 = null;
+  if (lastIdx >= 0) {
+    latest = aligned[lastIdx];
+    const win = aligned.slice(Math.max(0, lastIdx - 365 + 1), lastIdx + 1).filter(x => x != null);
+    if (win.length) pctTrailing1y = win.filter(x => x <= latest).length / win.length;
+    const zwin = aligned.slice(Math.max(0, lastIdx - 60 + 1), lastIdx + 1).filter(x => x != null);
+    if (zwin.length > 2) {
+      const mean = zwin.reduce((a, b) => a + b, 0) / zwin.length;
+      const sd = Math.sqrt(zwin.reduce((a, b) => a + (b - mean) * (b - mean), 0) / zwin.length);
+      z60 = sd > 1e-9 ? (latest - mean) / sd : 0;
+    }
+  }
+  return { key: key, full: full, byRegime: byRegime, latest: latest, pctTrailing1y: pctTrailing1y, z60: z60 };
 }
 
 /* 实时：从 BTC 日线 K 线算当前 20 日年化已实现波动率，判定当前体制 */
@@ -1957,6 +2000,16 @@ function renderReview() {
             : 'DVOL 的 IC 落在噪声区（|IC|<0.15），作为「恐惧温度计」定性看看可以，但不足以单独预测方向。它真正的价值在<b>极端期</b>：波动率指数飙升本身就是风险事件警报，比任何因子都直接。')
         : 'DVOL 样本不足，无法判定。';
       html += '<div class="rg-sub">' + verdict + '</div>';
+      // v3.14: 当前 DVOL 恐慌区标注（与实时 /api/dvol 同口径）
+      if (dv.latest != null && dv.pctTrailing1y != null) {
+        const pct = dv.pctTrailing1y, pctTxt = (pct * 100).toFixed(0) + '%';
+        const col = pct >= 0.90 ? 'var(--red)' : (pct >= 0.75 ? 'var(--yellow)' : 'var(--green)');
+        const zone = pct >= 0.90 ? '⚠ 当前处历史恐慌区' : (pct >= 0.75 ? '当前波动率偏高' : '当前波动率处历史正常区间');
+        html += '<div class="rg-sub" style="color:' + col + '"><b>' + zone + '</b>（近1年 ' + pctTxt + '）· DVOL=' + dv.latest.toFixed(0) + ' · 60日z=' + (dv.z60 == null ? '—' : dv.z60.toFixed(2)) + '</div>';
+      }
+      // v3.14: 数据边界 / 创世纪元（诚实回答「拉长到 2009」）
+      const startTs = (h.rep && h.rep.calTs && h.rep.calTs[h.rep.start]) || null;
+      html += '<div class="rg-sub" style="border-top:1px dashed var(--border);margin-top:8px;padding-top:8px"><b>数据边界</b>：IC 窗口实际始于 ' + (startTs ? fDate(startTs) : '—') + '（因子覆盖齐全的起点；BTC 日线虽延至 2014，但宏观/衍生品序列 2016-10 才齐全，故回放骨架前段 2014–2016 因子稀疏、不计入 IC）。链上 HR/TX/FEE 回溯到 2009，但 BTC 价格（IC 的因变量）最早可靠约 2014，且 <b>2009–2014 无可靠价格 → 标为「创世纪元」，不参与 IC 加权</b>。拉长到比特币诞生之年受价格源限制，非因子问题。</div>';
       auxBox.innerHTML = html;
     }
   }
@@ -2314,6 +2367,7 @@ async function refreshAll() {
   renderPaper();
   initNetwork(); renderHeatmap();
   renderStatus(ok);
+  refreshDvolAlarm();   // v3.14: 实时波动率恐慌警报（异步，不阻塞主渲染）
 }
 
 /* =====================================================================

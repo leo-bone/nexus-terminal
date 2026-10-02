@@ -5,7 +5,8 @@
  * 出口:
  *   /api/snapshot  宏观 / 政策 / 通胀 / 大宗 / 日元 序列（含日期 + 数据源诊断）
  *   /api/calendar  美国经济日历（非农 / 失业率 / 初请 / PCE / CPI / FOMC）
- *   /api/history   2 年日频历史包（供前端回放历史 Nexus Score + IC 检验）
+ *   /api/history   10 年+ 日频历史包（供前端回放历史 Nexus Score + IC 检验；BTC 经 v3.14 延至 ~2014）
+ *   /api/dvol      Deribit DVOL 实时恐慌统计（当前值 + 近1年百分位 + 60日 z，供实时波动率警报）
  *   /api/fetch     白名单代理（浏览器所有外部请求经此，绕 GFW + CORS）
  *   /health        健康检查
  *   /api/probe     数据源可达性诊断
@@ -104,12 +105,17 @@ async function fetchStooq(symbol) {
 }
 
 /* ---------- Yahoo Finance → {ts,closes} ---------- */
-async function fetchYahoo(symbol, range = '1y') {
+/* range 用 'max' 会对部分标的退化为月频采样（BTC-USD 实测只返回 145 个月点），
+ * 故 BTC 这类「要日频长历史」的标的改用 period1/period2 + interval=1d 精确取日频。 */
+async function fetchYahoo(sahoo, range = '10y', period1 = null) {
   const hosts = ['query1.finance.yahoo.com', 'query2.finance.yahoo.com'];
   let lastErr;
   for (const host of hosts) {
     try {
-      const url = `https://${host}/v8/finance/chart/${encodeURIComponent(symbol)}?range=${range}&interval=1d`;
+      const base = `https://${host}/v8/finance/chart/${encodeURIComponent(sahoo)}`;
+      const url = period1 != null
+        ? `${base}?period1=${period1}&period2=${Math.floor(Date.now() / 1000)}&interval=1d`
+        : `${base}?range=${range}&interval=1d`;
       const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36', 'Accept': 'application/json' } });
       if (!r.ok) throw new Error('yahoo ' + r.status);
       const j = await r.json();
@@ -501,6 +507,8 @@ const HIST_YAHOO = {
  * points), so range=10y must be explicit -- measured: BTC 3653 / DXY 3037 /
  * other macro 2500+ points, exactly covering the target window. */
 const HIST_RANGE = '10y';
+/* v3.14: BTC 用 period1 显式取日频长历史（2014-09-01 起，BTC-USD 诞生附近），避开 range=max 的月频退化 */
+const BTC_PERIOD1 = Math.floor(Date.UTC(2014, 8, 1) / 1000);
 const HIST_START_YEAR = 2016;   // first year for the per-year Treasury fetch
 const HIST_KEEP = 3900;         // max ~10.7y of daily points per series
 const HIST_TTL = 3600;          // success cache 1h
@@ -508,8 +516,8 @@ const HIST_MIN_RETRY = 900;     // failure backoff 15min
 /* NOTE: bump vN whenever this endpoint's payload shape or semantics change,
  * otherwise the previous edge cache masks the change and it looks like the new
  * code never shipped (hit this twice in practice). */
-const HIST_DATA_KEY = 'https://nexus-cache.internal/history-v10';
-const HIST_META_KEY = 'https://nexus-cache.internal/history-meta-v10';
+const HIST_DATA_KEY = 'https://nexus-cache.internal/history-v12';
+const HIST_META_KEY = 'https://nexus-cache.internal/history-meta-v12';
 
 const trimS = (s, n = HIST_KEEP) => {
   if (!s || !s.ts || !s.ts.length) return null;
@@ -687,16 +695,38 @@ async function fetchDeribitAll() {
   return { DVOL: { ts: dvol.map(x => x.t), closes: dvol.map(x => x.c) } };
 }
 
+/* v3.14: DVOL 实时恐慌统计 —— 从 deribitWithCache 的 DVOL 序列算「当前值处在历史什么位置」，
+ * 供前端实时面板做波动率恐慌警报（风险护栏，不是预测）。deribitWithCache 自带 12h 缓存，这里调用几乎零成本。 */
+async function dvolStat() {
+  const drb = await deribitWithCache();
+  if (!drb || !drb.DVOL || !drb.DVOL.closes || drb.DVOL.closes.length < 60) return null;
+  const closes = drb.DVOL.closes, ts = drb.DVOL.ts, n = closes.length;
+  const last = closes[n - 1], lastTs = ts[n - 1];
+  // 近 1 年（~365 点）分位：当前值在这段历史里的百分位（越高越恐慌）
+  const w = Math.min(365, n);
+  const win = closes.slice(n - w);
+  const pctTrailing1y = win.filter(x => x <= last).length / win.length;
+  // 近 60 日 z 分数（滚动均值 / 标准差）：捕捉近期相对自身的飙升
+  const zwin = closes.slice(Math.max(0, n - 60));
+  const mean = zwin.reduce((a, b) => a + b, 0) / zwin.length;
+  const sd = Math.sqrt(zwin.reduce((a, b) => a + (b - mean) * (b - mean), 0) / zwin.length);
+  const z60 = sd > 1e-9 ? (last - mean) / sd : 0;
+  return { latest: last, ts: lastTs, pctTrailing1y, z60, n, src: 'deribit:dvol' };
+}
+
 async function fetchHistoryBundle() {
   const out = { macro: {}, fng: null, tx: null, hr: null, btc: null, srcs: {} };
 
   // —— Yahoo 2 年日频 ——
   await Promise.all(Object.keys(HIST_YAHOO).map(async (k) => {
     try {
-      const d = await fetchYahoo(HIST_YAHOO[k], HIST_RANGE);
-      const t = trimS(d);
+      // v3.14: BTC 用 period1 显式取日频长历史（2014-09 起），把 IC 窗口从 2016-10 真正往前推到「10 年甚至更早」；
+      // 其余宏观序列仍用 10y（range=max 对部分标的会退化为月频采样，且会撑大包体）。BTC 单独放宽 keep 上限到 4600（~12.6y）。
+      const isBtc = (k === 'BTC');
+      const d = await fetchYahoo(HIST_YAHOO[k], HIST_RANGE, isBtc ? BTC_PERIOD1 : null);
+      const t = trimS(d, isBtc ? 4600 : HIST_KEEP);
       if (!t) throw new Error('empty');
-      if (k === 'BTC') { out.btc = t; out.srcs.BTC = 'yahoo:BTC-USD'; }
+      if (isBtc) { out.btc = t; out.srcs.BTC = 'yahoo:BTC-USD'; }
       else { out.macro[k] = t; out.srcs[k] = 'yahoo:' + HIST_YAHOO[k]; }
     } catch (e) { console.warn('hist yahoo fail', k, e.message); }
   }));
@@ -930,6 +960,14 @@ export default {
       catch (e) { return jsonResp({ error: e.message, ts: Date.now() }, 502); }
     }
 
+    if (url.pathname === '/api/dvol') {
+      try {
+        const s = await dvolStat();
+        if (!s) return jsonResp({ error: 'dvol unavailable (cooldown or fail)' }, 502);
+        return jsonResp(s, 200, { 'Cache-Control': 'public, max-age=300' });
+      } catch (e) { return jsonResp({ error: e.message }, 502); }
+    }
+
     if (url.pathname === '/api/calendar') {
       try { return await calendarWithFallback(); }
       catch (e) { return jsonResp({ error: e.message, events: [], ts: Date.now() }, 502); }
@@ -944,7 +982,7 @@ export default {
     }
 
     if (url.pathname === '/' || url.pathname === '/health') {
-      return jsonResp({ name: 'nexus-proxy', version: '3.12', status: 'ok', source: 'yahoo+stooq+nyfed+treasury+mof+coinlore+finforexfactory+bitcoin-data+bybit+deribit+proxy', symbols: Object.keys(SIMPLE).concat(['EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'JGB10Y', 'DVOL', 'DVHV']) });
+      return jsonResp({ name: 'nexus-proxy', version: '3.13', status: 'ok', source: 'yahoo+stooq+nyfed+treasury+mof+coinlore+finforexfactory+bitcoin-data+bybit+deribit+proxy', symbols: Object.keys(SIMPLE).concat(['EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'JGB10Y', 'DVOL', 'DVHV']) });
     }
 
     return new Response('Not Found', { status: 404, headers: CORS });
