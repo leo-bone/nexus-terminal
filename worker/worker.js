@@ -962,6 +962,13 @@ export default {
 
     if (url.pathname === '/api/dvol') {
       try {
+        if (url.searchParams.get('series')) {
+          // v3.15: 回测用——返回 DVOL 完整历史序列（ts/closes），供本地 walk-forward 防御回测
+          const drb = await deribitWithCache();
+          if (!drb || !drb.DVOL || !drb.DVOL.closes || drb.DVOL.closes.length < 2)
+            return jsonResp({ error: 'dvol series unavailable (cooldown or fail)' }, 502);
+          return jsonResp({ ts: drb.DVOL.ts, closes: drb.DVOL.closes, src: 'deribit:dvol' }, 200, { 'Cache-Control': 'public, max-age=300' });
+        }
         const s = await dvolStat();
         if (!s) return jsonResp({ error: 'dvol unavailable (cooldown or fail)' }, 502);
         return jsonResp(s, 200, { 'Cache-Control': 'public, max-age=300' });
@@ -982,7 +989,7 @@ export default {
     }
 
     if (url.pathname === '/' || url.pathname === '/health') {
-      return jsonResp({ name: 'nexus-proxy', version: '3.14', status: 'ok', source: 'yahoo+stooq+nyfed+treasury+mof+coinlore+finforexfactory+bitcoin-data+bybit+deribit+proxy', symbols: Object.keys(SIMPLE).concat(['EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'JGB10Y', 'DVOL', 'DVHV']) });
+      return jsonResp({ name: 'nexus-proxy', version: '3.15', status: 'ok', source: 'yahoo+stooq+nyfed+treasury+mof+coinlore+finforexfactory+bitcoin-data+bybit+deribit+proxy', symbols: Object.keys(SIMPLE).concat(['EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'JGB10Y', 'DVOL', 'DVHV']) });
     }
 
     return new Response('Not Found', { status: 404, headers: CORS });

@@ -2010,6 +2010,12 @@ function renderReview() {
       // v3.14: 数据边界 / 创世纪元（诚实回答「拉长到 2009」）
       const startTs = (h.rep && h.rep.calTs && h.rep.calTs[h.rep.start]) || null;
       html += '<div class="rg-sub" style="border-top:1px dashed var(--border);margin-top:8px;padding-top:8px"><b>数据边界</b>：IC 窗口实际始于 ' + (startTs ? fDate(startTs) : '—') + '（因子覆盖齐全的起点；BTC 日线虽延至 2014，但宏观/衍生品序列 2016-10 才齐全，故回放骨架前段 2014–2016 因子稀疏、不计入 IC）。链上 HR/TX/FEE 回溯到 2009，但 BTC 价格（IC 的因变量）最早可靠约 2014，且 <b>2009–2014 无可靠价格 → 标为「创世纪元」，不参与 IC 加权</b>。拉长到比特币诞生之年受价格源限制，非因子问题。</div>';
+      // v3.15: 护栏实证结论（walk-forward 防御回测，离线验证，详见 README v3.15）
+      html += '<div class="rg-sub" style="border-top:1px dashed var(--border);margin-top:8px;padding-top:8px"><b>护栏实证（v3.15 walk-forward 回测）</b>：把警报当「机械减仓开关」不成立——' +
+        '<b>① wild 体制是动量而非危险信号</b>：触发后 10/20 日远期收益反而更高（+3.28%/+7.01% vs 未触发 +1.53%/+3.14%，t=3.24/4.53），此时空仓会错失涨幅（Sharpe 0.82→0.64）；' +
+        '<b>② DVOL 恐慌单独触发</b>虽在 20 日远端有前瞻性（−3.40%，t=−4.56），但按恐慌日空仓最大回撤未降（−83.4% 不变）、Sharpe 反降（0.82→0.77）；' +
+        '<b>③ 双重警报（wild+恐慌同发）</b>是唯一有统计意义的短周期预警（触发后 10 日均值 −2.11%，t=−2.41），但仅 32 个样本、占时长 0.7%，太稀疏不足以系统化交易。' +
+        '→ 警报的正确定位是<b>行为护栏</b>（降杠杆 / 不追高 / 别临场决策），<b>不是可机械执行的卖出信号</b>；真正耐用的输出仍是体制徽标那句「主评分此时不可信」。</div>';
       auxBox.innerHTML = html;
     }
   }
