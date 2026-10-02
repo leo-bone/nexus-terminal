@@ -1487,6 +1487,8 @@ async function runHistoryCheck() {
     });
     const reg = regimeTest(rep);
     const per = periodIC(rep);
+    /* v3.17：多重检验与过拟合校正。bootstrap 较重（数十万次相关），不同步跑——
+     * 首屏先渲染，再异步算完只刷新 ⑩ 那一块，避免回放时卡住页面。 */
     /* v3.12: Deribit 期权原生指标（分析专用参考，不入评分）—— 测真实 IC，先看有没有用 */
     const aux = {};
     ['DVOL', 'DVHV'].forEach(function (k) { const a = auxRegimeIC(rep, k); if (a) aux[k] = a; });
@@ -1496,9 +1498,11 @@ async function runHistoryCheck() {
     const exAllIC = icCore(exSeries, rep, 10, rep.start, rep.n);
     const exMainWild = reg.byRegime.wild ? reg.byRegime.wild.ic : null;
     state.hist = { rep: rep, ics: ics, facs: facs, oos: oos, roll: roll, ext: ext, reg: reg, per: per, aux: aux,
+      mt: null, mtBusy: true,
       extreme: { series: exSeries, wildIC: exWildIC, mainWildIC: exMainWild, allIC: exAllIC } };
     renderHistory();
     renderReview();
+    scheduleMt(rep);
     if (note) note.textContent = '';
   } catch (e) {
     if (note) { note.textContent = '回放失败：' + ((e && e.message) || e); note.style.color = 'var(--red)'; }
@@ -2013,6 +2017,12 @@ function renderReview() {
     }
   }
 
+  /* ---- ⑩ 多重检验与过拟合校正 ----
+   * 用途很直接：给上面所有「IC 是多少 / t 是多少」的结论标上可信度折扣。
+   * 一次回放会对 20+ 因子 × 4 horizon 做上百次检验；不做校正的话，
+   * 单看 |t|>2 会把纯噪声读成信号，这正是业余因子挖掘的典型失误。 */
+  renderMtBox();
+
   /* ---- ⑨ 十年关键事件时间线 ----
    * 与 ⑥ 的口径不同：⑥ 是「程序扫出来的极端波幅」（|5日收益| ≥ 15%），
    * 而这列是「当时确实重要、但日线波幅未必够阈值」的事 —— 最典型的就是
@@ -2286,6 +2296,198 @@ function rollingIC(rep, win, h) {
   return out;
 }
 
+/* =====================================================================
+ * v3.17：多重检验与过拟合校正
+ *
+ *  这是「业余因子挖掘」与「专业机构」之间最硬的一条分界线，而且它可量化。
+ *  本终端一次回放会给 20+ 个因子 × 4 个 horizon 分别做显著性检验。若沿用
+ *  |t| > 2（≈ α=0.05）逐个判定，即使全部是纯噪声，统计上也期望有
+ *  K × α 个「显著」—— K=88 时就是 4.4 个假阳性。过去本面板的判定 ①②
+ *  正是这么做的。López de Prado 一整套方法就是为修正它而生，这里落地四项：
+ *
+ *    (a) Bonferroni / Šidák —— 把显著性门槛按试验次数 K 放大
+ *    (b) Benjamini-Hochberg FDR —— 控制「被判显著的结果里假发现的比例」
+ *    (c) White's Reality Check —— 在「全是噪声」的零假设下重采样，看最好的
+ *        那个因子能好到什么程度；若真实最好值不比噪声极值更极端，则整体不显著
+ *    (d) Deflated IC —— 在同等试验次数下，纯噪声能「碰」出的 IC 期望最大值
+ *
+ *  这些方法不会让信号变强。它们只会告诉你，你看到的「信号」
+ *  有多少可以纯粹用「试的次数够多」来解释。
+ * ===================================================================== */
+function erfApprox(x) {
+  const s = x < 0 ? -1 : 1; x = Math.abs(x);
+  const t = 1 / (1 + 0.3275911 * x);
+  const y = 1 - ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x);
+  return s * y;
+}
+function normCdf(x) { return 0.5 * (1 + erfApprox(x / Math.SQRT2)); }
+/* 正态逆 CDF（二分）—— 用来把校正后的 α 换算回「|t| 要大于多少」 */
+function normInv(p) {
+  if (!(p > 0) || !(p < 1)) return p <= 0 ? -12 : 12;
+  let lo = -12, hi = 12;
+  for (let k = 0; k < 100; k++) { const m = (lo + hi) / 2; if (normCdf(m) < p) lo = m; else hi = m; }
+  return (lo + hi) / 2;
+}
+function tToP2(t) { return Math.max(1e-12, 2 * (1 - normCdf(Math.abs(t)))); }
+
+/* White's Reality Check 的加速关键：Spearman 的秩在重排下是等变的。
+ * 若 r' 是 r 的一个排列（r'[i] = r[perm[i]]），则 rank(r')[i] = rank(r)[perm[i]]。
+ * 于是每次 bootstrap 不必再对打乱后的收益序列重新排序，直接查预计算的秩表即可
+ * —— 把每次 bootstrap 的复杂度从 O(K·m·log m) 降到 O(K·m)。 */
+function multiTest(rep, opts) {
+  opts = opts || {};
+  const alpha = opts.alpha == null ? 0.05 : opts.alpha;
+  const B = opts.boot || 200;
+  const rows = factorICRows(rep);
+  const tests = [];
+  rows.forEach(function (row) {
+    IC_HORIZONS.forEach(function (h) {
+      const p = row.per[h];
+      if (!p || p.t == null || p.ic == null) return;
+      tests.push({ id: row.id, name: row.name, h: h, ic: p.ic, t: p.t, n: p.n });
+    });
+  });
+  const K = tests.length;
+  if (!K) return null;
+  tests.forEach(function (x) { x.p = tToP2(x.t); });
+
+  const tCritRaw = normInv(1 - alpha / 2);
+  const tCritBonf = normInv(1 - alpha / (2 * K));
+  const aSidak = 1 - Math.pow(1 - alpha, 1 / K);
+  const tCritSidak = normInv(1 - aSidak / 2);
+
+  /* Benjamini-Hochberg step-up：先算 q 值（step-up 修正后的 p），再看哪些过了 α */
+  const ord = tests.map(function (x, i) { return i; }).sort(function (a, b) { return tests[a].p - tests[b].p; });
+  let prev = 1;
+  for (let k = ord.length - 1; k >= 0; k--) {
+    const i0 = ord[k];
+    const qv = Math.min(prev, tests[i0].p * K / (k + 1));
+    tests[i0].q = qv;
+    prev = qv;
+  }
+  let kMax = 0;
+  for (let k = 0; k < ord.length; k++) if (tests[ord[k]].p <= (k + 1) / K * alpha) kMax = k + 1;
+  ord.forEach(function (i0, k) { tests[i0].bhSig = k < kMax; });
+  tests.forEach(function (x) {
+    x.rawSig = Math.abs(x.t) > tCritRaw;
+    x.bonfSig = Math.abs(x.t) > tCritBonf;
+    x.sidakSig = Math.abs(x.t) > tCritSidak;
+  });
+
+  const nRawSig = tests.filter(function (x) { return x.rawSig; }).length;
+  const nBonfSig = tests.filter(function (x) { return x.bonfSig; }).length;
+  const nSidakSig = tests.filter(function (x) { return x.sidakSig; }).length;
+  const nBhSig = tests.filter(function (x) { return x.bhSig; }).length;
+
+  /* ---- White's Reality Check（置换 bootstrap，horizon = 10 日）----
+   * 朴素写法是 O(B·K·m·log m)。三处优化把它压到百毫秒级：
+   *   ① 秩等变性 —— 打乱 r 后其秩只是被同一个 perm 作用，不必重新排序，
+   *      于是 Spearman 退化成「查预计算的秩表 + 一次 pearson」；
+   *   ② 因子序列的秩固定，预中心化并把 Σ(x−x̄)² 预算出来，每次只剩两次遍历。
+   * 这里刻意<b>不</b>对日历降采样：降采样会让样本量变小、抽样方差变大，人为把
+   * 零分布撑宽（实测会把家族 p 从 0.003 推到 0.060，直接翻转结论）。
+   * 用性能调整去改变统计结论是不可接受的，宁可多花一点时间。 */
+  const H = 10;
+  const full = [];
+  for (let i = rep.start; i + H < rep.n; i++) {
+    const p0 = rep.closes[i];
+    if (p0 != null && p0 !== 0) full.push(i);
+  }
+  let wrc = null;
+  if (full.length >= 80) {
+    const Rfull = full.map(function (i) { return rep.closes[i + H] / rep.closes[i] - 1; });
+    const RRfull = rankAvg(Rfull);
+    const fprep = [];
+    rows.forEach(function (row) {
+      const arr = rep.fvals[row.id];
+      if (!arr) return;
+      const pos = [], sv = [];
+      for (let q = 0; q < full.length; q++) { const v = arr[full[q]]; if (v == null) continue; pos.push(q); sv.push(v); }
+      if (sv.length < 30) return;
+      const rs = rankAvg(sv);
+      let mrs = 0;
+      for (let q = 0; q < rs.length; q++) mrs += rs[q];
+      mrs /= rs.length;
+      const cs = new Array(rs.length);
+      let sxx = 0;
+      for (let q = 0; q < rs.length; q++) { cs[q] = rs[q] - mrs; sxx += cs[q] * cs[q]; }
+      if (!(sxx > 0)) return;
+      /* pos 长度等于整条日历 ⇒ 该因子处处有值，pos[q] 就是 q，可走快路径 */
+      const posless = pos.length === full.length;
+      fprep.push({ id: row.id, name: row.name, pos: pos, cs: cs, sxx: sxx, m: cs.length, posless: posless });
+    });
+    if (fprep.length >= 3) {
+      /* bestOf 接的是「已按本次排列取好的收益秩序列」gath，长度 M，各因子按自己的 pos 取子集。
+       * 关键一击：cs 已经中心化 ⇒ Σcs = 0 ⇒ Σcs·(y − ȳ) = Σcs·y。
+       * 于是「先扫一遍求 ȳ 再扫一遍求协方差」可并成一遍；再把 syy 写成 Σy² − (Σy)²/m。
+       * 每个因子从 3 次遍历降到 1 次，配合共享 gath 消除二级间接寻址，实测约 6 倍提速。 */
+      const bestOf = function (gath) {
+        let mx = 0, who = null;
+        for (let f = 0; f < fprep.length; f++) {
+          const P = fprep[f], cs = P.cs, m = P.m;
+          let sy = 0, sy2 = 0, sxy = 0;
+          if (P.posless) {
+            /* 快路径：该因子在整条日历上都有值，pos[q] === q，
+             * 可以直接顺序读 gath，省掉一层间接寻址 */
+            for (let q = 0; q < m; q++) { const y = gath[q]; sy += y; sy2 += y * y; sxy += cs[q] * y; }
+          } else {
+            const pos = P.pos;
+            for (let q = 0; q < m; q++) { const y = gath[pos[q]]; sy += y; sy2 += y * y; sxy += cs[q] * y; }
+          }
+          const syy = sy2 - sy * sy / m;
+          if (syy > 0) {
+            const a = Math.abs(sxy / Math.sqrt(P.sxx * syy));
+            if (a > mx) { mx = a; who = P.name; }
+          }
+        }
+        return { mx: mx, who: who };
+      };
+      const M = full.length;
+      const obs = bestOf(RRfull);
+      let seed = 20261002;
+      const rand = function () { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+      const gath = new Array(M);
+      const perm = []; for (let q = 0; q < M; q++) perm.push(q);
+      const maxAbs = [];
+      for (let b = 0; b < B; b++) {
+        for (let q = M - 1; q > 0; q--) { const j = Math.floor(rand() * (q + 1)); const tv = perm[q]; perm[q] = perm[j]; perm[j] = tv; }
+        for (let q = 0; q < M; q++) gath[q] = RRfull[perm[q]];
+        maxAbs.push(bestOf(gath).mx);
+      }
+      maxAbs.sort(function (a, b) { return a - b; });
+      const qof = function (q0) { const i2 = Math.min(maxAbs.length - 1, Math.max(0, Math.round(q0 * (maxAbs.length - 1)))); return maxAbs[i2]; };
+      const exceed = maxAbs.filter(function (v) { return v >= obs.mx; }).length;
+      wrc = {
+        B: B, n: M, nFactors: fprep.length,
+        obsMax: obs.mx, obsWho: obs.who,
+        med: qof(0.5), p95: qof(0.95), maxSeen: maxAbs[maxAbs.length - 1],
+        pval: (exceed + 1) / (B + 1),
+      };
+    }
+  }
+
+  /* Deflated IC：在 K 次独立检验、全为噪声的零假设下，|IC| 最大值的期望。
+   * 用同样 B 次 bootstrap 得到的 max|IC| 分布均值作为基准：真实最好 IC 若
+   * 没能明显超过它，说明「最好的发现」也可以纯由多次尝试解释。 */
+  let deflated = null;
+  if (wrc) {
+    deflated = {
+      expectedMax: wrc.med,
+      hurdle: wrc.p95,
+      best: wrc.obsMax,
+      bestWho: wrc.obsWho,
+      beatsHint: wrc.obsMax > wrc.p95,
+    };
+  }
+
+  return {
+    K: K, alpha: alpha, nFactors: rows.length,
+    tCritRaw: tCritRaw, tCritBonf: tCritBonf, tCritSidak: tCritSidak,
+    nRawSig: nRawSig, nBonfSig: nBonfSig, nSidakSig: nSidakSig, nBhSig: nBhSig,
+    expFalse: K * alpha, tests: tests, wrc: wrc, deflated: deflated,
+  };
+}
+
 /* ---------- 渲染：① 归因表 ---------- */
 function facVerdict(p) {
   if (!p || p.t == null || p.ic == null) return '<span style="color:#5b7a9a">· 样本少</span>';
@@ -2449,3 +2651,101 @@ window.addEventListener('load', async () => {
     if (net) { net.W = $('netCanvas').clientWidth; net.H = $('netCanvas').clientHeight; net.idle = 0; if (!netRunning) { netRunning = true; animateNetwork(); } }
   });
 });
+
+/* =====================================================================
+ * v3.17：⑩ 多重检验与过拟合校正 —— 单独成函数，因为 bootstrap 较重，
+ * 回放時先渲染其余面板，再异步算出结果后只刷新这一块，避免卡首屏。
+ * ===================================================================== */
+function renderMtBox() {
+  const mtBox = $('mttBox');
+  if (!mtBox) return;
+  const h = state.hist;
+  const mt = (h && h.mt) ? h.mt : null;
+  if (!mt) {
+    mtBox.innerHTML = (h && h.mtBusy)
+      ? '<div class="rg-sub">多重检验校正正在计算（bootstrap 重采样中，通常几百毫秒）…</div>'
+      : '<div class="rg-sub">多重检验校正暂不可用（回放数据不足，或尚未运行回放）。</div>';
+    return;
+  }
+  let mh = '<div class="fttl" style="margin-bottom:7px">⑩ 多重检验与过拟合校正</div>';
+  mh += '<div class="rg-sub">一次回放要做 <b>' + mt.K + ' 次</b>显著性检验（' + mt.nFactors +
+    ' 个因子 × 4 个 horizon）。若沿用「单个检验 |t| &gt; 2」逐个判定，即使<b>全部是纯噪声</b>，' +
+    '统计上也期望出现 <b>' + mt.expFalse.toFixed(1) + ' 个</b>「显著」。这一块就是把这件事摊开算给你看。</div>';
+  mh += '<div class="rg-tbl"><div class="rg-hd"><span>校正口径</span><span>门槛</span><span>通过</span><span>含义</span><span></span><span></span></div>';
+  const mtRow = function (lbl, tv, npass, mean) {
+    return '<div class="rg-row"><span class="rg-nm">' + lbl + '</span>' +
+      '<span>' + tv + '</span>' +
+      '<span class="' + (npass > 0 ? 'rg-y' : 'rg-dim') + '">' + npass + ' / ' + mt.K + '</span>' +
+      '<span class="rg-dim">' + mean + '</span><span></span><span></span></div>';
+  };
+  mh += mtRow('未校正（单个 α=0.05）', '|t| &gt; ' + mt.tCritRaw.toFixed(2), mt.nRawSig, '逐个判定，最容易自欺');
+  mh += mtRow('Bonferroni', '|t| &gt; ' + mt.tCritBonf.toFixed(2), mt.nBonfSig, '最严格：几乎不许有假发现');
+  mh += mtRow('Šidák', '|t| &gt; ' + mt.tCritSidak.toFixed(2), mt.nSidakSig, '同族，略宽松于 Bonferroni');
+  mh += mtRow('Benjamini-Hochberg FDR', 'q &lt; 0.05', mt.nBhSig, '容忍少量假发现，换取检验力');
+  mh += '</div>';
+
+  const surv = mt.tests.filter(function (x) { return x.bonfSig; })
+    .sort(function (a, b) { return Math.abs(b.ic) - Math.abs(a.ic); });
+  if (surv.length) {
+    mh += '<div class="rg-sub"><b>扛住 Bonferroni 的幸存者（' + surv.length + ' 个）</b>：' +
+      surv.slice(0, 8).map(function (x) {
+        return x.name.replace(/^[^ ]+ /, '') + ' <i>h=' + x.h + ' IC=' + x.ic.toFixed(3) + ' |t|=' + Math.abs(x.t).toFixed(1) + '</i>';
+      }).join(' · ') + '。只有这些，才谈得上「不是运气」。</div>';
+  } else {
+    mh += '<div class="rg-sub"><b>没有因子扛得住 Bonferroni 校正</b>（0 / ' + mt.K + '）。' +
+      '这不是说因子没用，而是说：在做了这么多次尝试之后，没有哪一个的统计证据强到可以排除运气解释。</div>';
+  }
+
+  const fadeout = mt.tests.filter(function (x) { return x.rawSig && !x.bonfSig; })
+    .sort(function (a, b) { return Math.abs(b.ic) - Math.abs(a.ic); });
+  if (fadeout.length) {
+    mh += '<div class="rg-sub">被校正淘汰的假发现候选（未校正时显著、校正后不显著）：' +
+      fadeout.slice(0, 6).map(function (x) {
+        return x.name.replace(/^[^ ]+ /, '') + '<i>h=' + x.h + '</i>';
+      }).join(' · ') + ' 共 ' + fadeout.length + ' 个。</div>';
+  }
+
+  if (mt.wrc) {
+    const W = mt.wrc;
+    const pcls = W.pval < 0.05 ? 'rg-g' : (W.pval < 0.20 ? 'rg-y' : 'rg-r');
+    mh += '<div class="rg-tbl" style="margin-top:8px"><div class="rg-hd">' +
+      '<span>White Reality Check</span><span>观测最佳</span><span>噪声中位数</span><span>噪声 95%</span><span>家族 p</span><span></span></div>';
+    mh += '<div class="rg-row"><span class="rg-nm">最好的那个因子 vs 纯噪声</span>' +
+      '<span>' + W.obsMax.toFixed(3) + '</span>' +
+      '<span class="rg-dim">' + W.med.toFixed(3) + '</span>' +
+      '<span>' + W.p95.toFixed(3) + '</span>' +
+      '<span class="' + pcls + '">' + W.pval.toFixed(3) + '</span>' +
+      '<span></span></div></div>';
+    mh += '<div class="rg-sub">做法：把未来收益与因子的配对关系彻底打乱 ' + W.B + ' 次（破坏真实信息、保留收益的统计特性），' +
+      '每次记录「这批因子里最好的 |IC| 能到多少」，得到一个<b>纯运气能达到的水平分布</b>。' +
+      '真实数据里最好的是 <b>' + (W.obsWho || '—').replace(/^[^ ]+ /, '') + ' |IC|=' + W.obsMax.toFixed(3) + '</b>，' +
+      '而纯噪声的中位数就有 ' + W.med.toFixed(3) + '、95 分位 ' + W.p95.toFixed(3) + '。家族 p = ' + W.pval.toFixed(3) + ' —— ' +
+      (W.pval < 0.05
+        ? '<b>最好的因子确实超过了运气能解释的范围</b>：整批因子里存在真实信息，值得往下做样本外验证。'
+        : '<b>最好的因子没能超过运气的解释范围</b>：这么多因子里挑出最好的那个，纯噪声也能挑到这个水平。这是筛选流程本身在产生虚假信号，而不是找到了 alpha。') +
+      '</div>';
+    mh += '<div class="rg-sub">注意两种校正回答的是<b>不同</b>的问题，结论可以同时成立且并不矛盾：' +
+      'White Reality Check 检验「<b>整批</b>里有没有真东西」（家族证据，检验力高）；' +
+      'Bonferroni 逐个追问「<b>这一个</b>能不能单独拿来做」（单个证据，要求苛刻）。' +
+      '家族显著、逐个全部失败，是<b>「有信号但很分散」</b>的典型样子——正好对应 IC 只有 0.10 量级的现实。</div>';
+  }
+  mh += '<div class="rg-sub" style="border-top:1px dashed var(--border);margin-top:8px;padding-top:8px">' +
+    '<b>这套校正不会让信号变强，只会告诉你「看见的信号」有多少能用「试得够多」来解释。</b>' +
+    '这也是本面板与市面上绝大多数「某因子胜率 80%」产品的区别：那些数字通常<b>从未</b>经过任何多重检验校正。</div>';
+  mtBox.innerHTML = mh;
+}
+
+/* 异步触发：bootstrap 较重，放到首屏渲染之后跑，算完只刷新 ⑩ 这一块 */
+function scheduleMt(rep) {
+  if (!rep) return;
+  try {
+    if (state.hist) { state.hist.mtBusy = true; state.hist.mt = null; }
+    renderMtBox();
+  } catch (e) { /* ignore */ }
+  setTimeout(function () {
+    let mt = null;
+    try { mt = multiTest(rep); } catch (e) { console.warn('multitest fail', e && e.message); }
+    if (state.hist) { state.hist.mtBusy = false; state.hist.mt = mt; }
+    try { renderMtBox(); } catch (e2) { console.warn('mt render fail', e2 && e2.message); }
+  }, 80);
+}

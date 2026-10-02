@@ -636,6 +636,67 @@ const near = (label, actual, expect, tol) => {
   chk('⑦ 块给出诚实结论文本', /极端体制内|外生冲击|样本外验证/.test(exBoxHtml), 'true');
   run('state.hist = null;');
 
+  console.log('\n===== K. 多重检验与过拟合校正（v3.17）=====');
+  run('state.hist = null;');
+
+  /* —— 数值核自洽：这是整套校正的地基，算错就全是假的 —— */
+  near('normInv(0.975) 回到 1.96', call('normInv', 0.975), 1.959964, 1e-3);
+  near('tToP2(1.96) 双侧 p ≈ 0.05', call('tToP2', 1.959964), 0.05, 1e-3);
+  near('normCdf(0) = 0.5', call('normCdf', 0), 0.5, 1e-6);
+  chk('normInv 单调递增', call('normInv', 0.99) > call('normInv', 0.95), 'true');
+  chk('normInv(0) 不返回 NaN', Number.isFinite(call('normInv', 0)), 'true');
+
+  /* —— 合成纯噪声样本：验证校正确实在收紧判定 —— */
+  (function () {
+    let s = 42;
+    const rnd = () => { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff; };
+    const NN = 400, closes = [], calTs = [];
+    const fv = { gold: [], oil: [], hr: [] };
+    let px = 100;
+    for (let i = 0; i < NN; i++) {
+      px *= (1 + (rnd() - 0.5) * 0.04);
+      closes.push(px);
+      calTs.push(Date.UTC(2018, 0, 1) + i * 86400000);
+      Object.keys(fv).forEach(k => fv[k].push(rnd() - 0.5));
+    }
+    const repN = { start: 0, n: NN, calTs, closes, scores: fv.gold, fvals: fv, fzs: {} };
+    run('var __repN = ' + JSON.stringify(repN) + ';');
+    const mt2 = run('multiTest(__repN)');
+    chk('multiTest 在合成样本上返回结构', !!mt2, 'true');
+    if (mt2) {
+      const nf = Object.keys(fv).length;
+      chk('检验次数 K = 因子数 × horizon 数', mt2.K, nf * 4);
+      near('期望假阳性数 = K × alpha', mt2.expFalse, mt2.K * 0.05, 1e-9);
+      chk('Bonferroni 门槛高于未校正门槛', mt2.tCritBonf > mt2.tCritRaw, 'true');
+      chk('Sidak 门槛不高于 Bonferroni', mt2.tCritSidak <= mt2.tCritBonf, 'true');
+      chk('Bonferroni 通过数 ≤ 未校正通过数', mt2.nBonfSig <= mt2.nRawSig, 'true');
+      chk('BH-FDR 通过数 ≥ Bonferroni 通过数', mt2.nBhSig >= mt2.nBonfSig, 'true');
+      chk('每次检验都算出 q 值', mt2.tests.every(x => x.q != null && x.q >= 0 && x.q <= 1), 'true');
+      chk('q 值不小于对应 p 值（校正只会变松）', mt2.tests.every(x => x.q >= x.p - 1e-12), 'true');
+      chk('WRC bootstrap 在合成样本上算得出', mt2.wrc !== null && mt2.wrc !== undefined, 'true');
+      if (mt2.wrc) {
+        chk('WRC 家族 p 落在 (0,1]', mt2.wrc.pval > 0 && mt2.wrc.pval <= 1, 'true');
+        chk('WRC 噪声 95 分位 ≥ 中位数', mt2.wrc.p95 >= mt2.wrc.med, 'true');
+      }
+      console.log('   合成噪声样本：K=' + mt2.K + ' 未校正显著=' + mt2.nRawSig +
+        ' Bonferroni=' + mt2.nBonfSig + ' BH=' + mt2.nBhSig +
+        (mt2.wrc ? ' WRC观测=' + mt2.wrc.obsMax.toFixed(3) + ' 噪声中位=' + mt2.wrc.med.toFixed(3) : ''));
+    }
+    run('__repN = null;');
+  })();
+
+  /* —— 渲染兜底：⑩ 块在无数据时不得抛错（异步 bootstrap 失败也要能降级） —— */
+  run('state.hist = { mt: null, mtBusy: false };');
+  let mtErr = null;
+  try { run('renderMtBox()'); } catch (e) { mtErr = e.message || String(e); }
+  chk('renderMtBox 无数据时也不抛错', mtErr, null);
+  const mtHtml = $id('mttBox').innerHTML || '';
+  chk('⑩ 块给出兜底文案', mtHtml.indexOf('多重检验校正') >= 0, 'true');
+  run('state.hist = { mt: null, mtBusy: true };');
+  try { run('renderMtBox()'); } catch (e) { mtErr = e.message || String(e); }
+  chk('renderMtBox 在计算中状态也不抛错', mtErr, null);
+  run('state.hist = null;');
+
   console.log('\n' + (fail ? `❌ 失败 ${fail} 项` : '✅ 全部断言通过'));
   process.exit(fail ? 1 : 0);
 })().catch(e => { console.error('FATAL', e.stack || e.message); process.exit(1); });
