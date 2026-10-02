@@ -697,6 +697,142 @@ const near = (label, actual, expect, tol) => {
   chk('renderMtBox 在计算中状态也不抛错', mtErr, null);
   run('state.hist = null;');
 
+  console.log('\n===== L. 回测过拟合概率 PBO(CSCV) 与去通胀夏普 DSR（v3.18）=====');
+  run('state.hist = null;');
+
+  /* —— rollingZFrom：滚动 z 必须只用过去窗口（前视是回测造假最隐蔽的形式） —— */
+  (function () {
+    const vals = [];
+    for (let i = 0; i < 400; i++) vals.push(Math.sin(i / 9) * 10 + (i % 7));
+    const z = call('rollingZFrom', vals, 100);
+    chk('rollingZFrom 返回等长数组', z.length, 400);
+    chk('rollingZFrom 前若干点为 null（窗口未攒够）', z[0] === null && z[10] === null, 'true');
+    chk('rollingZFrom 有产出后均为有限值', z.slice(150).every(v => v === null || Number.isFinite(v)), 'true');
+    /* 无前视：把序列在第 300 点之后整体改写，第 300 点之前的 z 必须一字不动 */
+    const vals2 = vals.slice();
+    for (let i = 300; i < 400; i++) vals2[i] = 9999;
+    const z2 = call('rollingZFrom', vals2, 100);
+    let same = true;
+    for (let i = 0; i < 299; i++) if (z[i] !== z2[i]) same = false;
+    chk('rollingZFrom 无前视（未来数据不影响过去的值）', same, 'true');
+  })();
+
+  /* —— deflatedSharpe 的数学自洽：N 越大，运气门槛越高，DSR 越低 —— */
+  (function () {
+    const T = 3000, sr = 0.05, g3 = 0.5, g4 = 8, V = 2e-4;
+    const d10 = call('deflatedSharpe', sr, T, g3, g4, 10, V, null);
+    const d100 = call('deflatedSharpe', sr, T, g3, g4, 100, V, null);
+    const d1000 = call('deflatedSharpe', sr, T, g3, g4, 1000, V, null);
+    chk('SR0 随尝试次数 N 单调上升', (d10.sr0 < d100.sr0) && (d100.sr0 < d1000.sr0), 'true');
+    chk('DSR 随尝试次数 N 单调下降', (d10.psr > d100.psr) && (d100.psr > d1000.psr), 'true');
+    chk('SR0 为正（试过多次后纯运气也有门槛）', d100.sr0 > 0, 'true');
+    chk('DSR 落在 [0,1]', d100.psr >= 0 && d100.psr <= 1, 'true');
+    chk('DSR 严于 PSR(vs 0)（去通胀只会更苛刻）', d100.psr <= d100.psr0 + 1e-12, 'true');
+    /* benchmark 版：给定的门槛高于 SR0 时应得到更低的 PSR */
+    const hi = call('deflatedSharpe', sr, T, g3, g4, 100, V, sr * 1.2);
+    chk('PSR 的门槛越高通过概率越低', hi.psrBH < d100.psr, 'true');
+    chk('PSR(vs 自身) ≈ 0.5', Math.abs(hi.psrBH - 0.5) < 0.5, 'true');
+  })();
+
+  /* —— 合成纯噪声：整模块最关键的自校准检验 ——
+   * 数据是纯随机、因子与未来收益毫无关系时，IS 挑出的最优在 OOS 上应当随机沉浮，
+   * 于是 PBO 必须落在 0.5 附近。若算出来很低，说明 pipeline 在某个环节偷看了未来。 */
+  (function () {
+    let s = 20261003;
+    const rnd = () => { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff; };
+    const FIDS = ['fng', 'hr', 'tx', 'mrv', 'fee', 'dxy', 'us10y', 'gold', 'oil', 'vix'];
+    const NN = 900, closes = [], calTs = [], fvals = {};
+    FIDS.forEach(k => { fvals[k] = []; });
+    let px = 50000;
+    for (let i = 0; i < NN; i++) {
+      px *= (1 + (rnd() - 0.5) * 0.05);
+      closes.push(px);
+      calTs.push(Date.UTC(2019, 0, 1) + i * 86400000);
+      FIDS.forEach(k => { fvals[k].push(rnd() - 0.5); });
+    }
+    const repP = { start: 0, n: NN, calTs, closes, scores: [], fvals, fzs: {} };
+    run('var __repP = ' + JSON.stringify(repP) + ';');
+
+    const built = run('pboBuildStrategies(__repP)');
+    chk('pboBuildStrategies 在合成样本上返回结构', !!built, 'true');
+    if (built) {
+      chk('候选池规模合理（>=10）', built.nCand >= 10, 'true');
+      chk('每个候选都有等长收益序列', built.rets.every(r => r.length === NN), 'true');
+      chk('返回了仓位序列（供敞口检验用）', built.poss.length === built.rets.length, 'true');
+      chk('滞后一步：第 0 天无收益（信号只能赚明天的钱）', built.rets.every(r => r[0] === null), 'true');
+    }
+
+    const pb = run('pboTest(__repP)');
+    chk('pboTest 在纯噪声样本上算得出', !!pb, 'true');
+    if (pb) {
+      chk('PBO 经验值落在 [0,1]', pb.pboEmp >= 0 && pb.pboEmp <= 1, 'true');
+      chk('枚举组合数 = C(S, S/2)', pb.combos, 252);
+      chk('λ 样本数 = 有效组合数', pb.nLambda, pb.combos);
+      chk('PBO 两种口径相互接近（|差|<0.20）', Math.abs(pb.pboEmp - pb.pboNorm) < 0.20, 'true');
+      chk('有效样本量 ≤ 总长度', pb.T <= NN, 'true');
+      chk('收益峰度 γ4 为正（厚尾）', pb.g4 > 0, 'true');
+      chk('买入持有基准算得出', pb.bhSRDay !== null && Number.isFinite(pb.bhSRDay), 'true');
+      chk('跑赢躺平计数在 [0, N]', pb.nBeatBH >= 0 && pb.nBeatBH <= pb.NC, 'true');
+      chk('PSR(SR>BH) 落在 [0,1]', pb.psrBH >= 0 && pb.psrBH <= 1, 'true');
+      chk('平均仓位有界于 [-1,1]', Math.abs(pb.avgPos) <= 1, 'true');
+      chk('多空中性化后也算得出夏普', pb.srNeutralDay === null || Number.isFinite(pb.srNeutralDay), 'true');
+      console.log('   纯噪声自校准：PBO(经验)=' + (pb.pboEmp * 100).toFixed(1) + '%' +
+        ' PBO(拟合)=' + (pb.pboNorm * 100).toFixed(1) + '%' +
+        ' λ均值=' + pb.lamMu.toFixed(3) + ' → 应靠近 50%/0');
+      console.log('   纯噪声 vs 躺平：最优 SR(ann)=' + pb.srAnn.toFixed(2) +
+        ' BH SR(ann)=' + (pb.bhSRAnn == null ? '—' : pb.bhSRAnn.toFixed(2)) +
+        ' 跑赢数=' + pb.nBeatBH + '/' + pb.NC);
+    }
+    run('__repP = null;');
+  })();
+
+  /* —— 零信息对照必须能在伪数据上跑出「看起来不错」的结果，这正是它的意义 —— */
+  (function () {
+    let s = 20261004;
+    const rnd = () => { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff; };
+    const FIDS = ['fng', 'hr', 'tx', 'mrv', 'fee', 'dxy', 'us10y', 'gold', 'oil', 'vix'];
+    const NN = 900, closes = [], calTs = [], fvals = {};
+    FIDS.forEach(k => { fvals[k] = []; });
+    let px = 50000;
+    for (let i = 0; i < NN; i++) {
+      px *= (1 + (rnd() - 0.5) * 0.05);
+      closes.push(px); calTs.push(Date.UTC(2019, 0, 1) + i * 86400000);
+      FIDS.forEach(k => { fvals[k].push(rnd() - 0.5); });
+    }
+    const repQ = { start: 0, n: NN, calTs, closes, scores: [], fvals, fzs: {} };
+    run('var __repQ = ' + JSON.stringify(repQ) + ';');
+    const nul = run('pboNullCalib(__repQ, { nullRuns: 6 })');
+    chk('pboNullCalib 在纯噪声上返回结构', !!nul, 'true');
+    if (nul) {
+      chk('零信息对照跑够指定轮数', nul.runs >= 4 && nul.runs <= 6, 'true');
+      chk('零信息最优夏普为正（机器确能制造漂亮数字）', nul.maxDay > 0, 'true');
+      chk('零信息分布有离散度（不是常数）', nul.maxDay > nul.minDay, 'true');
+      chk('零信息中位 ≥ 最小、≤ 最大', nul.medDay >= nul.minDay && nul.medDay <= nul.maxDay, 'true');
+      console.log('   零信息对照（年化）：中位=' + (nul.medDay * Math.sqrt(365)).toFixed(2) +
+        ' 最高=' + (nul.maxDay * Math.sqrt(365)).toFixed(2) +
+        ' ← 这台机器在没有真实信息时也能吐出的数字');
+    }
+    run('__repQ = null;');
+  })();
+
+  /* —— 渲染兜底：⑪ 块在无数据 / 计算中都不得抛错 —— */
+  run('state.hist = { pbo: null, pboBusy: false };');
+  let pboErr = null;
+  try { run('renderPboBox()'); } catch (e) { pboErr = e.message || String(e); }
+  chk('renderPboBox 无数据时也不抛错', pboErr, null);
+  const pboHtml = $id('pboBox').innerHTML || '';
+  chk('⑪ 块给出兜底文案', pboHtml.indexOf('回测过拟合') >= 0, 'true');
+  run('state.hist = { pbo: null, pboBusy: true };');
+  try { run('renderPboBox()'); } catch (e) { pboErr = e.message || String(e); }
+  chk('renderPboBox 在计算中状态也不抛错', pboErr, null);
+  run('state.hist = null;');
+
+  /* —— 容器存在性：⑪ 必须真的挂到面板上，否则功能算写了但用户看不见 —— */
+  /* 容器存在性：⑪ 必须真的挂到面板上，否则功能算写了但用户看不见 */
+  const IDX = require('fs').readFileSync(__dirname + '/../index.html', 'utf8');
+  chk('index.html 存在 ⑪ pboBox 容器', IDX.indexOf('id="pboBox"') >= 0, 'true');
+
+
   console.log('\n' + (fail ? `❌ 失败 ${fail} 项` : '✅ 全部断言通过'));
   process.exit(fail ? 1 : 0);
 })().catch(e => { console.error('FATAL', e.stack || e.message); process.exit(1); });

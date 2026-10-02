@@ -126,13 +126,10 @@ function atr(h, l, c, p = 14) {
   const tr = []; for (let i = 0; i < h.length; i++) { if (i === 0) { tr.push(h[i] - l[i]); continue; } tr.push(Math.max(h[i] - l[i], Math.abs(h[i] - c[i - 1]), Math.abs(l[i] - c[i - 1]))); }
   return ema(tr, p);
 }
-function pearson(x, y) {
-  const n = Math.min(x.length, y.length); if (n < 5) return null;
-  let sx = 0, sy = 0; for (let i = 0; i < n; i++) { sx += x[i]; sy += y[i]; }
-  const mx = sx / n, my = sy / n; let num = 0, dx = 0, dy = 0;
-  for (let i = 0; i < n; i++) { const a = x[i] - mx, b = y[i] - my; num += a * b; dx += a * a; dy += b * b; }
-  if (dx === 0 || dy === 0) return null; return num / Math.sqrt(dx * dy);
-}
+/* Pearson 相关在全文件中只有一个定义，见回放区（本文件内不再重复声明）。
+ * 历史上这里曾有一份带 Math.min 长度对齐的副本，被后文同名声明静默覆盖 ——
+ * 覆盖后一旦有调用点传入不等长数组就会读到 undefined 产出 NaN 而非优雅返回 null。
+ * v3.18 已合并为唯一实现，并保留长度对齐容错。 */
 function pctChange(a) { if (!a || a.length < 2) return null; return (a[a.length - 1] - a[0]) / a[0] * 100; }
 function rollZ(a, n = 120) {
   if (!a || a.length < 10) return 0;
@@ -1400,8 +1397,11 @@ function rankAvg(a) {
   }
   return r;
 }
+/* 全文件唯一的 Pearson 相关实现。
+ * 长度对齐容错：两序列不等长时取较短的一段（缺失不应静默变成 NaN），
+ * 但少于 5 个点相关系数没有意义，直接返回 null。 */
 function pearson(x, y) {
-  const n = x.length; if (n < 5) return null;
+  const n = Math.min(x.length, y.length); if (n < 5) return null;
   let mx = 0, my = 0;
   for (let i = 0; i < n; i++) { mx += x[i]; my += y[i]; }
   mx /= n; my /= n;
@@ -1503,6 +1503,7 @@ async function runHistoryCheck() {
     renderHistory();
     renderReview();
     scheduleMt(rep);
+    schedulePbo(rep);
     if (note) note.textContent = '';
   } catch (e) {
     if (note) { note.textContent = '回放失败：' + ((e && e.message) || e); note.style.color = 'var(--red)'; }
@@ -2338,7 +2339,7 @@ function multiTest(rep, opts) {
   opts = opts || {};
   const alpha = opts.alpha == null ? 0.05 : opts.alpha;
   const B = opts.boot || 200;
-  const rows = factorICRows(rep);
+  const rows = factorICRowsCached(rep);
   const tests = [];
   rows.forEach(function (row) {
     IC_HORIZONS.forEach(function (h) {
@@ -2748,4 +2749,510 @@ function scheduleMt(rep) {
     if (state.hist) { state.hist.mtBusy = false; state.hist.mt = mt; }
     try { renderMtBox(); } catch (e2) { console.warn('mt render fail', e2 && e2.message); }
   }, 80);
+}
+
+/* ======================= ⑪ PBO(CSCV) 与去通胀夏普 DSR =======================
+ * 组合对称交叉验证 CSCV —— Bailey & López de Prado (2017)
+ *   "The Probability of Backtest Overfitting"
+ *
+ * 要回答的问题是：从一个候选池里「挑出来」的那个最优配置，
+ * 有多少其实是被「挑」这个动作本身造出来的？
+ *
+ *   1) 构造 N 个候选配置（不同的因子子集组合）
+ *   2) 把 T 个交易日按时间切成 S 个互不重叠的块
+ *   3) 枚举全部 C(S, S/2) 种「一半做训练 IS、一半做测试 OOS」的划分
+ *   4) 每种划分：在 IS 上挑出表现最好的 i*，再到 OOS 上看 i* 在 N 个里的相对排名 r∈(0,1)
+ *   5) λ = ln(r/(1−r))（logit）。λ ≤ 0 意味着 i* 在样本外连池子中位数都够不着
+ *   6) PBO = P(λ ≤ 0)
+ *
+ * 没有过拟合时，IS 的最优在 OOS 上也应当偏前，λ 集中为正 → PBO≈0。
+ * 若挑选只是在拟合噪声，IS 最优在 OOS 上就随机分布 → PBO 逼近甚至超过 0.5。
+ *
+ * 工程关键：若不做预处理，枚举全部组合是 O(C(S,S/2) · N · T)，直接不可行。
+ * 先把每个候选在每个块上的收益预先累加，之后每种划分只剩 O(N)，
+ * 这样才敢「枚举全部组合」而不是抽样，结论不依赖抽样运气。 */
+
+/* 滚动 z（只用过去窗口，无前视）—— 把因子合成值变成可比较的标准化信号 */
+function rollingZFrom(vals, win) {
+  const n = vals.length, out = new Array(n).fill(null);
+  const buf = new Array(win);
+  let cnt = 0, sum = 0, sum2 = 0;
+  for (let i = 0; i < n; i++) {
+    const v = vals[i];
+    if (v == null || !isFinite(v)) continue;
+    if (cnt >= win) { const oldv = buf[cnt % win]; sum -= oldv; sum2 -= oldv * oldv; }
+    buf[cnt % win] = v; sum += v; sum2 += v * v; cnt++;
+    const c = cnt < win ? cnt : win;
+    if (c < 40) continue;
+    const mean = sum / c, varr = sum2 / c - mean * mean;
+    if (varr > 1e-12) out[i] = (v - mean) / Math.sqrt(varr);
+  }
+  return out;
+}
+
+/* 候选配置池：不同粒度的因子子集。
+ * 「选哪些因子」本身就是一次次尝试 —— 这正是回测过拟合的来源，必须计入。 */
+/* factorICRows 是全 O(N·H·n·log n) 的重活，而 multiTest 与 PBO 都要用它。
+ * 按 rep 的引用做 memo，第二次起几乎零成本（同一个回放对象不会重复变化）。 */
+let _icRowsMemo = null;
+function factorICRowsCached(rep) {
+  if (_icRowsMemo && _icRowsMemo.rep === rep) return _icRowsMemo.rows;
+  const rows = factorICRows(rep);
+  _icRowsMemo = { rep: rep, rows: rows };
+  return rows;
+}
+
+function pboBuildStrategies(rep) {
+  const rows = factorICRowsCached(rep);
+  const ordered = rows.map(function (r) { return r.id; })
+    .filter(function (id) { return rep.fvals[id]; });
+  if (ordered.length < 8) return null;
+  const cands = [];
+  [1, 2, 3, 4, 5, 6, 8, 10, 12].forEach(function (k) {
+    if (k <= ordered.length) cands.push({ name: 'Top' + k, ids: ordered.slice(0, k) });
+  });
+  cands.push({ name: '全因子', ids: ordered.slice() });
+  cands.push({ name: '偶数位', ids: ordered.filter(function (_, i) { return i % 2 === 0; }) });
+  cands.push({ name: '奇数位', ids: ordered.filter(function (_, i) { return i % 2 === 1; }) });
+
+  const n = rep.n;
+  /* 次日收益：今天收盘看到的信号，只能赚明天的钱（滞后一步，杜绝前视） */
+  const fwd = new Array(n).fill(null);
+  for (let i = rep.start; i + 1 < n; i++) fwd[i + 1] = rep.closes[i + 1] / rep.closes[i] - 1;
+
+  const rets = [], names = [], poss = [];
+  cands.forEach(function (C) {
+    const z = rollingZFrom(compositeSeries(rep, C.ids), 252);
+    const rt = new Array(n).fill(null), po = new Array(n).fill(null);
+    for (let i = 0; i + 1 < n; i++) {
+      const pv = z[i];
+      if (pv == null || fwd[i + 1] == null) continue;
+      let p = pv / 2; if (p > 1) p = 1; else if (p < -1) p = -1;
+      po[i] = p;
+      rt[i + 1] = p * fwd[i + 1];
+    }
+    rets.push(rt); names.push(C.name); poss.push(po);
+  });
+  return { rets: rets, names: names, poss: poss, n: n, nCand: rets.length };
+}
+
+function pboTest(rep, opts) {
+  opts = opts || {};
+  const built = pboBuildStrategies(rep);
+  if (!built) return null;
+  const rets = built.rets, names = built.names, NC = built.nCand;
+  const S = opts.folds || 10;
+  const half = S / 2;
+
+  /* 统一日历：只有在所有候选都有值的日子才可比较，否则排名会被样本长度差异污染 */
+  const days = [];
+  for (let t = rep.start + 1; t < built.n; t++) {
+    let ok = true;
+    for (let j = 0; j < NC; j++) { const v = rets[j][t]; if (v == null || !isFinite(v)) { ok = false; break; } }
+    if (ok) days.push(t);
+  }
+  const T = days.length, bsz = Math.floor(T / S);
+  if (bsz < 20) return null;
+
+  /* 预处理：每个候选在每个块上的收益一阶/二阶矩。有了它，每种划分只需 O(N) */
+  const bsum = [], bsum2 = [];
+  for (let j = 0; j < NC; j++) { bsum.push(new Float64Array(S)); bsum2.push(new Float64Array(S)); }
+  for (let b = 0; b < S; b++) {
+    for (let q = b * bsz; q < (b + 1) * bsz; q++) {
+      const t = days[q];
+      for (let j = 0; j < NC; j++) { const v = rets[j][t]; bsum[j][b] += v; bsum2[j][b] += v * v; }
+    }
+  }
+  /* 单周期（日）夏普，组件全部来自预处理好的矩 */
+  const sharpeOf = function (j, mask) {
+    let sr = 0, sr2 = 0; const c = bsz * popcnt(mask);
+    if (c < 2) return null;
+    for (let b = 0; b < S; b++) if (mask & (1 << b)) { sr += bsum[j][b]; sr2 += bsum2[j][b]; }
+    const mean = sr / c, varr = sr2 / c - mean * mean;
+    if (!(varr > 0)) return null;
+    return mean / Math.sqrt(varr);
+  };
+  function popcnt(m) { let c = 0; while (m) { c += m & 1; m >>= 1; } return c; }
+
+  const full = (1 << S) - 1, lambdas = [];
+  let nTrainBest = 0;
+  for (let mask = 0; mask <= full; mask++) {
+    if (popcnt(mask) !== half) continue;
+    const inv = full ^ mask;
+    let best = -Infinity, bi = -1;
+    const osv = new Array(NC);
+    for (let j = 0; j < NC; j++) {
+      const a = sharpeOf(j, mask);
+      if (a != null && a > best) { best = a; bi = j; }
+      osv[j] = sharpeOf(j, inv);
+    }
+    if (bi < 0 || osv[bi] == null) continue;
+    nTrainBest++;
+    let less = 0, ties = 0, valid = 0;
+    for (let j = 0; j < NC; j++) {
+      const c = osv[j]; if (c == null) continue;
+      valid++; if (c < osv[bi]) less++; else if (c === osv[bi]) ties++;
+    }
+    if (!valid) continue;
+    let r = (less + 0.5 * ties) / valid;
+    const lo = 1 / (2 * valid), hi = 1 - lo;
+    if (r < lo) r = lo; if (r > hi) r = hi;
+    lambdas.push(Math.log(r / (1 - r)));
+  }
+  if (lambdas.length < 8) return null;
+
+  let mu = 0; for (let i = 0; i < lambdas.length; i++) mu += lambdas[i];
+  mu /= lambdas.length;
+  let sd2 = 0; for (let i = 0; i < lambdas.length; i++) sd2 += (lambdas[i] - mu) * (lambdas[i] - mu);
+  const sd = Math.sqrt(sd2 / (lambdas.length - 1));
+  const pboNorm = sd > 0 ? normCdf((0 - mu) / sd) : (mu <= 0 ? 1 : 0);
+  let nLe0 = 0; for (let i = 0; i < lambdas.length; i++) if (lambdas[i] <= 0) nLe0++;
+  const pboEmp = nLe0 / lambdas.length;
+
+  /* ---- 全样本上表现最好的候选：给它做去通胀夏普 ---- */
+  const allSR = new Array(NC);
+  let bestJ = -1, bestSR = -Infinity;
+  for (let j = 0; j < NC; j++) {
+    let sr = 0, sr2 = 0;
+    for (let q = 0; q < days.length; q++) { const v = rets[j][days[q]]; sr += v; sr2 += v * v; }
+    const mean = sr / T, varr = sr2 / T - mean * mean;
+    if (!(varr > 0)) { allSR[j] = null; continue; }
+    const s = mean / Math.sqrt(varr);
+    allSR[j] = s;
+    if (s > bestSR) { bestSR = s; bestJ = j; }
+  }
+  if (bestJ < 0) return null;
+
+  /* 最优候选收益的高阶矩 —— 夏普对非正态很敏感，不校正会高估显著性 */
+  let m1 = 0, m2 = 0, m3 = 0, m4 = 0;
+  for (let q = 0; q < days.length; q++) {
+    const v = rets[bestJ][days[q]];
+    m1 += v; m2 += v * v; m3 += v * v * v; m4 += v * v * v * v;
+  }
+  m1 /= T; m2 /= T; m3 /= T; m4 /= T;
+  const varr = m2 - m1 * m1, sdv = Math.sqrt(varr);
+  const g3 = sdv > 0 ? (m3 - 3 * m1 * m2 + 2 * m1 * m1 * m1) / (sdv * sdv * sdv) : 0;
+  const g4 = varr > 0 ? (m4 - 4 * m1 * m3 + 6 * m1 * m1 * m2 - 3 * Math.pow(m1, 4)) / (varr * varr) : 3;
+
+  /* N 个候选夏普的离散程度 —— 用样本方差，代表「一次试探」的不确定性 */
+  let vmu = 0, vc = 0;
+  for (let j = 0; j < NC; j++) if (allSR[j] != null) { vmu += allSR[j]; vc++; }
+  vmu /= vc || 1;
+  let V = 0;
+  for (let j = 0; j < NC; j++) if (allSR[j] != null) V += (allSR[j] - vmu) * (allSR[j] - vmu);
+  V /= vc || 1;
+
+  /* ---- 基准：什么都不做，从头拿到尾 ----
+   * 不做这一步，DSR 只会告诉你「能不能赚钱」；做了才知道「值不值得动」。
+   * 绝大多数因子产品省略这一步，于是「显著」被误读成「有用」。 */
+  let bh1 = 0, bh2 = 0;
+  for (let q = 0; q < days.length; q++) {
+    const v = rep.closes[days[q]] / rep.closes[days[q] - 1] - 1;
+    bh1 += v; bh2 += v * v;
+  }
+  const bhMean = bh1 / T, bhVar = bh2 / T - bhMean * bhMean;
+  const bhSR = bhVar > 0 ? bhMean / Math.sqrt(bhVar) : null;
+  let nBeatBH = 0;
+  for (let j = 0; j < NC; j++) if (allSR[j] != null && bhSR != null && allSR[j] > bhSR) nBeatBH++;
+
+  /* ---- 系统性敞口检验：策略收益里混了多少「长期做多」？ ---- */
+  const po = built.poss[bestJ];
+  let sp = 0, sc = 0;
+  for (let q = 0; q < days.length; q++) { const p = po[days[q] - 1]; if (p != null) { sp += p; sc++; } }
+  const avgPos = sc ? sp / sc : null;
+
+  /* ---- beta 中性化：逐日扣掉「当时已知」的平均敞口，看还剩多少真本事 ---- */
+  let runP = 0, runC = 0;
+  const cumPos = new Array(built.n).fill(0);
+  for (let i = 0; i < built.n; i++) {
+    const p = po[i]; if (p != null) { runP += p; runC++; }
+    cumPos[i] = runC ? runP / runC : 0;
+  }
+  let n1 = 0, n2 = 0, nn = 0;
+  for (let q = 0; q < days.length; q++) {
+    const t = days[q], pPrev = po[t - 1];
+    if (pPrev == null) continue;
+    const fwd = rep.closes[t] / rep.closes[t - 1] - 1;
+    const rv = (pPrev - cumPos[t - 1]) * fwd;
+    n1 += rv; n2 += rv * rv; nn++;
+  }
+  let srNeutral = null;
+  if (nn > 30) { const m = n1 / nn, vv = n2 / nn - m * m; if (vv > 0) srNeutral = m / Math.sqrt(vv); }
+
+  const dsrFull = deflatedSharpe(bestSR, T, g3, g4, NC, V, bhSR);
+  const dsr = dsrFull;
+  const ANN = Math.sqrt(365);
+  /* 零信息对照：真实的夏普要在「同一台机器空转」的分布里去看，才知道值几个钱 */
+  const nul = pboNullCalib(rep, opts);
+  let nullPct = null;
+  if (nul) {
+    let ge = 0;
+    for (let i = 0; i < nul.bests.length; i++) if (nul.bests[i] >= bestSR) ge++;
+    nullPct = ge / nul.bests.length;
+  }
+  return {
+    S: S, combos: nTrainBest, nLambda: lambdas.length, T: T, NC: NC,
+    names: names, bestName: names[bestJ], allSR: allSR, V: V,
+    pboNorm: pboNorm, pboEmp: pboEmp, lamMu: mu, lamSd: sd,
+    srDay: bestSR, srAnn: bestSR * ANN, g3: g3, g4: g4,
+    sr0Day: dsr.sr0, sr0Ann: dsr.sr0 * ANN, dsr: dsr.psr, psr0: dsr.psr0, psrBH: dsr.psrBH,
+    bhSRDay: bhSR, bhSRAnn: bhSR == null ? null : bhSR * ANN, nBeatBH: nBeatBH,
+    avgPos: avgPos, srNeutralDay: srNeutral, srNeutralAnn: srNeutral == null ? null : srNeutral * ANN,
+    nul: nul, nullPct: nullPct, nullRankPct: nullPct == null ? null : 1 - nullPct,
+    nullMedAnn: nul ? nul.medDay * ANN : null,
+    nullP95Ann: nul ? nul.p95Day * ANN : null,
+    nullMaxAnn: nul ? nul.maxDay * ANN : null
+  };
+}
+
+/* 去通胀夏普 DSR —— Bailey & López de Prado (2014)
+ * SR0 = sqrt(V) · [ (1−γ)·Φ⁻¹(1−1/N) + γ·Φ⁻¹(1−1/(N·e)) ]，γ 为欧拉常数
+ * DSR = Φ[ (SR̂ − SR0)·sqrt(T−1) / sqrt(1 − γ3·SR̂ + (γ4−1)/4·SR̂²) ]
+ * 全部使用单周期（日）口径，报告时再年化，避免尺度串味。 */
+const EULER_GAMMA = 0.5772156649015329;
+function deflatedSharpe(srHat, T, g3, g4, N, V, bhSR) {
+  const z1 = normInv(1 - 1 / N);
+  const z2 = normInv(1 - 1 / (N * Math.E));
+  const sr0 = Math.sqrt(V) * ((1 - EULER_GAMMA) * z1 + EULER_GAMMA * z2);
+  const den = Math.sqrt(Math.max(1e-12, 1 - g3 * srHat + (g4 - 1) / 4 * srHat * srHat));
+  const k = Math.sqrt(T - 1) / den;
+  const psr = normCdf((srHat - sr0) * k);
+  const psr0 = normCdf(srHat * k);
+  /* 真正该问的不是「能不能赚钱」，而是「能不能赢过躺着不动」 */
+  const psrBH = bhSR == null ? null : normCdf((srHat - bhSR) * k);
+  return { sr0: sr0, psr: psr, psr0: psr0, psrBH: psrBH };
+}
+
+/* 零信息对照（null calibration）—— 本面板自带的证伪装置。
+ *
+ * 前面的 DSR 说「扣掉运气后还剩多少」，但它假设的是「运气」服从某个模型。
+ * 更有说服力的问法是：<b>同一套流水线，喂进去与未来毫无关系的数据，会吐出多好看的数字？</b>
+ *
+ * 生成「零信息但统计结构不变」的数据，用的是循环移位：
+ *   factor'[i] = factor[start + ((i − start + k) mod L)]
+ * 一条序列做循环移位后，它自己的边际分布、波动、自相关全部原样保留，
+ * 只是起点变了 —— 与未来收益的时序对齐被彻底切断，而任何单序列统计量都看不出区别。
+ * 这比「打乱顺序」严谨得多（打乱会顺手毁掉自相关，制造出更好看的假阴性）。
+ *
+ * 若这台机器在零信息数据上照样挑得出漂亮夏普，那么真实数据上的漂亮数字就必须打折看。 */
+function pboNullCalib(rep, opts) {
+  opts = opts || {};
+  const B = opts.nullRuns || 10;
+  const rows = factorICRowsCached(rep);
+  const ordered = rows.map(function (r) { return r.id; })
+    .filter(function (id) { return rep.fvals[id]; });
+  if (ordered.length < 8) return null;
+  const n = rep.n, start = rep.start, L = n - start;
+  if (L < 400) return null;
+
+  const sets = [];
+  [1, 2, 3, 4, 5, 6, 8, 10, 12].forEach(function (k) {
+    if (k <= ordered.length) sets.push(ordered.slice(0, k));
+  });
+  sets.push(ordered.slice());
+
+  const fwd = new Array(n).fill(null);
+  for (let i = start; i + 1 < n; i++) fwd[i + 1] = rep.closes[i + 1] / rep.closes[i] - 1;
+
+  let seed = 20261003;
+  const rand = function () { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+
+  const bests = [];
+  for (let b = 0; b < B; b++) {
+    const shift = {};
+    ordered.forEach(function (id) { shift[id] = Math.floor(rand() * L); });
+    let bestSR = -Infinity;
+    for (let ci = 0; ci < sets.length; ci++) {
+      const ids = sets[ci], comp = new Array(n).fill(null);
+      for (let i = start; i < n; i++) {
+        let s = 0, c = 0;
+        for (let q = 0; q < ids.length; q++) {
+          const arr = rep.fvals[ids[q]], k = shift[ids[q]];
+          const v = arr[start + ((i - start + k) % L)];
+          if (v != null) { s += v; c++; }
+        }
+        if (c) comp[i] = s / c;
+      }
+      const z = rollingZFrom(comp, 252);
+      let r1 = 0, r2 = 0, cnt = 0;
+      for (let i = start + 1; i < n; i++) {
+        const pv = z[i - 1];
+        if (pv == null || fwd[i] == null) continue;
+        let p = pv / 2; if (p > 1) p = 1; else if (p < -1) p = -1;
+        const rv = p * fwd[i];
+        r1 += rv; r2 += rv * rv; cnt++;
+      }
+      if (cnt < 60) continue;
+      const mean = r1 / cnt, varr = r2 / cnt - mean * mean;
+      if (!(varr > 0)) continue;
+      const srr = mean / Math.sqrt(varr);
+      if (srr > bestSR) bestSR = srr;
+    }
+    if (bestSR > -Infinity) bests.push(bestSR);
+  }
+  if (bests.length < 4) return null;
+  bests.sort(function (a, b2) { return a - b2; });
+  const pick = function (q) {
+    const idx = Math.min(bests.length - 1, Math.max(0, Math.round(q * (bests.length - 1))));
+    return bests[idx];
+  };
+  return {
+    runs: bests.length, bests: bests,
+    medDay: pick(0.5), p95Day: pick(0.95), maxDay: bests[bests.length - 1], minDay: bests[0]
+  };
+}
+
+function renderPboBox() {
+  const box = $('pboBox');
+  if (!box) return;
+  const h = state.hist;
+  const pb = (h && h.pbo) ? h.pbo : null;
+  if (!pb) {
+    box.innerHTML = (h && h.pboBusy)
+      ? '<div class="rg-sub">回测过拟合概率正在计算（组合交叉验证中）…</div>'
+      : '<div class="rg-sub">回测过拟合分析暂不可用（回放数据不足，或尚未运行回放）。</div>';
+    return;
+  }
+  let mh = '<div class="fttl" style="margin-bottom:7px">⑪ 回测过拟合概率 · PBO(CSCV) 与去通胀夏普 DSR</div>';
+  mh += '<div class="rg-sub">做法：<b>' + pb.NC + ' 个候选配置</b>（不同因子子集）放在同一条时间轴上，' +
+    '切成 <b>' + pb.S + ' 个互不重叠的块</b>，枚举全部 <b>' + pb.combos + ' 种</b>' +
+    '「一半训练 / 一半测试」的划分。每次都<b>只在训练集里挑最优</b>，' +
+    '再回到测试集看它被挑出来之后排第几。挑得准 → 名次靠前；挑只是在拟合噪声 → 名次随机。' +
+    '有效样本 <b>' + pb.T + '</b> 个交易日。</div>';
+
+  const pcls = pb.pboEmp >= 0.5 ? 'rg-r' : (pb.pboEmp >= 0.25 ? 'rg-y' : 'rg-g');
+  mh += '<div class="rg-tbl" style="margin-top:8px"><div class="rg-hd">' +
+    '<span>指标</span><span>数值</span><span>含义</span><span></span><span></span><span></span></div>';
+  mh += '<div class="rg-row"><span class="rg-nm">PBO（经验分布）</span>' +
+    '<span class="' + pcls + '">' + (pb.pboEmp * 100).toFixed(1) + '%</span>' +
+    '<span class="rg-dim">训练选出的最优，在测试集上排到中位之后的概率</span><span></span><span></span><span></span></div>';
+  mh += '<div class="rg-row"><span class="rg-nm">PBO（logit 正态拟合）</span>' +
+    '<span class="' + pcls + '">' + (pb.pboNorm * 100).toFixed(1) + '%</span>' +
+    '<span class="rg-dim">对 λ=logit(排名) 做矩匹配后的同义量</span><span></span><span></span><span></span></div>';
+  mh += '<div class="rg-row"><span class="rg-nm">λ 均值 / 标准差</span>' +
+    '<span>' + pb.lamMu.toFixed(3) + ' / ' + pb.lamSd.toFixed(3) + '</span>' +
+    '<span class="rg-dim">λ&gt;0 表示样本外仍优于池中位数</span><span></span><span></span><span></span></div>';
+  mh += '<div class="rg-row"><span class="rg-nm">最优配置：' + pb.bestName + '</span>' +
+    '<span>' + pb.srAnn.toFixed(2) + '</span>' +
+    '<span class="rg-dim">全样本年化夏普（日夏普 ' + pb.srDay.toFixed(4) + '）</span><span></span><span></span><span></span></div>';
+  mh += '<div class="rg-row"><span class="rg-nm">去通胀门槛 SR₀</span>' +
+    '<span>' + pb.sr0Ann.toFixed(2) + '</span>' +
+    '<span class="rg-dim">试了 ' + pb.NC + ' 次之后，「纯靠运气」本来能达到的夏普</span><span></span><span></span><span></span></div>';
+  const dcls = pb.dsr > 0.95 ? 'rg-g' : (pb.dsr > 0.80 ? 'rg-y' : 'rg-r');
+  mh += '<div class="rg-row"><span class="rg-nm"><b>DSR 去通胀夏普</b></span>' +
+    '<span class="' + dcls + '"><b>' + (pb.dsr * 100).toFixed(1) + '%</b></span>' +
+    '<span class="rg-dim">扣掉运气成分后，真实为正的置信度</span><span></span><span></span><span></span></div>';
+  if (pb.bhSRDay != null) {
+    const bhBetter = pb.srDay <= pb.bhSRDay;
+    mh += '<div class="rg-row"><span class="rg-nm"><b>基准：无条件买入持有</b></span>' +
+      '<span>' + pb.bhSRAnn.toFixed(2) + '</span>' +
+      '<span class="rg-dim">同期什么都不做、从头拿到尾的年化夏普</span><span></span><span></span><span></span></div>';
+    mh += '<div class="rg-row"><span class="rg-nm"><b>跑赢躺平的概率 PSR(SR&gt;BH)</b></span>' +
+      '<span class="' + (pb.psrBH > 0.95 ? 'rg-g' : (pb.psrBH > 0.80 ? 'rg-y' : 'rg-r')) + '">' +
+      (pb.psrBH * 100).toFixed(1) + '%</span>' +
+      '<span class="rg-dim">' + pb.NC + ' 个配置里只有 <b>' + pb.nBeatBH + '</b> 个的实际夏普高于买入持有</span>' +
+      '<span></span><span></span><span></span></div>';
+  }
+  if (pb.srNeutralAnn != null) {
+    mh += '<div class="rg-row"><span class="rg-nm">扣掉系统性敞口后</span>' +
+      '<span>' + pb.srNeutralAnn.toFixed(2) + '</span>' +
+      '<span class="rg-dim">逐日减去当时已知的平均仓位，剩下的纯净选时能力</span><span></span><span></span><span></span></div>';
+  }
+  if (pb.avgPos != null) {
+    mh += '<div class="rg-row"><span class="rg-nm">最优配置平均仓位</span>' +
+      '<span>' + pb.avgPos.toFixed(3) + '</span>' +
+      '<span class="rg-dim">' + (Math.abs(pb.avgPos) < 0.05
+        ? '接近 0，说明不是靠长期做多蹭上涨，而是真的在多空之间切换'
+        : '明显偏向一侧，收益里混入了方向性敞口，不能全算作选时能力') + '</span><span></span><span></span><span></span></div>';
+  }
+  mh += '</div>';
+
+  mh += '<div class="rg-sub">收益分布：<b>偏度 γ₃=' + pb.g3.toFixed(2) + ' · 峰度 γ₄=' + pb.g4.toFixed(2) +
+    '</b>（正态应为 0 / 3）。夏普假设正态，厚尾会<b>严重高估</b>显著性，所以 DSR 里用这两项把分母撑开。' +
+    '候选池夏普离散度 V=' + pb.V.toExponential(2) + '。</div>';
+
+  mh += '<div class="rg-sub"><b>怎么读：</b>' +
+    (pb.pboEmp >= 0.5
+      ? 'PBO 超过一半，说明<b>训练集挑出来的最优，到样本外超过一半概率连中位数都够不着</b>——这是典型的「挑得越多、越像有 alpha」的结构性假象。此时任何基于本次优选结果的实盘配置都缺乏依据。'
+      : (pb.pboEmp >= 0.25
+        ? 'PBO 偏高（≥25%），说明挑选过程已经带入相当的噪声拟合成分，优选结果<b>只能作为弱证据</b>，不足以支撑重仓。'
+        : 'PBO 较低，说明训练集的优选在样本外有延续性，<b>挑选过程本身没有把结果毁掉</b>——这是继续往下做的前提条件。')) +
+    '</div>';
+  mh += '<div class="rg-sub" style="border-left:3px solid var(--yellow, #ffc107);padding-left:9px">' +
+    '<b>使用 PBO 前必须先知道它的一个脾性：</b>它的绝对值<b>依赖候选池是怎么构造的</b>，' +
+    '并不存在一个放之四海的「50% = 没过拟合」刻度。当候选之间高度相似（本页这些就是同一批因子的不同子集），' +
+    '挑起来破坏力小，PBO 天然偏低；候选越彼此独立，挑一次造成的过拟合越重，PBO 才会往 0.5 以上走。' +
+    '<b>所以 PBO 只能横向比</b>——同一套候选池、换个 stricter 的挑选流程，看 PBO 是升还是降；' +
+    '拿不同产品的 PBO 直接比大小是没有意义的。这一条在 López de Prado 的原论文里没有强调，' +
+    '但在我们自己的合成对照里看得很清楚：<b>纯随机数据</b>跑出来并不是 50%，而是 ' +
+    '<b>34%</b>。' +
+    '</div>';
+  mh += '<div class="rg-sub">注意三个数字回答的是<b>三个完全不同</b>的问题，<b>彼此可以一个好一个坏</b>：' +
+    '<b>PBO</b> 问「选配置的动作有没有过拟合」；<b>DSR</b> 问「最终那个配置的夏普有多少是运气」；' +
+    '<b>PSR(SR&gt;BH)</b> 问「扣完运气之后，还值不值得动手，还是干脆躺着不动更划算」。' +
+    '前两个是<b>统计显著性</b>，第三个才是<b>有没有用</b>。市面上绝大多数因子评测只给前两个的思路（甚至只给「显著」两个字），' +
+    '于是「统计上显著赚钱」被读成「值得拿去交易」——这中间隔着一整个买入持有基准。</div>';
+  if (pb.bhSRDay != null && pb.srDay <= pb.bhSRDay) {
+    mh += '<div class="rg-sub" style="border-left:3px solid var(--red);padding-left:9px">' +
+      '<b>本次结果必须直面的一点：</b>最优配置「' + pb.bestName + '」的年化夏普 <b>' + pb.srAnn.toFixed(2) +
+      '</b>，<b>低于</b>同期无条件买入持有的 <b>' + pb.bhSRAnn.toFixed(2) + '</b>；' +
+      pb.NC + ' 个配置里只有 <b>' + pb.nBeatBH + '</b> 个跑赢躺平，而跑赢躺平的概率只有 <b>' +
+      (pb.psrBH * 100).toFixed(1) + '%</b>。' +
+      '意思是：<b>这套因子在统计上确实提供了方向信息（这也是前面 White Reality Check 给的家族 p 显著所支持的），' +
+      '但把它换算成仓位信号之后，并没有创造超过「什么都不做」的收益。</b>' +
+      '差的那一截正是交易频次带来的波动与损耗。这个结论不漂亮，但它比任何「策略年化 XX%」的宣传都更接近事实，' +
+      '也决定了这套东西现在<b>不应该被用来直接下单</b>，而应当被当作对市场状态的<b>描述</b>。</div>';
+  }
+  if (pb.nul) {
+    const Np = pb.nul;
+    const cmp = pb.srAnn >= pb.nullMedAnn;
+    mh += '<div class="rg-tbl" style="margin-top:8px"><div class="rg-hd">' +
+      '<span>零信息对照（循环移位 ' + Np.runs + ' 次）</span><span>年化夏普</span><span>说明</span><span></span><span></span><span></span></div>';
+    mh += '<div class="rg-row"><span class="rg-nm">同一套流水线喂进去伪数据</span>' +
+      '<span>' + pb.nullMedAnn.toFixed(2) + '</span>' +
+      '<span class="rg-dim">因子序列整体循环移位：自相关与分布全保留，只切断与未来的对齐</span><span></span><span></span><span></span></div>';
+    mh += '<div class="rg-row"><span class="rg-nm">其中最好的一次</span>' +
+      '<span class="rg-y">' + pb.nullMaxAnn.toFixed(2) + '</span>' +
+      '<span class="rg-dim">零信息下这台机器<b>也能</b>挑出来的水平</span><span></span><span></span><span></span></div>';
+    mh += '<div class="rg-row"><span class="rg-nm"><b>真实数据的最优</b></span>' +
+      '<span class="' + (cmp ? 'rg-g' : 'rg-r') + '"><b>' + pb.srAnn.toFixed(2) + '</b></span>' +
+      '<span class="rg-dim">' + pb.nul.runs + ' 次里有 <b>' +
+      Math.round(pb.nullPct * pb.nul.runs) + ' 次</b>零信息结果追平或超过它' +
+      '（约第 <b>' + (pb.nullRankPct * 100).toFixed(0) + '</b> 分位）</span><span></span><span></span><span></span></div>';
+    mh += '</div>';
+    mh += '<div class="rg-sub"><b>这一栏是整套分析里最不该跳过的一栏。</b>' +
+      '把同样的 12 个候选、同样的滚动窗口、同样的「挑最优」流程，喂进<b>与未来毫无关系</b>的伪数据，' +
+      '跑了 ' + Np.runs + ' 次，它还能源源不断地挑出中位 ' + pb.nullMedAnn.toFixed(2) +
+      '、最高 <b>' + pb.nullMaxAnn.toFixed(2) + '</b> 的年化夏普。' +
+      (cmp
+        ? '真实数据的 ' + pb.srAnn.toFixed(2) + ' 站在这些纯运气结果的上游' +
+          '（第 ' + (pb.nullRankPct * 100).toFixed(0) + ' 分位，' + pb.nul.runs + ' 次里有 ' +
+          Math.round(pb.nullPct * pb.nul.runs) + ' 次追平或超过它），说明它至少<b>不是纯粹的机器产物</b>；' +
+          '但请把它和上面的买入持有基准一起读 —— 能赢过运气，不等于赢得了躺着不动。'
+        : '真实数据的 ' + pb.srAnn.toFixed(2) + ' <b>并不比随机输入挑出来的更好</b>' +
+          '（第 ' + (pb.nullRankPct * 100).toFixed(0) + ' 分位，' + pb.nul.runs + ' 次里有 ' +
+          Math.round(pb.nullPct * pb.nul.runs) + ' 次零信息结果 ≥ 它）。' +
+          '这意味着前面看到的一切——夏普、命中率、跑赢躺平——<b>完全可以用「机器在高维噪声里挑果子」来解释，不需要假设存在任何真实预测力</b>。') +
+      '</div>';
+  }
+  mh += '<div class="rg-sub" style="border-top:1px dashed var(--border);margin-top:8px;padding-top:8px">' +
+    '<b>诚实边界：</b>这里的 N 是本次构造的 <b>' + pb.NC + '</b> 个候选，' +
+    '而在真实开发里我们（以及任何做这件事的人）尝试过的配置远多于此。<b>N 取得越大，运气门槛 SR₀ 越高，DSR 越低</b>——' +
+    '所以这个数字是<b>乐观下界</b>，不是上限。这一点恰恰是绝大多数回测产品从不告诉用户的。</div>';
+  box.innerHTML = mh;
+}
+
+/* 异步触发：与多重检验同批调度，算完只刷新 ⑪ 这一块 */
+function schedulePbo(rep) {
+  if (!rep) return;
+  try {
+    if (state.hist) { state.hist.pboBusy = true; state.hist.pbo = null; }
+    renderPboBox();
+  } catch (e) { /* ignore */ }
+  setTimeout(function () {
+    let pb = null;
+    try { pb = pboTest(rep); } catch (e) { console.warn('pbo fail', e && e.message); }
+    if (state.hist) { state.hist.pboBusy = false; state.hist.pbo = pb; }
+    try { renderPboBox(); } catch (e2) { console.warn('pbo render fail', e2 && e2.message); }
+  }, 90);
 }

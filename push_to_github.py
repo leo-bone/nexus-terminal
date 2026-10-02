@@ -8,8 +8,10 @@ GitHub 仅作源码镜像，不对公服务；对外服务由 Cloudflare 两个 
     python3 push_to_github.py
 
 行为:
-    - 自动跳过 .workbuddy / .git / node_modules / .wrangler
-    - 跳过根目录 public/（旧 GitHub Pages 构建产物，已废弃；真正静态资源在 frontend/public/）
+    - 自动跳过 .workbuddy / .git / node_modules / .wrangler / archive
+    - archive/ 存放历史产物（旧 GitHub Pages 构建页、版本截图），不进镜像
+      —— 它里面的 wrangler.toml 指向生产数据域名 nexus-api.uichain.org，
+         误入 deploy 会威胁线上，留在镜像里也是纯风险
     - Cloudflare 凭据走本机 ~/.wrangler/config/default.toml 的 OAuth token（wrangler 自管）
 """
 import os, sys, re, base64, json, urllib.request, subprocess
@@ -49,14 +51,12 @@ def req(method, path, data=None):
         print("HTTP", e.code, e.read().decode()[:400])
         raise
 
-# 收集文件（排除系统/构建目录 与 根级 public/ 旧构建产物）
+# 收集文件（排除系统/构建目录 与 archive/ 历史产物）
 SKIP = {".DS_Store"}
 files = []
 for dp, dns, fns in os.walk(ROOT):
     rel_dp = os.path.relpath(dp, ROOT)
-    dns[:] = [d for d in dns if d not in (".workbuddy", ".git", "node_modules", ".wrangler")]
-    if rel_dp == "public":  # 仅跳过根级 public（GitHub Pages 遗留）；保留 frontend/public
-        continue
+    dns[:] = [d for d in dns if d not in (".workbuddy", ".git", "node_modules", ".wrangler", "archive")]
     for fn in fns:
         if fn in SKIP:
             continue
