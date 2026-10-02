@@ -1177,6 +1177,37 @@ function renderFactors() {
     box.appendChild(card);
   });
   const cnt = $('fCount'); if (cnt) cnt.textContent = FACTORS.filter(f => !f.replayOnly).length + ' 维 · ' + nScored + ' 参与评分' + (nDead ? ' · ' + nDead + ' 无数据' : '');
+
+  /* v3.11 实践延展：当前体制徽标 + 极端体制子评分卡 */
+  const regime = currentRegime();
+  const badge = $('regimeBadge');
+  if (badge) {
+    if (!regime) { badge.textContent = '体制 —'; badge.className = 'hint regime-badge'; }
+    else {
+      const cls = regime.key === 'calm' ? 'calm' : regime.key === 'chop' ? 'chop' : 'wild';
+      badge.textContent = '体制 ' + regime.label + ' · 波动 ' + (regime.vol * 100).toFixed(0) + '%';
+      badge.className = 'hint regime-badge ' + cls;
+    }
+  }
+  const es = extremeSubScore(out);
+  const esBox = $('extSubBox'), esScore = $('extSubScore'), esState = $('extSubState'), esNote = $('extSubNote'), esFactors = $('extSubFactors');
+  if (esBox) {
+    const active = regime && regime.key === 'wild';
+    esBox.className = 'extsub' + (active ? ' active' : '');
+    if (esState) esState.textContent = active ? '启用' : '休眠';
+    if (esScore) {
+      esScore.textContent = (!active || es.score == null) ? '—' : es.score;
+      esScore.className = 'extsub-score ' + (es.score == null ? '' : es.score > 60 ? 'up' : es.score < 40 ? 'dn' : 'n');
+    }
+    if (esNote) esNote.textContent = active
+      ? '极端波动率体制：主评分此时不可信，看这份子评分与外生事件日历。'
+      : '仅在 20 日年化波动率 ≥ 80% 时启用（当前 ' + (regime ? (regime.vol * 100).toFixed(0) : '—') + '%）。';
+    if (esFactors) {
+      esFactors.innerHTML = es.parts.length ? es.parts.map(p =>
+        '<span class="esf ' + (p.contribution > 0.25 ? 'up' : p.contribution < -0.25 ? 'dn' : 'n') + '">' +
+        p.name.replace(/^[^ ]+ /, '') + ' ' + (p.z >= 0 ? '+' : '') + p.z.toFixed(1) + '</span>').join('') : '（因子数据缺失）';
+    }
+  }
 }
 /* =====================================================================
  *  历史回放 · IC 有效性检验 / 因子归因（v3.8 → v3.9）
@@ -1428,7 +1459,13 @@ async function runHistoryCheck() {
     });
     const reg = regimeTest(rep);
     const per = periodIC(rep);
-    state.hist = { rep: rep, ics: ics, facs: facs, oos: oos, roll: roll, ext: ext, reg: reg, per: per };
+    /* v3.11 实践延展：极端体制子评分的回测验证（同 10 年样本，非样本外） */
+    const exSeries = extremeSubSeries(rep);
+    const exWildIC = icCore(regimeMasked(exSeries, rep, 'wild'), rep, 10, rep.start, rep.n);
+    const exAllIC = icCore(exSeries, rep, 10, rep.start, rep.n);
+    const exMainWild = reg.byRegime.wild ? reg.byRegime.wild.ic : null;
+    state.hist = { rep: rep, ics: ics, facs: facs, oos: oos, roll: roll, ext: ext, reg: reg, per: per,
+      extreme: { series: exSeries, wildIC: exWildIC, mainWildIC: exMainWild, allIC: exAllIC } };
     renderHistory();
     renderReview();
     if (note) note.textContent = '';
@@ -1658,6 +1695,70 @@ function periodIC(rep, ids) {
   return out;
 }
 
+/* ---------- 极端体制子评分（v3.11 实践延展）----------
+ * 来自 v3.11 分体制画像的发现：有些因子只在「极端波动率」体制里做事——
+ * 算力趋势 hr（平静 0.08 / 极端 0.21）、黄金 gold（0.05 / 0.20）、原油 oil（−0.07 / −0.17）。
+ * 于是把它们单独抽成一份「极端体制子评分」：平时休眠，仅当 20 日年化波动率 ≥ 80% 时启用。
+ * 设计取舍：因子集是**经验硬编码**的（来自 v3.11 体制画像，wild|IC| 明显 > calm|IC| 的因子），
+ * 权重沿用主评分里各自的静态权重。回放里验证它在极端体制内是否比主评分更能区分未来涨跌；
+ * 线上只在 wild 体制点亮——极端期主评分本身不可信（低分档不再对应负收益），
+ * 这时该看的是这份子评分 + 外生事件日历，而不是主 Nexus Score。 */
+const EXTREME_FACTORS = ['hr', 'gold', 'oil'];
+function fWeight(id) { const f = FACTORS.find(x => x.id === id); return f ? f.w : 1; }
+
+/* 实时：从当天的因子 out（含 z / contribution / ok）合成子评分 */
+function extremeSubScore(out) {
+  let sum = 0, wsum = 0; const parts = [];
+  EXTREME_FACTORS.forEach(id => {
+    const o = out[id]; if (!o || o.ok === false) return;
+    const w = fWeight(id); const c = (o.contribution || 0) * w;
+    sum += c; wsum += w;
+    parts.push({ id: id, name: (FACTORS.find(x => x.id === id) || {}).name || id, z: o.z, contribution: o.contribution, w: w });
+  });
+  if (wsum <= 0) return { score: null, parts: parts, available: 0 };
+  const raw = sum / wsum;
+  return { score: Math.max(2, Math.min(98, Math.round(50 + raw * 22))), raw: raw, parts: parts, available: parts.length };
+}
+
+/* 回放：从 rep.fvals（逐日贡献）合成子评分时间序列（与 rep 对齐，不可用时为 null） */
+function extremeSubSeries(rep) {
+  const n = rep.n, out = new Array(n).fill(null);
+  const fw = {}; EXTREME_FACTORS.forEach(id => { fw[id] = fWeight(id); });
+  for (let i = 0; i < n; i++) {
+    let sum = 0, wsum = 0;
+    for (const id of EXTREME_FACTORS) { const a = rep.fvals[id]; if (!a) continue; const v = a[i]; if (v == null) continue; sum += v * fw[id]; wsum += fw[id]; }
+    if (wsum > 0) { const raw = sum / wsum; out[i] = Math.max(2, Math.min(98, Math.round(50 + raw * 22))); }
+  }
+  return out;
+}
+
+/* 把序列按体制遮罩：只保留落在指定体制（或任意体制若 regimeKey 为 null）的交易日 */
+function regimeMasked(series, rep, regimeKey) {
+  const vol = realizedVol(rep, 20); const out = new Array(rep.n).fill(null);
+  for (let i = rep.start; i < rep.n; i++) {
+    if (vol[i] == null) continue;
+    const R = REGIMES.find(x => vol[i] >= x.lo && vol[i] < x.hi);
+    if (regimeKey && (!R || R.k !== regimeKey)) continue;
+    out[i] = series[i];
+  }
+  return out;
+}
+
+/* 实时：从 BTC 日线 K 线算当前 20 日年化已实现波动率，判定当前体制 */
+function currentRegime() {
+  const k = state.klines['BTC1d'];
+  if (!k || k.length < 21) return null;
+  const c = k.map(x => x.c);
+  const rs = [];
+  for (let i = c.length - 20; i < c.length; i++) { const p = c[i - 1]; if (p) rs.push(c[i] / p - 1); }
+  if (rs.length < 15) return null;
+  const m = rs.reduce((a, b) => a + b, 0) / rs.length;
+  const v = rs.reduce((a, b) => a + (b - m) * (b - m), 0) / rs.length;
+  const vol = Math.sqrt(v) * Math.sqrt(365);
+  for (const R of REGIMES) if (vol >= R.lo && vol < R.hi) return { key: R.k, label: R.label, vol: vol };
+  return { key: 'wild', label: '极端', vol: vol };
+}
+
 /* ---------- v3.11 十年复盘的渲染 ---------- */
 const fPct = v => v == null ? '—' : (v >= 0 ? '+' : '') + (v * 100).toFixed(2) + '%';
 const fDate = t => { const d = new Date(t); return d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0') + '-' + String(d.getUTCDate()).padStart(2, '0'); };
@@ -1746,6 +1847,31 @@ function renderReview() {
   });
   ph += '</div>';
   pb.innerHTML = ph;
+
+  /* v3.11 实践延展：极端体制子评分的回测验证 */
+  const ex = h.extreme || null;
+  if (ex) {
+    const box = $('extScoreBox');
+    if (box) {
+      const fmtIc = x => x == null || x.spear == null ? '—' : x.spear.toFixed(3) + (x.t == null ? '' : ' (' + x.t.toFixed(2) + ')');
+      const cls = x => x == null || x.spear == null ? 'rg-y' : (x.spear > 0.1 ? 'rg-g' : (x.spear < 0 ? 'rg-r' : 'rg-y'));
+      const mainWild = ex.mainWildIC;
+      const wn = (h.reg && h.reg.byRegime.wild && h.reg.byRegime.wild.n) || (ex.wildIC ? ex.wildIC.n : null);
+      let html = '<div class="fttl" style="margin-bottom:7px">⑦ 极端体制子评分 · 回测验证（同 10 年样本，非样本外）</div>';
+      html += '<div class="rg-sub">把 v3.11 体制画像里「只在极端期做事」的因子（算力 / 黄金 / 原油）单独抽成一份子评分，平时休眠、仅当 20 日波动率 ≥ 80% 启用。下面看它在<b>极端体制内</b>是否比主评分更能区分未来 10 日涨跌：</div>';
+      html += '<div class="rg-tbl"><div class="rg-hd"><span>评分口径</span><span>极端期 IC(10日)</span><span>极端样本</span><span>全样本 IC(10日)</span><span></span><span></span></div>';
+      html += '<div class="rg-row"><span class="rg-nm">主 Nexus Score</span><span>' + (mainWild == null ? '—' : mainWild.toFixed(3)) + '</span><span>' + wn + '</span><span>' + (h.ics && h.ics[2] ? h.ics[2].spear.toFixed(3) : '—') + '</span><span></span><span></span></div>';
+      html += '<div class="rg-row"><span class="rg-nm">极端体制子评分（算力/黄金/原油）</span><span class="' + cls(ex.wildIC) + '">' + fmtIc(ex.wildIC) + '</span><span>' + (ex.wildIC ? ex.wildIC.n : '—') + '</span><span class="' + cls(ex.allIC) + '">' + fmtIc(ex.allIC) + '</span><span></span><span></span></div>';
+      html += '</div>';
+      const verdict = (ex.wildIC && ex.wildIC.spear != null && mainWild != null)
+        ? (ex.wildIC.spear > mainWild
+            ? '在极端体制内，这份子评分比主评分更能区分未来 10 日涨跌（' + ex.wildIC.spear.toFixed(3) + ' vs ' + mainWild.toFixed(3) + '）—— 但仍是同样本回测，需样本外验证。'
+            : '在极端体制内，这份子评分并未优于主评分（' + ex.wildIC.spear.toFixed(3) + ' vs ' + mainWild.toFixed(3) + '）：极端行情主要由外生冲击驱动，因子信号被稀释，这时该看外生事件日历而非任何评分。')
+        : '极端期样本不足，无法判定。';
+      html += '<div class="rg-sub">' + verdict + '</div>';
+      box.innerHTML = html;
+    }
+  }
 
   if (hint) hint.textContent = h.ext ? (h.ext.length + ' 波极端行情') : '已完成';
 }

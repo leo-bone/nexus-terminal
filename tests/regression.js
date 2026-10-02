@@ -540,12 +540,91 @@ const near = (label, actual, expect, tol) => {
     console.log('   逐年 IC(10日)：' + perL.map(r => r.y + ' ' + (r.ic == null ? '—' : r.ic.toFixed(2))).join(' · '));
   }
 
+  /* =================================================================
+   *  J. 极端体制子评分（v3.11 实践延展）
+   *  -----------------------------------------------------------------
+   *  验证 v3.11 分体制画像的产物：把「只在极端期做事」的因子（算力/黄金/原油）
+   *  抽成子评分。需要确认：① 合成日线能正确判定体制；② 子评分在实时 out 上算得出来；
+   *  ③ 回放里子评分序列与主评分在极端体制内的 IC 都算得出来（诚实标注同样本）。
+   * ================================================================= */
+  console.log('\n===== J. 极端体制子评分（v3.11 实践延展）=====');
+
+  /* ① currentRegime：用合成日线判定体制 */
+  const mkKlines = (amp) => call(`(amp) => {
+    let seed = 777;
+    const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+    const t0 = Date.parse('2026-08-01');
+    const kl = []; let p = 60000;
+    for (let i = 0; i < 40; i++) { const e = (rnd() - 0.5) * 2 * amp; p = p * (1 + e); kl.push({ t: t0 + i * 86400000, o: p, h: p * 1.01, l: p * 0.99, c: p, v: 1e9 }); }
+    return kl;
+  }`, amp);
+  run('state.klines["BTC1d"] = null;');
+  chk('无日线时 currentRegime 返回 null', call('currentRegime') === null, 'true');
+  call('h => { state.klines["BTC1d"] = h; }', mkKlines(0.006));
+  const rgCalm = call('currentRegime');
+  chk('低波动日线 → 平静体制', rgCalm && rgCalm.key === 'calm', 'true');
+  call('h => { state.klines["BTC1d"] = h; }', mkKlines(0.09));
+  const rgWild = call('currentRegime');
+  chk('高波动日线 → 极端体制', rgWild && rgWild.key === 'wild', 'true');
+  chk('极端体制波动率 ≥ 0.80', rgWild && rgWild.vol >= 0.8, 'true');
+  console.log('   合成日线：平静 vol=' + (rgCalm ? (rgCalm.vol).toFixed(3) : '—') + ' · 极端 vol=' + (rgWild ? rgWild.vol.toFixed(3) : '—'));
+  run('state.klines["BTC1d"] = null;');
+
+  /* ② extremeSubScore：实时 out 上合成 */
+  const fakeOut = {
+    hr:   { z: 1.2, contribution: 1.2, ok: true },
+    gold: { z: -0.4, contribution: -0.4, ok: true },
+    oil:  { z: 1.5, contribution: -1.5, ok: true },   // oil dir=-1 → 负贡献
+  };
+  const esLive = call('extremeSubScore', fakeOut);
+  chk('子评分对 3 个可用因子算得出', esLive && esLive.available === 3 && typeof esLive.score === 'number', 'true');
+  chk('子评分落在 [2,98]', esLive && esLive.score >= 2 && esLive.score <= 98, 'true');
+  const fakeOutDead = { hr: { ok: false }, gold: { ok: false }, oil: { ok: false } };
+  const esDead = call('extremeSubScore', fakeOutDead);
+  chk('3 个因子全无数据 → 子评分休眠', esDead && esDead.score === null && esDead.available === 0, 'true');
+  console.log('   子评分（算力+1.2 / 黄金-0.4 / 原油-1.5 加权）→ ' + esLive.score);
+
+  /* ③ 回放里子评分序列 + 极端体制内 IC */
+  if (repL) {
+    const exS = call('extremeSubSeries', repL);
+    chk('子评分序列与 rep 对齐', exS && exS.length === repL.n, 'true');
+    chk('子评分序列有非 null 值', exS && exS.some(v => v != null), 'true');
+    const exAll = call('icCore', exS, repL, 10, repL.start, repL.n);
+    chk('子评分全样本 IC 算得出', exAll && exAll.spear != null && Math.abs(exAll.spear) <= 1, 'true');
+    const masked = call('regimeMasked', exS, repL, 'wild');
+    chk('极端体制遮罩序列长度对齐', masked && masked.length === repL.n, 'true');
+    const exWild = call('icCore', masked, repL, 10, repL.start, repL.n);
+    chk('子评分极端期 IC 算得出或样本不足为 null', exWild === null || (exWild.spear != null && Math.abs(exWild.spear) <= 1), 'true');
+    console.log('   子评分：全样本 IC(10)=' + (exAll ? exAll.spear.toFixed(3) : '—') +
+      ' · 极端期 IC(10)=' + (exWild ? exWild.spear.toFixed(3) + ' (n=' + exWild.n + ')' : '样本不足'));
+  }
+
   /* —— 回放不得污染实时状态 —— */
   const liveAfter = call('computeNexusScore');
   chk('回放后游标已复位', run('state.asof'), null);
   chk('回放不污染实时评分', liveAfter.score, liveBefore.score);
   chk('回放后实时评分仍为 28 维', Object.keys(liveAfter.out).length, 28);
   run('state.histBundle = null;');
+
+  /* —— 渲染兜底：renderReview 必须不抛错且 ⑦ 极端子评分块渲染出来（防「reg 未定义」类 bug 被 catch 静默吞掉）—— */
+  const mockHist = {
+    reg: { byRegime: {
+      calm:  { n: 1000, ic: 0.13, t: 1.5, up: 0.02, dn: -0.01, base: 0.018 },
+      chop:  { n: 1500, ic: 0.18, t: 2.3, up: 0.045, dn: 0.01, base: 0.014 },
+      wild:  { n: 672, ic: 0.13, t: 1.1, up: 0.03, dn: 0.003, base: 0.035 },
+    }, byFactor: {} },
+    ext: [], per: [{ y: 2020, n: 100, ic: 0.1, t: 2.0, ret: 0.05 }],
+    ics: [null, null, { spear: 0.14, t: 2.5, n: 3544 }],
+    extreme: { wildIC: { spear: 0.157, t: 1.9, n: 672 }, allIC: { spear: 0.054, t: 0.9, n: 3544 }, mainWildIC: 0.13 },
+  };
+  run('state.hist = (' + JSON.stringify(mockHist) + ');');
+  let renderErr = null;
+  try { run('renderReview()'); } catch (e) { renderErr = e.message || String(e); }
+  chk('renderReview 不抛错（⑦ 块变量作用域正确）', renderErr, null);
+  const exBoxHtml = $id('extScoreBox').innerHTML || '';
+  chk('⑦ 极端体制子评分块渲染', exBoxHtml.indexOf('极端体制子评分') >= 0, 'true');
+  chk('⑦ 块给出诚实结论文本', /极端体制内|外生冲击|样本外验证/.test(exBoxHtml), 'true');
+  run('state.hist = null;');
 
   console.log('\n' + (fail ? `❌ 失败 ${fail} 项` : '✅ 全部断言通过'));
   process.exit(fail ? 1 : 0);

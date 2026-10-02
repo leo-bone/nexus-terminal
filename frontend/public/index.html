@@ -195,6 +195,24 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
 .ex-ev i{font-style:normal;color:var(--dim);font-size:8px;margin-left:3px}
 .ex-nohit{color:var(--dim);font-style:italic}
 .ex-z{font-size:8.5px;color:var(--dim);margin-top:4px;line-height:1.65;font-family:"JetBrains Mono",monospace}
+
+/* ---------- v3.11 极端体制子评分 ---------- */
+.regime-badge{font-weight:600;border:1px solid var(--border);padding:2px 7px;border-radius:9px}
+.regime-badge.calm{color:var(--green);border-color:rgba(0,229,160,.3);background:rgba(0,229,160,.07)}
+.regime-badge.chop{color:var(--yellow);border-color:rgba(255,193,7,.3);background:rgba(255,193,7,.07)}
+.regime-badge.wild{color:var(--red);border-color:rgba(255,61,110,.35);background:rgba(255,61,110,.09)}
+.extsub{margin:9px 0 2px;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:9px 11px;transition:border-color .2s}
+.extsub.active{border-color:rgba(255,61,110,.4);box-shadow:0 0 14px rgba(255,61,110,.08)}
+.extsub-h{display:flex;align-items:center;gap:8px;margin-bottom:7px}
+.extsub-h .hint{padding:2px 7px;border-radius:9px;background:rgba(255,255,255,.05);color:var(--dim)}
+.extsub.active .hint{color:var(--red);background:rgba(255,61,110,.12)}
+.extsub-row{display:flex;align-items:baseline;gap:10px;font-family:"JetBrains Mono",monospace}
+.extsub-row .fscore-l{font-size:26px;font-weight:800}
+.extsub-row .fscore-l.up{color:var(--green)}.extsub-row .fscore-l.dn{color:var(--red)}.extsub-row .fscore-l.n{color:var(--text2)}
+.extsub-lbl{font-size:9px;color:var(--dim)}
+.extsub-factors{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.extsub-factors .esf{font-size:9.5px;font-family:"JetBrains Mono",monospace;padding:2px 7px;border-radius:7px;background:rgba(255,255,255,.04)}
+.extsub-factors .esf.up{color:var(--green)}.extsub-factors .esf.dn{color:var(--red)}.extsub-factors .esf.n{color:var(--dim)}
 </style>
 </head>
 <body>
@@ -254,7 +272,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
   </div>
 
   <div class="panel">
-    <div class="phdr"><span class="icon">🧠</span><span class="lbl">因子模型 · Nexus Score</span><span id="fCount" class="hint">28 维</span><span class="hint">方向加权合成 · 实时</span></div>
+    <div class="phdr"><span class="icon">🧠</span><span class="lbl">因子模型 · Nexus Score</span><span id="fCount" class="hint">28 维</span><span class="hint">方向加权合成 · 实时</span><span id="regimeBadge" class="hint regime-badge">体制 —</span></div>
     <div class="fpanel">
       <div class="fhdr">
         <span class="fttl">综合多空评分</span>
@@ -265,6 +283,12 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
       </div>
       <div class="fnote">每个因子先算 z（相对自身历史的偏离），再乘方向 dir 得到多空贡献：<b style="color:var(--green)">绿=利多</b> · <b style="color:var(--red)">红=利空</b> · 灰「仅展示」不参与评分。悬停卡片可看权重与原始 z。</div>
       <div id="factorGrid" class="fgrid"></div>
+      <div class="extsub" id="extSubBox">
+        <div class="extsub-h"><span class="fttl">极端体制子评分</span><span id="extSubState" class="hint">休眠</span></div>
+        <div class="extsub-row"><span class="fscore-l" id="extSubScore">—</span><span class="extsub-lbl">算力 · 黄金 · 原油（仅极端波动时启用）</span></div>
+        <div class="fnote" id="extSubNote">仅在 20 日年化波动率 ≥ 80% 时启用。</div>
+        <div class="extsub-factors" id="extSubFactors"></div>
+      </div>
     </div>
   </div>
 
@@ -307,6 +331,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
     <div class="hgrid">
       <div class="hbox"><div class="fttl" style="margin-bottom:7px">④ 分体制对比 · 评分 vs 未来 10 日收益</div><div id="regBox"></div></div>
       <div class="hbox"><div class="fttl" style="margin-bottom:7px">⑤ 分期稳定性 · 逐年 IC</div><div id="perBox"></div></div>
+      <div class="hbox" id="extScoreBox" style="grid-column:1/-1"></div>
     </div>
     <div class="fttl" style="padding:14px 14px 7px">⑥ 极端行情 · 事件归因（哪些是因子推的，哪些是外部打进来的）</div>
     <div id="extList" class="ex-wrap"></div>
