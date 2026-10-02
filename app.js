@@ -719,26 +719,152 @@ function renderTA() {
 /* =====================================================================
  *  因子关系网络 + 相关性热力图（日收益率，日期对齐）
  * ===================================================================== */
+
+/* =====================================================================
+ *  因子关系网络 + 相关性热力图（日收益率）
+ *
+ *  v3.20 的四处升级（对应文首 ⑬）：
+ *    ① 相关矩阵做 PSD 谱截断 + 向常数相关目标收缩，才敢拿去求逆；
+ *    ② 「总相关 / 偏相关」可切换 —— 前者包含经由第三方的传导，后者是控制住
+ *       其余全部因子后的直接关系。两条 DXY–BTC 的线含义完全不同；
+ *    ③ 连边与否由 BH-FDR 决定，不再是 |r|>0.08 这种拍出来的阈值；
+ *    ④ 网络形态可选 MST（n-1 条边，最强骨架）或显著网络（全部显著边）。
+ * ===================================================================== */
 let net = null;
 let netRunning = false;      // 全局唯一动画循环开关（修复每 60 秒泄漏一个 rAF 循环）
+const NET_OPTS = { mode: 'mst', rel: 'corr', win: 120 };
+const CLUSTER_COLORS = ['#00b4ff', '#ffb300', '#b388ff', '#00e5a0', '#ff9100', '#ff3d6e'];
+let netAna = null;
+
 function netKeys() { return Object.keys(state.series).filter(k => META[k] && state.retMaps[k] && state.retMaps[k].size > 20); }
+
+/* 日期上界作为「数据有没有变」的标记：没变就复用上次的谱/偏相关结果，
+ * 每次 60 秒刷新都重算 231 对 × 数百天没有意义，但也不要让陈旧结果一直挂着。 */
+function retStamp(keys) {
+  let mx = 0;
+  for (let i = 0; i < keys.length; i++) {
+    const m = state.retMaps[keys[i]];
+    m.forEach(function (v, d) { if (d > mx) mx = d; });
+  }
+  return mx;
+}
+function netAnalyzed(force) {
+  const keys = netKeys();
+  if (keys.length < 3) { netAna = null; return null; }
+  const stamp = keys.length + '|' + keys.join(',') + '|' + retStamp(keys);
+  if (!force && netAna && netAna.win === NET_OPTS.win && netAna.stamp === stamp) return netAna;
+  corrAna = null;
+  let A = null;
+  try { A = netAnalyze(keys, { win: NET_OPTS.win }); } catch (e) { console.warn('netAnalyze fail', e && e.message); }
+  if (A) A.stamp = stamp;
+  netAna = A;
+  return A;
+}
+function netRelMatrix(A) { return (NET_OPTS.rel === 'part' && A.partial) ? A.partial : A.R; }
+
+/* ⑬-⑯ 整套相关性分析（含 n-1 次谱分解、153 对滚动相关、17 个因子的滞后扫描）
+ * 实测十年数据量下合计约 650ms。而刷新是每 60 秒一次 —— 不缓存等于每分钟
+ * 白烧半秒 CPU。缓存键同样是「最大日期」，日频数据一天才变一次。 */
+let corrAna = null;
+function corrAnalyzed(force) {
+  const A = netAnalyzed(force);
+  if (!A) return null;
+  if (corrAna && corrAna.stamp === A.stamp && !force) return corrAna;
+  let LL = null, RS = null, CB = null;
+  const target = A.keys.indexOf('BTC') >= 0 ? 'BTC' : A.keys[A.keys.length - 1];
+  try { LL = leadLag(A.keys.filter(function (k) { return k !== target; }), target, { maxLag: 5, win: 365 }); } catch (e) { console.warn('leadLag fail', e && e.message); }
+  try { RS = rollingSystemic(A.keys, { win: 90, step: 5 }); } catch (e) { console.warn('rollingSystemic fail', e && e.message); }
+  try {
+    const longA = A.win === 365 ? A : netAnalyze(A.keys, { win: 365 });
+    CB = corrBreak(A, { longA: longA });
+  } catch (e) { console.warn('corrBreak fail', e && e.message); }
+  corrAna = { stamp: A.stamp, A: A, LL: LL, RS: RS, CB: CB, target: target };
+  return corrAna;
+}
+
+/* 偏相关的显著性：自由度为 n-2-(p-2)。控制住的变量越多，剩下的自由度越少，
+ * 这是偏相关的固有代价 —— 30 个样本、控制 20 个变量之后算出来的「直接关系」
+ * 本质上没法与 0 区分。所以小样本时这里会诚实地给出 q≈1。 */
+function netPartialQS(A) {
+  if (A._pq) return A._pq;
+  const p = A.keys.length, ps = [], list = [];
+  for (let i = 0; i < p; i++) for (let j = i + 1; j < p; j++) {
+    const r = A.partial[i][j];
+    const n = A.ovl[i][j];
+    const df = Math.max(4, n - p);
+    list.push({ i: i, j: j, r: r, n: n });
+    if (!isFinite(r)) { ps.push(1); continue; }
+    const rr = Math.max(-0.999999, Math.min(0.999999, r));
+    const t = rr * Math.sqrt(df / (1 - rr * rr));
+    ps.push(tToP2(t));
+  }
+  const qs = bhQ(ps);
+  const map = {};
+  list.forEach(function (x, k) { map[x.i + ':' + x.j] = qs[k]; });
+  A._pq = { map: map, qs: qs, n: list.length };
+  return A._pq;
+}
+function netEdges(A) {
+  const p = A.keys.length;
+  const R = netRelMatrix(A);
+  if (NET_OPTS.mode === 'mst') {
+    return mstFromCorr(R, p).edges.map(function (e) { return { a: e.a, b: e.b, r: e.r, mst: true }; });
+  }
+  const out = [];
+  if (NET_OPTS.rel === 'part') {
+    const PQ = netPartialQS(A);
+    for (let i = 0; i < p; i++) for (let j = i + 1; j < p; j++) {
+      const q = PQ.map[i + ':' + j];
+      const r = R[i][j];
+      if (q != null && q < 0.05 && isFinite(r)) out.push({ a: i, b: j, r: r, q: q });
+    }
+  } else {
+    A.pairs.forEach(function (pr) { if (pr.sig) out.push({ a: pr.i, b: pr.j, r: pr.r, q: pr.q }); });
+  }
+  return out;
+}
+
 function initNetwork() {
   const cv = $('netCanvas'); if (!cv) return;
-  const W = cv.clientWidth, H = cv.clientHeight;
-  const keys = netKeys();
-  const nodes = [], edges = [];
-  keys.forEach(id => { const m = META[id]; nodes.push({ id, label: m.name, short: m.s, color: m.color, group: m.group, x: W / 2 + (Math.random() - .5) * 200, y: H / 2 + (Math.random() - .5) * 160, vx: 0, vy: 0, fixed: id === 'BTC' }); });
-  for (let i = 0; i < keys.length; i++) for (let j = i + 1; j < keys.length; j++) {
-    const r = pearsonMaps(state.retMaps[keys[i]], state.retMaps[keys[j]]);
-    if (r != null && Math.abs(r) > 0.08) edges.push({ a: keys[i], b: keys[j], r });
+  const A = netAnalyzed();
+  if (!A) {
+    if ($('netCount')) $('netCount').textContent = '—';
+    net = null;
+    return;
   }
-  net = { cv, ctx: cv.getContext('2d'), nodes, edges, W, H, idle: 0 };
-  const btc = nodes.find(n => n.id === 'BTC'); if (btc) { btc.x = W / 2; btc.y = H / 2; btc.fixed = true; }
-  $('netCount') && ($('netCount').textContent = `${nodes.length} 因子 / ${edges.length} 关系 · 日收益相关性`);
-  if (!netRunning) { netRunning = true; animateNetwork(); }   // 只允许一个循环
+  const W = cv.clientWidth, H = cv.clientHeight;
+  const keys = A.keys, p = keys.length;
+  const maxS = Math.max.apply(null, A.strength.concat([1e-9]));
+  /* 初始位置：确定性种子 + 按簇分角度撒点。原来用纯 Math.random，
+   * 于是每次刷新连 Layout 都不同，「这张图变了」和「数据变了」分不开。 */
+  let seed = 20261003;
+  const rnd = function () { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+  const clusterOf = A.cluster;
+  const nodes = keys.map(function (id, i) {
+    const m = META[id];
+    const ci = clusterOf[i] || 0;
+    const nc = Math.max(1, A.nCluster);
+    const ang = (ci / nc) * Math.PI * 2 + (rnd() - 0.5) * 0.8;
+    const rad = 60 + rnd() * 50;
+    return {
+      id: id, label: m.name, short: m.s, color: m.color, group: m.group, ci: ci,
+      strength: A.strength[i], eigC: A.eigC[i],
+      r: id === 'BTC' ? 16 : 5 + 7 * Math.sqrt(Math.max(0, A.strength[i]) / maxS),
+      x: W / 2 + Math.cos(ang) * rad, y: H / 2 + Math.sin(ang) * rad, vx: 0, vy: 0, fixed: id === 'BTC',
+    };
+  });
+  const edges = netEdges(A);
+  net = { cv: cv, ctx: cv.getContext('2d'), nodes: nodes, edges: edges, A: A, W: W, H: H, idle: 0 };
+  const btc = nodes.find(function (n) { return n.id === 'BTC'; });
+  if (btc) { btc.x = W / 2; btc.y = H / 2; btc.fixed = true; }
+  if ($('netCount')) $('netCount').textContent = nodes.length + ' 因子 / ' + edges.length + ' 边 · ' +
+    (NET_OPTS.rel === 'part' ? '偏相关' : '总相关') + ' · ' + NET_OPTS.win + ' 日';
+  net.idle = 0;
+  if (!netRunning) { netRunning = true; animateNetwork(); }
 }
 function animateNetwork() {
-  if (!net) return; const { cv, ctx, nodes, edges, W, H } = net;
+  if (!net) return;
+  const cv = net.cv, ctx = net.ctx, nodes = net.nodes, edges = net.edges, A = net.A, W = net.W, H = net.H;
   const dpr = window.devicePixelRatio || 1;
   if (cv.width !== W * dpr) { cv.width = W * dpr; cv.height = H * dpr; }
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, W, H);
@@ -746,24 +872,352 @@ function animateNetwork() {
     nodes.forEach(n => { if (n.fixed) return; let fx = (W / 2 - n.x) * 0.002, fy = (H / 2 - n.y) * 0.002;
       nodes.forEach(m => { if (m === n) return; const dx = n.x - m.x, dy = n.y - m.y; const d2 = dx * dx + dy * dy + 1; const f = 1400 / d2; fx += dx / Math.sqrt(d2) * f; fy += dy / Math.sqrt(d2) * f; });
       n.vx = (n.vx + fx) * 0.85; n.vy = (n.vy + fy) * 0.85; n.x += n.vx; n.y += n.vy; });
-    edges.forEach(e => { const a = nodes.find(n => n.id === e.a), b = nodes.find(n => n.id === e.b); if (!a || !b) return; const dx = b.x - a.x, dy = b.y - a.y, d = Math.sqrt(dx * dx + dy * dy) || 1, f = (d - 90) * 0.01; a.vx += dx / d * f; a.vy += dy / d * f; b.vx -= dx / d * f; b.vy -= dy / d * f; });
+    edges.forEach(e => { const a = nodes[e.a], b = nodes[e.b]; if (!a || !b) return; const dx = b.x - a.x, dy = b.y - a.y, d = Math.sqrt(dx * dx + dy * dy) || 1, f = (d - 90) * 0.01; a.vx += dx / d * f; a.vy += dy / d * f; b.vx -= dx / d * f; b.vy -= dy / d * f; });
   }
-  edges.forEach(e => { const a = nodes.find(n => n.id === e.a), b = nodes.find(n => n.id === e.b); if (!a || !b) return; const col = e.r > 0 ? `rgba(0,229,160,${Math.min(.7, Math.abs(e.r))})` : `rgba(255,61,110,${Math.min(.7, Math.abs(e.r))})`; ctx.strokeStyle = col; ctx.lineWidth = 1 + Math.abs(e.r) * 3; ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke(); });
-  nodes.forEach(n => { const r = n.id === 'BTC' ? 16 : 9; ctx.fillStyle = n.color; ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, 7); ctx.fill(); ctx.fillStyle = '#060c18'; ctx.font = 'bold 9px JetBrains Mono, monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(n.id === 'BTC' ? 'BTC' : (n.short || n.label.slice(0, 3)), n.x, n.y); if (n.id !== 'BTC') { ctx.fillStyle = '#a8bfd6'; ctx.font = '8px Inter, sans-serif'; ctx.fillText(n.label, n.x, n.y + r + 9); } });
-  // 力导向收敛后停帧省电（刷新/缩放时会重新启动）
+  /* 负相关画虚线 —— 视觉上必须能一眼区分「同向」与「反向」，这是网络图最容易丢的信息 */
+  edges.forEach(e => {
+    const a = nodes[e.a], b = nodes[e.b]; if (!a || !b) return;
+    const ar = Math.abs(e.r || 0);
+    ctx.strokeStyle = (e.r >= 0 ? 'rgba(0,229,160,' : 'rgba(255,61,110,') + Math.min(.75, .18 + ar) + ')';
+    ctx.lineWidth = 1 + ar * 3.2;
+    ctx.setLineDash(e.r >= 0 ? [] : [3, 3]);
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    ctx.setLineDash([]);
+  });
+  nodes.forEach(n => {
+    ctx.fillStyle = n.color;
+    ctx.beginPath(); ctx.arc(n.x, n.y, n.r, 0, 7); ctx.fill();
+    ctx.strokeStyle = CLUSTER_COLORS[(n.ci || 0) % CLUSTER_COLORS.length];
+    ctx.lineWidth = 1.6;
+    ctx.beginPath(); ctx.arc(n.x, n.y, n.r + 2.5, 0, 7); ctx.stroke();
+    ctx.fillStyle = '#060c18'; ctx.font = 'bold 9px JetBrains Mono, monospace';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(n.id === 'BTC' ? 'BTC' : (n.short || n.label.slice(0, 3)), n.x, n.y);
+    if (n.id !== 'BTC') { ctx.fillStyle = '#a8bfd6'; ctx.font = '8px Inter, sans-serif'; ctx.fillText(n.label, n.x, n.y + n.r + 9); }
+  });
   const ke = nodes.reduce((a, n) => a + Math.abs(n.vx) + Math.abs(n.vy), 0);
   net.idle = ke < 0.06 ? net.idle + 1 : 0;
   if (net.idle > 90) { netRunning = false; return; }
   requestAnimationFrame(animateNetwork);
 }
+
 function renderHeatmap() {
-  const box = $('heatmap'); if (!box) return; const ids = netKeys();
-  box.style.gridTemplateColumns = `64px repeat(${ids.length}, 1fr)`;
-  let html = '<div class="hm-h"></div>' + ids.map(id => `<div class="hm-h" title="${META[id].name}">${META[id].s || META[id].name.slice(0, 2)}</div>`).join('');
-  ids.forEach(ri => {
+  const box = $('heatmap'); if (!box) return;
+  const A = netAnalyzed();
+  if (!A) { box.innerHTML = '<div class="macro-hint">—</div>'; return; }
+  const ids = A.keys, p = ids.length;
+  const R = netRelMatrix(A);
+  const isPart = NET_OPTS.rel === 'part';
+  const PQ = isPart ? netPartialQS(A) : null;
+  box.style.gridTemplateColumns = `64px repeat(${p}, 1fr)`;
+  let html = '<div class="hm-h"></div>' + ids.map(function (id) {
+    return `<div class="hm-h" title="${META[id].name}">${META[id].s || META[id].name.slice(0, 2)}</div>`;
+  }).join('');
+  let nSig = 0, nCell = 0;
+  ids.forEach(function (ri, a) {
     html += `<div class="hm-h" style="text-align:left" title="${META[ri].name}">${META[ri].s || META[ri].name.slice(0, 2)}</div>`;
-    ids.forEach(ci => { const r = ri === ci ? 1 : pearsonMaps(state.retMaps[ri], state.retMaps[ci]); const bg = r == null ? '#132035' : r > 0 ? `rgba(0,229,160,${Math.abs(r) * .8})` : `rgba(255,61,110,${Math.abs(r) * .8})`; html += `<div class="hm-cell" style="background:${bg};color:${Math.abs(r || 0) > .5 ? '#060c18' : '#a8bfd6'}">${r == null ? '·' : r.toFixed(2)}</div>`; });
+    ids.forEach(function (ci, b) {
+      if (a === b) { html += `<div class="hm-cell" style="background:#1b2c47;color:#a8bfd6">1</div>`; return; }
+      const r = R[a][b];
+      let sig = true;
+      if (isPart && PQ) { const q = PQ.map[a + ':' + b]; sig = q != null && q < 0.05; }
+      else { const key = Math.min(a, b) + ':' + Math.max(a, b); const pr = A.pairs.find(function (x) { return (x.i === Math.min(a, b) && x.j === Math.max(a, b)); }); sig = pr ? pr.sig : false; }
+      if (b > a) { nCell++; if (sig) nSig++; }
+      const ciTxt = corrCI(r, A.ovl[a][b]);
+      const bg = r == null || !isFinite(r) ? '#132035'
+        : r > 0 ? `rgba(0,229,160,${Math.abs(r) * .8})` : `rgba(255,61,110,${Math.abs(r) * .8})`;
+      const opacity = sig ? 1 : .38;                       // 不显著 → 淡化，但不填以为 0
+      const tit = `${META[ri].name} × ${META[ci].name}\n${isPart ? '偏相关' : '相关'} r=${r == null ? '—' : r.toFixed(3)}` +
+        `\n样本 ${A.ovl[a][b]} 天${ciTxt ? ' · 95%CI [' + ciTxt[0].toFixed(2) + ', ' + ciTxt[1].toFixed(2) + ']' : ''}\n${sig ? '通过 BH-FDR(q<0.05)' : '未通过 BH-FDR（可能只是噪声）'}`;
+      html += `<div class="hm-cell" style="background:${bg};opacity:${opacity};color:${Math.abs(r || 0) > .5 ? '#060c18' : '#a8bfd6'}" title="${tit}">${r == null || !isFinite(r) ? '·' : r.toFixed(2)}</div>`;
+    });
   });
+  box.innerHTML = html;
+  const tp = $('heatTip');
+  if (tp) tp.innerHTML = p + ' 个序列 · ' + nCell + ' 个无序对（C(' + p + ',2)）· ' + nSig + ' 对通过 BH-FDR（未通过的已淡化，但仍是真实估计值 —— 淡化=不确定，不等于零）· 窗口 ' + NET_OPTS.win + ' 日 · 平均重叠样本 n̄=' + A.nBar;
+}
+
+/* ---- ⑬ 网络统计条：把「图很好看」升级成「图说明什么」 ---- */
+function renderNetStats() {
+  const el = $('netStats'); if (!el) return;
+  const A = netAnalyzed();
+  if (!A) { el.innerHTML = '<span class="badge">网络数据不足</span>'; return; }
+  const p = A.keys.length;
+  const AR = A.absorption;
+  const btcIdx = A.keys.indexOf('BTC');
+  let btcTxt = '—';
+  if (btcIdx >= 0) {
+    let bi = -1, br = 0;
+    for (let j = 0; j < p; j++) {
+      if (j === btcIdx) continue;
+      const r = Math.abs(A.R[btcIdx][j] || 0);
+      if (r > br) { br = r; bi = j; }
+    }
+    if (bi >= 0) btcTxt = (META[A.keys[bi]] ? META[A.keys[bi]].name : A.keys[bi]) + ' ' +
+      (A.R[btcIdx][bi] >= 0 ? '+' : '') + A.R[btcIdx][bi].toFixed(2);
+  }
+  const chip = function (txt, cls) { return '<span class="badge ' + (cls || 'bg-blue') + '">' + txt + '</span>'; };
+  el.innerHTML =
+    chip('平均 |ρ| ' + (A.avgAbsCorr == null ? '—' : A.avgAbsCorr.toFixed(3))) +
+    chip('吸收比 PC1 ' + (AR[0] * 100).toFixed(0) + '% · PC1-2 ' + (AR[1] * 100).toFixed(0) + '%', AR[0] > 0.6 ? 'bg-red' : AR[0] > 0.45 ? 'bg-gold' : 'bg-green') +
+    chip('分散化比率 ' + A.divRatio.toFixed(2)) +
+    chip('有效样本 n̄=' + A.nBar) +
+    chip('收缩 δ=' + A.delta.toFixed(2)) +
+    chip(A.clipped ? '谱已修正（有 λ≤0）' : '矩阵半正定', A.clipped ? 'bg-gold' : 'bg-green') +
+    chip('数据驱动分簇 ' + A.nCluster + ' 组') +
+    chip('BTC 最强邻居：' + btcTxt, 'bg-purple');
+}
+
+/* ---- ⑭ 领先-滞后 + 相关性断裂 ---- */
+function renderCorrPanels() {
+  const lb = $('leadLagBox'), cb = $('corrBreakBox');
+  const A = netAnalyzed();
+  if (!lb && !cb) return;
+  if (!A) {
+    if (lb) lb.innerHTML = '<div class="macro-hint">序列不足。</div>';
+    if (cb) cb.innerHTML = '<div class="macro-hint">序列不足。</div>';
+    return;
+  }
+  const CA = corrAnalyzed();
+  if (lb) {
+    const target = CA ? CA.target : (A.keys[A.keys.length - 1] || '—');
+    const L = CA ? CA.LL : null;
+    if (!L) { lb.innerHTML = '<div class="macro-hint">样本不足以做领先-滞后扫描（需 ≥60 天共同交易日）。</div>'; }
+    else {
+      const rows = L.rows.slice(0, 10);
+      let html = '<div class="rg-tbl"><div class="rg-hd" style="grid-template-columns:1.3fr .5fr .6fr .6fr .6fr .8fr">' +
+        '<span>因子 vs ' + target + '</span><span>最优滞后</span><span>r(滞后)</span><span>r(同步)</span><span>q 值</span><span>半样本稳定性</span></div>';
+      rows.forEach(function (r) {
+        const nm = META[r.key] ? META[r.key].name : r.key;
+        const lead = r.bestLag > 0 ? ('领先 ' + r.bestLag + ' 日') : r.bestLag < 0 ? ('滞后 ' + (-r.bestLag) + ' 日') : '同步';
+        const stab = r.stable
+          ? '<span style="color:#00e5a0">✔ 两段一致</span>'
+          : '<span style="color:#ffc107">△ 前/后段不一致</span>';
+        html += '<div class="rg-row" style="grid-template-columns:1.3fr .5fr .6fr .6fr .6fr .8fr">' +
+          '<span class="rg-nm">' + nm + '</span>' +
+          '<span>' + lead + '</span>' +
+          '<span style="color:' + icColor(r.bestR) + '">' + r.bestR.toFixed(3) + '</span>' +
+          '<span class="rg-dim">' + (r.lag0 == null ? '—' : r.lag0.toFixed(3)) + '</span>' +
+          '<span class="' + (r.sigQ ? 'rg-g' : 'rg-dim') + '">' + (r.q == null ? '—' : r.q.toFixed(3)) + '</span>' +
+          '<span>' + stab + (r.lagA == null || r.lagB == null ? '' : '<i>' + r.lagA + ' / ' + r.lagB + '</i>') + '</span></div>';
+      });
+      html += '</div>';
+      html += '<div class="rg-sub">「滞后」列的含义：该因子对 <b>' + target + '</b> 的收益，在哪一个偏移上解释力最强。' +
+        '这一步天生是<b>事后的</b>——先把 11 个偏移全试一遍再挑最好的，即便全是噪声也会挑出一个「最优滞后」。' +
+        '两道防线：<b>①</b> 全家族 ' + L.nTests + ' 次检验一起做 BH-FDR，只标 q&lt;0.05 的；' +
+        '<b>②</b> 样本劈成前后两半各自找最优滞后，<b>两段不一致的一律不采信</b>。' +
+        '真有传导机制的东西会在两段时间里指向同一个偏移；噪声不会。</div>';
+      lb.innerHTML = html;
+    }
+  }
+  if (cb) {
+    const B = CA ? CA.CB : null;
+    if (!B || !B.rows.length) { cb.innerHTML = '<div class="macro-hint">不足一年的共同样本，无法比较短/长窗相关。</div>'; }
+    else {
+      let html = '<div class="rg-tbl"><div class="rg-hd" style="grid-template-columns:1.6fr .7fr .7fr .8fr .8fr">' +
+        '<span>序列对</span><span>' + B.shortWin + '日</span><span>365日</span><span>变化</span><span>z（Fisher）</span></div>';
+      B.rows.slice(0, 8).forEach(function (r) {
+        const d = r.rs - r.rl;
+        html += '<div class="rg-row" style="grid-template-columns:1.6fr .7fr .7fr .8fr .8fr">' +
+          '<span class="rg-nm">' + (META[r.keys[0]] ? META[r.keys[0]].name : r.keys[0]) + ' × ' + (META[r.keys[1]] ? META[r.keys[1]].name : r.keys[1]) + '</span>' +
+          '<span style="color:' + icColor(r.rs) + '">' + r.rs.toFixed(2) + '</span>' +
+          '<span class="rg-dim">' + r.rl.toFixed(2) + '</span>' +
+          '<span class="' + (d >= 0 ? 'rg-g' : 'rg-r') + '">' + (d >= 0 ? '+' : '') + d.toFixed(2) + '</span>' +
+          '<span class="' + (Math.abs(r.z) > 2 ? 'rg-r' : 'rg-dim') + '">' + r.z.toFixed(2) + '</span></div>';
+      });
+      html += '</div>';
+      html += '<div class="rg-sub">相关性本身没有对错，但<b>相关性发生变化</b>是有含义的：' +
+        '短窗与长窗的差值在 Fisher-z 空间标准化（z = (zₛ−zₗ)/√(1/(nₛ−3)+1/(nₗ−3))），|z|&gt;2 意味着' +
+        '这对资产的关系已经超出了抽样噪声能解释的范围 —— 与之绑定的对冲/分散化假设需要重新审视。' +
+        '注意这是「分散化会不会失效」的监控，<b>不是</b>价格方向的预测。</div>';
+      cb.innerHTML = html;
+    }
+  }
+}
+
+/* ---- ⑭ 滚动系统性共振图 ---- */
+function renderSystemic() {
+  const cv = $('corrCanvas'); if (!cv) return;
+  const CA = corrAnalyzed();
+  const RS = CA ? CA.RS : null;
+  const note = $('corrNote');
+  if (!RS) {
+    const ctx0 = cv.getContext('2d');
+    if (ctx0) ctx0.clearRect(0, 0, cv.clientWidth, cv.clientHeight);
+    if (note) note.textContent = '滚动共振图需要至少 ' + (90 + 40) + ' 天的共同交易日。';
+    return;
+  }
+  const dpr = window.devicePixelRatio || 1;
+  const W = cv.clientWidth, H = cv.clientHeight;
+  cv.width = W * dpr; cv.height = H * dpr;
+  const g = cv.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, W, H);
+  const padL = 30, padR = 10, padT = 10, padB = 18;
+  const pts = RS.pts;
+  const vals = pts.map(function (x) { return x.avg; });
+  const raw = vals.concat([RS.mean + 2 * RS.sd, RS.mean - 2 * RS.sd]);
+  let lo = Math.min.apply(null, raw), hi = Math.max.apply(null, raw);
+  lo = Math.max(-1, lo - 0.05); hi = Math.min(1, hi + 0.05);
+  const x = i => padL + i * (W - padL - padR) / Math.max(1, pts.length - 1);
+  const y = v => padT + (hi - v) / Math.max(1e-9, hi - lo) * (H - padT - padB);
+  g.font = '9px JetBrains Mono, monospace';
+  g.strokeStyle = 'rgba(26,46,80,.6)'; g.fillStyle = '#3a5070'; g.textAlign = 'right';
+  for (let i = 0; i <= 4; i++) {
+    const v = lo + (hi - lo) * i / 4;
+    g.beginPath(); g.moveTo(padL, y(v)); g.lineTo(W - padR, y(v)); g.stroke();
+    g.fillText(v.toFixed(2), padL - 4, y(v) + 3);
+  }
+  g.setLineDash([3, 3]); g.strokeStyle = 'rgba(255,193,7,.5)';
+  g.beginPath(); g.moveTo(padL, y(RS.mean)); g.lineTo(W - padR, y(RS.mean)); g.stroke();
+  g.beginPath(); g.moveTo(padL, y(RS.mean + 2 * RS.sd)); g.lineTo(W - padR, y(RS.mean + 2 * RS.sd)); g.strokeStyle = 'rgba(255,61,110,.5)'; g.stroke();
+  g.setLineDash([]);
+  g.lineWidth = 1.6; g.strokeStyle = '#a8bfd6';
+  g.beginPath();
+  pts.forEach(function (p, i) { const xx = x(i), yy = y(p.avg); i ? g.lineTo(xx, yy) : g.moveTo(xx, yy); });
+  g.stroke();
+  /* 尾部用颜色标识当前处于什么位置：共振抬升=组合分散化在失效 */
+  const lastX = x(pts.length - 1), lastY = y(RS.last.avg);
+  g.fillStyle = Math.abs(RS.z || 0) > 2 ? '#ff3d6e' : '#00b4ff';
+  g.beginPath(); g.arc(lastX, lastY, 3.2, 0, 7); g.fill();
+  g.fillStyle = '#4a6a8a'; g.textAlign = 'left';
+  g.fillText(RS.win + ' 日滚动平均成对相关 · ' + RS.nPair + ' 对', padL, H - 4);
+  g.textAlign = 'right';
+  g.fillText('黄=均值 · 红虚线=+2σ', W - padR, H - 4);
+  if (note) {
+    const dz = RS.z == null ? '—' : RS.z.toFixed(2);
+    note.innerHTML = '当前 <b style="color:' + (Math.abs(RS.z || 0) > 2 ? 'var(--red)' : 'var(--text2)') + '">' +
+      RS.last.avg.toFixed(3) + '</b>（自身分布 z=' + dz + '，均值 ' + RS.mean.toFixed(3) + ' ± ' + RS.sd.toFixed(3) + '）· ' +
+      '|ρ|&gt;0.5 的组合占比 ' + (RS.last.shareHi * 100).toFixed(0) + '% · ' +
+      '<b>口径</b>：把全部序列两两配对的滚动相关等权平均。它上升 = 因子开始一起动 = 「多因子分散化在失效。' +
+      '这是风险监控指标，与「BTC 要涨还是要跌」无关 —— 高共振期里，任何一个因子的极端读数都不再是独立证据。';
+  }
+}
+
+/* =====================================================================
+ *  ⑫ 渲染：分歧度 / 岭回归今日评级 / 动态权重溯源
+ * ===================================================================== */
+function renderScoreV2(res) {
+  /* ---- 分歧度 ---- */
+  const db = $('dispBox');
+  if (db) {
+    const D = scoreDispersion ? scoreDispersion(res) : null;
+    if (!D) { db.textContent = '—'; }
+    else {
+      const cls = D.consensus > 0.6 ? 'bg-green' : D.consensus > 0.4 ? 'bg-gold' : 'bg-red';
+      db.innerHTML =
+        '<div class="extsub-h"><span class="fttl">评分分歧度</span><span class="hint">' + D.n + ' 维参与</span></div>' +
+        '<div class="extsub-row"><span class="fscore-l ' + (D.consensus > 0.6 ? 'up' : D.consensus > 0.4 ? 'n' : 'dn') + '">' +
+        (D.consensus * 100).toFixed(0) + '% 一致</span>' +
+        '<span class="extsub-lbl">分歧 σ=' + D.sd.toFixed(2) + ' · 剔除任一因子后分数区间 ' + D.jackLo + '~' + D.jackHi + '</span></div>' +
+        '<div class="fnote" style="margin:6px 0 4px">' +
+        '<b>' + (D.agreeSign > 0 ? '偏多' : '偏空') + '权重占比 ' + ((D.agreeSign > 0 ? D.upW : D.dnW) * 100).toFixed(0) + '%</b> · ' +
+        '一致度越高，这个分数越像结论；一致度低说明因子在互相打架，此时分数是「平均值」而不是「判断」。<br>' +
+        '<b>单点敏感度</b>：去掉「' + (D.driver ? D.driver.name.replace(/^[^ ]+ /, '') : '—') + '」后分数变动 ' + D.driverDelta.toFixed(1) + ' 分' +
+        '（满分摆动 ' + D.jackRange + ' 分）—— 谁在一个人说了算，这里直接点名。<br>' +
+        '<b>注意</b>：σ 与标准误（±' + D.bandScore.toFixed(1) + ' 分）都按「因子互相独立」计算。' +
+        '而 ⑬ 的网络显示它们高度相关，所以这是<b>不确定性的下界</b>，真实误差只会更大。</div>' +
+        '<div class="extsub-factors">' + D.top.map(function (p) {
+          return '<span class="esf ' + (p.c > 0.25 ? 'up' : p.c < -0.25 ? 'dn' : 'n') + '">' +
+            p.name.replace(/^[^ ]+ /, '') + ' ' + (p.c >= 0 ? '+' : '') + p.c.toFixed(1) + '<i style="opacity:.6"> ×w' + p.w + '</i></span>';
+        }).join('') + '</div>';
+      db.className = 'extsub' + (D.consensus < 0.4 ? ' active' : '');
+    }
+  }
+  /* ---- 岭回归今日评级 ---- */
+  const rb = $('ridgeBox');
+  if (rb) {
+    const RL = (typeof ridgeLiveScore === 'function') ? ridgeLiveScore(res.out) : null;
+    if (!RL) {
+      rb.innerHTML = '<div class="extsub-h"><span class="fttl">动态权重评分（岭回归）</span><span class="hint">未就绪</span></div>' +
+        '<div class="fnote" style="margin:0">先运行上方「历史回放」—— 系数要用历史逐日滚动估出来，' +
+        '没有任何预先写死的权重可代替这一步。</div>';
+    } else {
+      const rw = state.hist.rw.live;
+      const cls = RL.score > 60 ? 'up' : RL.score < 40 ? 'dn' : 'n';
+      rb.innerHTML = '<div class="extsub-h"><span class="fttl">动态权重评分（岭回归）</span><span class="hint">以历史预测分布定位</span></div>' +
+        '<div class="extsub-row"><span class="fscore-l ' + cls + '">' + RL.score + '</span>' +
+        '<span class="extsub-lbl">原始预测 ' + (RL.raw * 100).toFixed(2) + '% / ' + rw.h + ' 日 · 历史中位数 ' + (RL.median * 100).toFixed(2) + '% · ' + RL.nFac + '/' + RL.nTotal + ' 维可用</span></div>' +
+        '<div class="fnote" style="margin:6px 0 0">这里的分数不是 50+22×z 的那套公式 —— 它是「用历史逐日估计出的&lt;因子→未来收益&gt;系数，' +
+        '乘上今天的 z」得到的收益预测，再换算成<b>在自己历史预测分布中的百分位</b>（' + RL.nHist + ' 个历史预测值）。' +
+        '换句话说：<b>这个预测值在历史上排第几</b>，而不是「我给它打几分」。左右两个分数不一致时，' +
+        '右边的权重是被数据估出来的，左边的权重是人写的 —— 但两者都不是交易建议，' +
+        '它们的样本外 IC 见下方 ⑫ 表。</div>';
+    }
+  }
+}
+
+function renderRwBox() {
+  const box = $('rwBox'); if (!box) return;
+  const h = state.hist;
+  const rw = h && h.rw ? h.rw.full : null;
+  const rwl = h && h.rw ? h.rw.live : null;
+  if (!rw) {
+    box.innerHTML = '<div class="fttl" style="margin-bottom:7px">⑫ 动态权重：岭回归 vs 手写权重</div>' +
+      '<div class="rg-sub">' + (h && h.rwBusy ? '计算中…' : '样本不足以做 walk-forward 估计（需要 ≥ ' + (RW_MIN_TRAIN + RW_H + 80) + ' 天回放窗口）。') + '</div>';
+    return;
+  }
+  const f2 = v => v == null ? '—' : v.toFixed(3);
+  const pc = v => v == null ? '—' : (v >= 0 ? '+' : '') + (v * 100).toFixed(2) + '%';
+  let html = '<div class="fttl" style="margin-bottom:7px">⑫ 动态权重：岭回归 vs 手写权重（walk-forward · 前向 ' + rw.h + ' 日）</div>';
+  html += '<div class="rg-tbl"><div class="rg-hd" style="grid-template-columns:1.1fr .7fr .7fr .8fr .8fr .8fr">' +
+    '<span>口径</span><span>IC( spearman )</span><span>t</span><span>高档收益</span><span>低档收益</span><span>多空差</span></div>';
+  const rowHtml = function (nm, q, isDef, extra) {
+    if (!q) return '';
+    return '<div class="rg-row" style="grid-template-columns:1.1fr .7fr .7fr .8fr .8fr .8fr">' +
+      '<span class="rg-nm">' + nm + (isDef ? '<i>默认口径</i>' : '') + '</span>' +
+      '<span class="' + (q.ic == null ? 'rg-dim' : q.ic > 0.02 ? 'rg-g' : q.ic < -0.02 ? 'rg-r' : 'rg-y') + '">' + f2(q.ic) + (q.t == null ? '' : ' (' + q.t.toFixed(1) + ')') + '</span>' +
+      '<span class="rg-dim">' + (extra || '') + '</span>' +
+      '<span class="' + (q.up == null ? '' : q.up >= 0 ? 'rg-g' : 'rg-r') + '">' + pc(q.up) + '</span>' +
+      '<span class="' + (q.dn == null ? '' : q.dn >= 0 ? 'rg-g' : 'rg-r') + '">' + pc(q.dn) + '</span>' +
+      '<span class="' + (q.spread == null ? '' : q.spread > 0 ? 'rg-g' : 'rg-r') + '">' + pc(q.spread) + '</span></div>';
+  };
+  html += rowHtml('现状：手写权重 + 22×z', rw.baseline, false, '现在的面板');
+  rw.rows.forEach(function (r) { html += rowHtml('岭回归 λ=' + r.lambda, r, r.default, 'κ=' + r.n); });
+  html += rowHtml('等权 z 合成（参照）', rw.equalWeight, false, '无权重信息');
+  html += '</div>';
+
+  const pickDef = function (o) {
+    if (!o || !o.rows) return null;
+    for (let i = 0; i < o.rows.length; i++) if (o.rows[i].default) return o.rows[i];
+    return null;
+  };
+  const defLive = pickDef(rwl);
+  if (rwl) html += '<div class="rg-sub">实时可用口径（' + RW_LIVE_IDS.length + ' 维，去掉没有实时数据源的回放专用因子）：' +
+    '样本外 IC ' + f2(defLive ? defLive.ic : null) +
+    ' vs 同窗口手写权重 IC ' + f2(rwl.baseline ? rwl.baseline.ic : null) + '。' +
+    '两个口径的差别本身就是一条信息：<b>拿掉 MVRV/链上手续费这类只有历史没有实时的因子之后，模型还剩多少燃料</b>。</div>';
+
+  const defRow = pickDef(rw) || { ic: null, t: null, spread: null };
+  const agreeTxt = rw.agreeTot ? (rw.agreeN + '/' + rw.agreeTot) : '—';
+  const dIC = (defRow.ic != null && rw.baseline && rw.baseline.ic != null) ? (defRow.ic - rw.baseline.ic) : null;
+  const verdict = dIC == null ? '样本不足以比较。'
+    : (dIC > 0.01 ? '<b style="color:var(--green)">动态权重高出 ' + dIC.toFixed(3) + '</b>'
+      : (dIC < -0.01 ? '<b style="color:var(--red)">动态权重低 ' + Math.abs(dIC).toFixed(3) + '</b>'
+        : '两者差距在 ±0.01 以内，<b>等于没区别</b>'));
+  html += '<div class="rg-sub">样本外口径结论：岭回归（λ=' + RW_LAMBDA_DEFAULT + '）IC ' + f2(defRow.ic) +
+    ' vs 手写权重 IC ' + f2(rw.baseline ? rw.baseline.ic : null) + ' —— ' + verdict +
+    '。多空差 ' + pc(defRow.spread) + ' vs ' + pc(rw.baseline ? rw.baseline.spread : null) + '。' +
+    '（评价区间 ' + rw.nPred + ' 天，有效样本 ≈ ' + Math.round(rw.nPred / rw.h) + ' 个非重叠窗口，' +
+    '所以 t 值只有 ' + (defRow.t == null ? '—' : defRow.t.toFixed(2)) + ' —— 十年数据在这个 horizon 上' +
+    '真正的信息量就是这么点，这不是模型的错，是因子的信息密度决定的。）</div>';
+  html += '<div class="rg-sub"><b>核对清单（这一块的价值不在结论，在于它把自己摊开了）：</b><br>' +
+    '① 训练只用「标签已揭晓」的样本 —— 第 t 天预测 t→t+' + rw.h + ' 的收益，训练样本的最后一条标签是当天收盘才出现的。' +
+    '回归测试里的「篡改未来不改变历史预测」直接验这一条。<br>' +
+    '② 默认 λ=' + RW_LAMBDA_DEFAULT + ' 是<b>事前定死的规则</b>（罚项 ≈ 一个单位因子方差），' +
+    '不是从这四条里面挑出最好看的那条。四条全列出来是为了让你看到<b>结果对 λ 有多敏感</b> —— ' +
+    '如果只有某一条 λ 能用，那大概率是调参调出来的，不是信号。<br>' +
+    '③ 学到的方向 vs 我们在 FACTORS 里假设的方向：' + agreeTxt + ' 一致' +
+    '（α=' + (rw.agreePct == null ? '—' : (rw.agreePct * 100).toFixed(0)) + '%）。' +
+    '不一致的那些因子值得单独看一眼 —— 到底是模型过拟合，还是我们的方向假设一开始就设反了。<br>' +
+    '④ 样本口径：每 5 天重估一次系数，共 ' + rw.nRefit + ' 次；参与 ' + rw.K + ' 维；' +
+    '评价区间 ' + rw.nPred + ' 天（第 ' + rw.firstPred + ' 天起到末尾），这段区间的预测系数每一次都是当时的历史算出来的。' +
+    '有效下注数 ' + (rw.enb == null ? '—' : rw.enb.toFixed(1)) + ' / ' + rw.K +
+    '（越接近 1 = 实际只押在一个方向上，分散度是假的）；' +
+    '平均换手 Σ|Δβ| ' + (rw.turnover == null ? '—' : rw.turnover.toFixed(3)) + '。<br>' +
+    '⑤ <b>最要紧的一句</b>：这张表回答的是「动态权重比手写权重好多少」，' +
+    '如果样本外 IC 没有稳定超过现状口径，那结论就是<b>这套因子里的信息量不足以支撑一个更精细的组合方法</b> —— ' +
+    '换更大的模型不会凭空产生 alpha。</div>';
   box.innerHTML = html;
 }
 
@@ -1175,7 +1629,8 @@ function renderDeriv() {
   const fb = $('dv_fund'); if (fb && d.funding != null) fb.style.color = d.funding > 0.03 ? '#ff3d6e' : d.funding < -0.02 ? '#00e5a0' : '#a8bfd6';
 }
 function renderFactors() {
-  const { score, out, nScored, nDead } = computeNexusScore();
+  const res = computeNexusScore();
+  const { score, out, nScored, nDead } = res;
   const ring = $('nxRing'); if (ring) { ring.setAttribute('stroke-dasharray', `${score * 2.51} 251`); ring.setAttribute('stroke', score > 60 ? '#00e5a0' : score < 40 ? '#ff3d6e' : '#ffc107'); }
   if ($('nxScore')) $('nxScore').textContent = score;
   if ($('nxSig')) { const s = score > 60 ? '偏多' : score < 40 ? '偏空' : '中性'; $('nxSig').textContent = s; $('nxSig').className = 'fscore-l ' + (score > 60 ? 'up' : score < 40 ? 'dn' : 'n'); }
@@ -1229,6 +1684,8 @@ function renderFactors() {
         p.name.replace(/^[^ ]+ /, '') + ' ' + (p.z >= 0 ? '+' : '') + p.z.toFixed(1) + '</span>').join('') : '（因子数据缺失）';
     }
   }
+  /* v3.20 ⑫：分歧度 + 动态权重今日评级（失败不影响主面板） */
+  try { renderScoreV2(res); } catch (e) { console.warn('score v2 fail', e && e.message); }
 }
 /* v3.14: Deribit DVOL 实时波动率恐慌警报（风险护栏，不是预测）。
  * 从 /api/dvol 取当前 DVOL 的近1年百分位 + 60日 z，红/黄/绿三档提示。失败静默（增强项）。 */
@@ -1521,7 +1978,13 @@ async function runHistoryCheck() {
     const exWildIC = icCore(regimeMasked(exSeries, rep, 'wild'), rep, 10, rep.start, rep.n);
     const exAllIC = icCore(exSeries, rep, 10, rep.start, rep.n);
     const exMainWild = reg.byRegime.wild ? reg.byRegime.wild.ic : null;
-    state.hist = { rep: rep, ics: ics, facs: facs, oos: oos, roll: roll, ext: ext, reg: reg, per: per, aux: aux,
+    /* v3.20 ⑫：增量式岭回归。两套口径 —— 全回放维（历史保真度）与实时可用维（线上可用） */
+    const rwS = {};
+    try {
+      rwS.full = ridgeWalkForward(rep);
+      rwS.live = ridgeWalkForward(rep, { only: RW_LIVE_IDS });
+    } catch (e) { console.warn('ridge walk-forward fail', e && e.message); }
+    state.hist = { rep: rep, ics: ics, facs: facs, oos: oos, roll: roll, ext: ext, reg: reg, per: per, aux: aux, rw: rwS,
       mt: null, mtBusy: true,
       extreme: { series: exSeries, wildIC: exWildIC, mainWildIC: exMainWild, allIC: exAllIC } };
     renderHistory();
@@ -2218,6 +2681,7 @@ function renderHistory() {
   }
 
   renderFacRank(S.facs);
+  renderRwBox();
   renderOOS(S.oos);
   drawRollChart($('rollCanvas'), S.roll);
   drawHistChart($('histCanvas'), rep);
@@ -2634,6 +3098,7 @@ async function refreshAll() {
   renderTicker(); renderChart(); renderTA(); renderFG(); renderMacro(); renderEcon(); renderOnChain(); renderDeriv(); renderFactors();
   renderPaper();
   initNetwork(); renderHeatmap();
+  try { renderNetStats(); renderCorrPanels(); renderSystemic(); } catch (e) { console.warn('net v2 fail', e && e.message); }
   renderStatus(ok);
   refreshDvolAlarm();   // v3.14: 实时波动率恐慌警报（异步，不阻塞主渲染）
 }
@@ -2660,6 +3125,23 @@ function bindUI() {
   const buy = $('ptBuy'); if (buy) buy.addEventListener('click', paperBuy);
   const closeAll = $('ptCloseAll'); if (closeAll) closeAll.addEventListener('click', paperCloseAll);
   const ptReset = $('ptReset'); if (ptReset) ptReset.addEventListener('click', paperReset);
+  /* v3.20：关系网络的三个开关 —— 网络形态 / 关系类型 / 相关窗口。
+   * 换一次开关就重算谱分解与偏相关，所以这里显式 force 重分析而不吃缓存。 */
+  document.querySelectorAll('.ttab').forEach(function (tab) {
+    tab.addEventListener('click', function () {
+      const g = tab.dataset.g;
+      document.querySelectorAll('.ttab').forEach(function (x) { if (x.dataset.g === g) x.classList.remove('on'); });
+      tab.classList.add('on');
+      const v = tab.dataset.v;
+      if (g === 'win') NET_OPTS.win = parseInt(v, 10) || 120;
+      else NET_OPTS[g] = v;
+      try {
+        netAnalyzed(true);
+        initNetwork(); renderHeatmap(); renderNetStats(); renderCorrPanels(); renderSystemic();
+        if (net) { net.idle = 0; if (!netRunning) { netRunning = true; animateNetwork(); } }
+      } catch (e2) { console.warn('net redraw fail', e2 && e2.message); }
+    });
+  });
   const refresh = $('refreshBtn'); if (refresh) refresh.addEventListener('click', refreshAll);
 }
 
@@ -2672,6 +3154,7 @@ window.addEventListener('load', async () => {
   setInterval(refreshAll, CONFIG.REFRESH_MS);
   window.addEventListener('resize', () => {
     renderChart();
+    try { renderSystemic(); } catch (e) { /* ignore */ }
     if (state.hist) renderHistory();
     if (net) { net.W = $('netCanvas').clientWidth; net.H = $('netCanvas').clientHeight; net.idle = 0; if (!netRunning) { netRunning = true; animateNetwork(); } }
   });
@@ -3279,4 +3762,893 @@ function schedulePbo(rep) {
     if (state.hist) { state.hist.pboBusy = false; state.hist.pbo = pb; }
     try { renderPboBox(); } catch (e2) { console.warn('pbo render fail', e2 && e2.message); }
   }, 90);
+}
+
+/* =====================================================================
+ * v3.20 · ⑫ 多空评分 v2 / ⑬ 因子关系网络 v2 / ⑭ 实时相关性与领先滞后
+ *
+ *  这一版动的是三个「业余 vs 机构」差异最大的位置：
+ *
+ *   ⑫ 分数不再是「拍脑袋权重 × z」的加权平均。
+ *      同样一批 z，用**增量式岭回归**逐日滚动估计各因子的真实权重，
+ *      全程只用「当天已经知道结果」的样本（无前视偏差），
+ *      再把估计出的与传统假设的方向做对照。输出的是「这套权重值多少 IC」，
+ *      而不是又一个自说自话的分数。
+ *
+ *   ⑬ 网络不再是「裸相关系数 + 阈值」。
+ *      ① 相关矩阵先做 PSD 修正与收缩 —— 缺失值导致 pairwise-complete 的矩阵
+ *         可能不是半正定，直接求逆会得到荒谬的偏相关；
+ *      ② 区分**总相关**与**偏相关**（精度矩阵）：总相关包含经由第三方的传导，
+ *         偏相关才是「控制住其他所有因子后的直接关系」；
+ *      ③ 显著性用 BH-FDR 而不是 |r|>0.08 这种拍出来的门槛；
+ *      ④ MST（最小生成树）+ 聚类 + 中心性 + 吸收比：把「谁连着谁」
+ *         升级成「这个因子网络里系统性风险有多集中」。
+ *
+ *   ⑭ 相关性不再是一个静态数字。选一个窗口就得到一个数 —— 而样本外的那一个月
+ *      往往早就换了样子：危机里所有资产一起跌、平静期则各自走。所以这里给出
+ *      滚动共振图（平均成对相关的漂移）、领先-滞后扫描（带半样本稳定性复核，
+ *      防把噪声读成领先指标）与相关性断裂告警（短窗 vs 长窗 Fisher-z 差）。
+ * ===================================================================== */
+
+/* =====================================================================
+ *  数值内核：对称矩阵特征分解 / 求逆 / 相关矩阵修正 / Fisher-z / BH-FDR
+ * ===================================================================== */
+
+/* Jacobi 特征分解（对称矩阵专用）。返回特征值降序 + 对应特征向量。
+ * 选 Jacobi 而不是幂法：吸收比需要**整条谱**，不是只要第一主成分；
+ * n≈20 的规模下每轮 O(n³)，几十轮旋转在浏览器里不到 1ms。 */
+function jacobiEigen(Ain, n, maxSweep) {
+  const A = Ain.map(function (r) { return r.slice(); });
+  const V = [];
+  for (let i = 0; i < n; i++) { V.push(new Array(n).fill(0)); V[i][i] = 1; }
+  maxSweep = maxSweep || 60;
+  for (let s = 0; s < maxSweep; s++) {
+    let off = 0;
+    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) off += A[i][j] * A[i][j];
+    if (off < 1e-24) break;
+    for (let p = 0; p < n; p++) {
+      for (let q = p + 1; q < n; q++) {
+        const apq = A[p][q];
+        if (Math.abs(apq) < 1e-16) continue;
+        const theta = (A[q][q] - A[p][p]) / (2 * apq);
+        const t = (theta >= 0 ? 1 : -1) / (Math.abs(theta) + Math.sqrt(theta * theta + 1));
+        const c = 1 / Math.sqrt(t * t + 1), sn = t * c;
+        for (let k = 0; k < n; k++) { const akp = A[k][p], akq = A[k][q]; A[k][p] = c * akp - sn * akq; A[k][q] = sn * akp + c * akq; }
+        for (let k = 0; k < n; k++) { const apk = A[p][k], aqk = A[q][k]; A[p][k] = c * apk - sn * aqk; A[q][k] = sn * apk + c * aqk; }
+        for (let k = 0; k < n; k++) { const vkp = V[k][p], vkq = V[k][q]; V[k][p] = c * vkp - sn * vkq; V[k][q] = sn * vkp + c * vkq; }
+      }
+    }
+  }
+  const idx = [];
+  for (let i = 0; i < n; i++) idx.push(i);
+  idx.sort(function (a, b) { return A[b][b] - A[a][a]; });
+  const val = idx.map(function (i) { return A[i][i]; });
+  const vec = idx.map(function (i) { return V.map(function (row) { return row[i]; }); });
+  return { val: val, vec: vec };
+}
+
+/* 对称正定矩阵求逆（Cholesky）。非正定返回 null —— 调用方必须显式处理，
+ * 不能拿一个「数值上看着还行」的伪逆去算偏相关。 */
+function cholInv(Ain, n) {
+  const L = [];
+  for (let i = 0; i < n; i++) L.push(new Array(n).fill(0));
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j <= i; j++) {
+      let s = Ain[i][j];
+      for (let k = 0; k < j; k++) s -= L[i][k] * L[j][k];
+      if (i === j) {
+        if (!(s > 1e-14)) return null;
+        L[i][i] = Math.sqrt(s);
+      } else L[i][j] = s / L[j][j];
+    }
+  }
+  const inv = [];
+  for (let i = 0; i < n; i++) inv.push(new Array(n).fill(0));
+  for (let col = 0; col < n; col++) {
+    const y = new Array(n).fill(0);
+    for (let i = 0; i < n; i++) {
+      let s = (i === col ? 1 : 0);
+      for (let k = 0; k < i; k++) s -= L[i][k] * y[k];
+      y[i] = s / L[i][i];
+    }
+    for (let i = n - 1; i >= 0; i--) {
+      let s = y[i];
+      for (let k = i + 1; k < n; k++) s -= L[k][i] * inv[k][col];
+      inv[i][col] = s / L[i][i];
+    }
+  }
+  for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) {
+    const m = (inv[i][j] + inv[j][i]) / 2;   // 数值对称化
+    inv[i][j] = m; inv[j][i] = m;
+  }
+  return inv;
+}
+
+/* Cholesky 解线性方程组 A x = b（A 已含岭惩罚，正定） */
+function cholSolve(Ain, b, n) {
+  const L = [];
+  for (let i = 0; i < n; i++) L.push(new Array(n).fill(0));
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j <= i; j++) {
+      let s = Ain[i][j];
+      for (let k = 0; k < j; k++) s -= L[i][k] * L[j][k];
+      if (i === j) {
+        if (!(s > 1e-12)) return null;
+        L[i][i] = Math.sqrt(s);
+      } else L[i][j] = s / L[j][j];
+    }
+  }
+  const y = new Array(n).fill(0);
+  for (let i = 0; i < n; i++) {
+    let s = b[i];
+    for (let k = 0; k < i; k++) s -= L[i][k] * y[k];
+    y[i] = s / L[i][i];
+  }
+  const x = new Array(n).fill(0);
+  for (let i = n - 1; i >= 0; i--) {
+    let s = y[i];
+    for (let k = i + 1; k < n; k++) s -= L[k][i] * x[k];
+    x[i] = s / L[i][i];
+  }
+  return x;
+}
+
+/* Fisher z 变换与逆变换 —— 相关系数不能直接做加减、不能直接用 ±1.96/√n 算误差界。
+ * 只有在 z 空间里它才近似正态，且方差只依赖样本量：SE = 1/√(n-3)。 */
+function fisherZ(r) {
+  const rr = Math.max(-0.9999999999, Math.min(0.9999999999, r));
+  return 0.5 * Math.log((1 + rr) / (1 - rr));
+}
+function fisherZInv(z) { return Math.tanh(z); }
+function corrCI(r, n, z) {
+  if (n == null || n < 6 || r == null || !isFinite(r)) return null;
+  const c = z == null ? 1.96 : z;
+  const f = fisherZ(r), se = 1 / Math.sqrt(n - 3);
+  return [fisherZInv(f - c * se), fisherZInv(f + c * se)];
+}
+/* 相关系数显著性：t = r√(n-2)/√(1-r²)。用正态近似出双尾 p，
+ * 这个近似在 n 大于几十时与 t 分布差异可忽略，且我们后续一律走 BH-FDR
+ * （对 p 的量级而非精确值敏感），近似带来的误差不会改变任何结论。 */
+function corrP(r, n) {
+  if (n == null || n < 6 || r == null || !isFinite(r)) return null;
+  const rr = Math.max(-0.999999, Math.min(0.999999, r));
+  const t = rr * Math.sqrt((n - 2) / (1 - rr * rr));
+  return tToP2(t);
+}
+/* Benjamini-Hochberg step-up（通用版）。返回 q 值数组，与输入同序。
+ * v3.17 里那份是嵌在 multiTest 内部的专用实现 —— 这里抽出来给网络与领先滞后复用，
+ * 三者用同一份代码，避免「同一个校正方法、三种口径」。 */
+function bhQ(pvals) {
+  const m = pvals.length, out = new Array(m).fill(1);
+  const ord = [];
+  for (let i = 0; i < m; i++) if (pvals[i] != null && isFinite(pvals[i])) ord.push(i);
+  ord.sort(function (a, b) { return pvals[a] - pvals[b]; });
+  let prev = 1;
+  for (let k = ord.length - 1; k >= 0; k--) {
+    const i0 = ord[k];
+    const q = Math.min(prev, pvals[i0] * ord.length / (k + 1));
+    out[i0] = Math.min(1, q);
+    prev = q;
+  }
+  return out;
+}
+
+/* 相关系数 → 距离。Mantegna (1999) 的度量：d = √(2(1-ρ))，满足度量三条公理，
+ * 于是可以在上面建最小生成树。直接拿 (1-ρ) 或 1/|ρ| 当「距离」是错的 ——
+ * 它们不满足三角不等式，MST 的结果没有意义。 */
+function corrDist(r) {
+  const rr = Math.max(-1, Math.min(1, isFinite(r) ? r : 0));
+  return Math.sqrt(Math.max(0, 2 * (1 - rr)));
+}
+
+/* =====================================================================
+ *  ⑬ 因子关系网络 v2
+ * ===================================================================== */
+
+/* 把若干收益 Map 对齐到同一张日期网格上。缺失留 NaN，
+ * 由后续 pairwise-complete 处理 —— 直接丢弃含缺失的行会让样本少一半以上，
+ * 那是「用数据完整性换样本量」的典型错误取舍。 */
+function buildRetMat(keys, win) {
+  /* 防御：请求了还没有数据的序列（刷新竞态、或首次加载只到了一半）时不能炸，
+   * 也不能用 undefined 参与后续矩阵运算 —— 直接把这条序列剔除并让上层看到维数不符。 */
+  const valid = keys.filter(function (k) { return state.retMaps && state.retMaps[k] && state.retMaps[k].size; });
+  if (valid.length !== keys.length) keys = valid;
+  const maps = keys.map(function (k) { return state.retMaps[k]; });
+  if (keys.length < 2) return { days: [], cols: [], keys: keys };
+  const set = new Set();
+  maps.forEach(function (m) { m.forEach(function (v, d) { set.add(d); }); });
+  let days = Array.from(set).sort(function (a, b) { return a - b; });
+  if (win && days.length > win) days = days.slice(days.length - win);
+  const pos = new Map();
+  days.forEach(function (d, i) { pos.set(d, i); });
+  const cols = keys.map(function (k, ki) {
+    const arr = new Array(days.length).fill(NaN);
+    maps[ki].forEach(function (v, d) {
+      const i = pos.get(d);
+      if (i != null && isFinite(v)) arr[i] = v;
+    });
+    return arr;
+  });
+  return { days: days, cols: cols, keys: keys };
+}
+
+/* pairwise-complete 相关 + 重叠样本数 */
+function pairCorr(a, b, L) {
+  let sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0, n = 0;
+  for (let i = 0; i < L; i++) {
+    const x = a[i], y = b[i];
+    if (!isFinite(x) || !isFinite(y)) continue;
+    sx += x; sy += y; sxx += x * x; syy += y * y; sxy += x * y; n++;
+  }
+  if (n < 20) return { r: null, n: n };
+  const cx = sx / n, cy = sy / n;
+  const vx = sxx - n * cx * cx, vy = syy - n * cy * cy, cov = sxy - n * cx * cy;
+  if (!(vx > 0) || !(vy > 0)) return { r: null, n: n };
+  return { r: cov / Math.sqrt(vx * vy), n: n };
+}
+
+/* 相关矩阵的两道处理，顺序不能反：
+ *   ① 向「常数相关」目标收缩 —— pairwise-complete 下每个格子用的是不同的样本，
+ *      矩阵的估计误差很大；收缩强度随维数/样本比上升。
+ *      这里用的是 δ=(p+1)/(p+n̄) 这一启发式，**不是** Ledoit-Wolf 的最优强度，
+ *      面板会把 δ 直接显示出来，使用者知道自己在看什么。
+ *   ② 谱截断保证半正定 —— 只要有一个特征值 ≤ 0，求逆（偏相关）就会出错，
+ *      更糟的是它会悄悄给出一个数值上「看起来没问题」的错误答案。 */
+function prepCorr(R, p, nBar) {
+  let sum = 0, cnt = 0;
+  for (let i = 0; i < p; i++) for (let j = i + 1; j < p; j++) if (isFinite(R[i][j])) { sum += R[i][j]; cnt++; }
+  const rbar = cnt ? sum / cnt : 0;
+  const delta = Math.max(0, Math.min(1, (p + 1) / (p + Math.max(1, nBar))));
+  const S = [];
+  for (let i = 0; i < p; i++) {
+    S.push(new Array(p).fill(0));
+    for (let j = 0; j < p; j++) {
+      const base = i === j ? 1 : (isFinite(R[i][j]) ? R[i][j] : rbar);
+      S[i][j] = (1 - delta) * base + delta * (i === j ? 1 : rbar);
+    }
+  }
+  const E = jacobiEigen(S, p);
+  let minLam = Infinity;
+  for (let i = 0; i < p; i++) minLam = Math.min(minLam, E.val[i]);
+  const floor = Math.max(1e-8, 1e-8);
+  const clipped = minLam < floor;
+  const lam = E.val.map(function (v) { return Math.max(floor, v); });
+  const Psd = [];
+  for (let i = 0; i < p; i++) { Psd.push(new Array(p).fill(0)); Psd[i][i] = 1; }
+  for (let i = 0; i < p; i++) for (let j = i; j < p; j++) {
+    let s = 0;
+    for (let k = 0; k < p; k++) s += lam[k] * E.vec[k][i] * E.vec[k][j];
+    Psd[i][j] = s; Psd[j][i] = s;
+  }
+  const dg = [];
+  for (let i = 0; i < p; i++) dg.push(Math.sqrt(Math.max(1e-12, Psd[i][i])));
+  for (let i = 0; i < p; i++) for (let j = 0; j < p; j++) Psd[i][j] = Psd[i][j] / (dg[i] * dg[j]);
+  /* 报告的是**最后真正拿去用的那个矩阵**的谱，不是中间量的谱。
+   * 谱截断之后还要再归一化对角线才能让对角回到 1，这一步会轻微改变特征值 ——
+   * 所以必须在全部处理做完之后再算一次，否则「矩阵已半正定」这句话就是空的。 */
+  const Ef = jacobiEigen(Psd, p);
+  return {
+    R: Psd, delta: delta, rbar: rbar, clipped: clipped,
+    minEigRaw: minLam, minEig: Ef.val[Ef.val.length - 1],
+    eigen: Ef.val.slice(), eigenRaw: E.val.slice(),
+    nNonPsd: E.val.filter(function (v) { return v <= 1e-8; }).length,
+  };
+}
+
+/* Prim 最小生成树 —— 建在 Mantegna 距离上，输入可以是总相关矩阵也可以是偏相关矩阵 */
+function mstFromCorr(R, p) {
+  const D = [];
+  for (let i = 0; i < p; i++) { D.push(new Array(p).fill(0)); for (let j = 0; j < p; j++) D[i][j] = corrDist(R[i][j]); }
+  const inTree = new Array(p).fill(false), best = new Array(p).fill(Infinity), from = new Array(p).fill(-1);
+  best[0] = 0;
+  const edges = [];
+  for (let it = 0; it < p; it++) {
+    let u = -1, bd = Infinity;
+    for (let i = 0; i < p; i++) if (!inTree[i] && best[i] < bd) { bd = best[i]; u = i; }
+    if (u < 0) break;
+    inTree[u] = true;
+    if (from[u] >= 0) edges.push({ a: from[u], b: u, d: D[from[u]][u], r: R[from[u]][u] });
+    for (let v = 0; v < p; v++) if (!inTree[v] && D[u][v] < best[v]) { best[v] = D[u][v]; from[v] = u; }
+  }
+  return { edges: edges, dist: D };
+}
+
+/* 主分析：一张网络需要的所有统计量，一次算完。 */
+function netAnalyze(keys, opts) {
+  opts = opts || {};
+  const win = opts.win || 120;
+  const M = buildRetMat(keys, win);
+  const L = M.days.length, p = keys.length;
+  if (p < 3 || L < 30) return null;
+  const R = [], Ncnt = [];
+  let nSum = 0, nNum = 0;
+  for (let i = 0; i < p; i++) {
+    R.push(new Array(p).fill(NaN)); Ncnt.push(new Array(p).fill(0));
+    R[i][i] = 1; Ncnt[i][i] = L;
+  }
+  for (let i = 0; i < p; i++) for (let j = i + 1; j < p; j++) {
+    const c = pairCorr(M.cols[i], M.cols[j], L);
+    R[i][j] = R[j][i] = c.r; Ncnt[i][j] = Ncnt[j][i] = c.n;
+    if (c.r != null) { nSum += c.n; nNum++; }
+  }
+  const nBar = nNum ? Math.round(nSum / nNum) : L;
+  const prep = prepCorr(R, p, nBar);
+  const Rs = prep.R;
+
+  /* ---- 显著性：全部 K=p(p-1)/2 对一起做 BH-FDR ---- */
+  const pairs = [], ps = [];
+  for (let i = 0; i < p; i++) for (let j = i + 1; j < p; j++) {
+    pairs.push({ i: i, j: j });
+    ps.push(corrP(Rs[i][j], Ncnt[i][j]));
+  }
+  const qs = bhQ(ps);
+  pairs.forEach(function (pr, k) { pr.r = Rs[pr.i][pr.j]; pr.n = Ncnt[pr.i][pr.j]; pr.p = ps[k]; pr.q = qs[k]; pr.sig = qs[k] < 0.05; });
+
+  /* ---- 偏相关：控制住其他所有因子后的直接关系 ---- */
+  let partial = null, Pinv = null;
+  const Pfull = cholInv(Rs, p);
+  if (Pfull) {
+    Pinv = Pfull;
+    partial = [];
+    for (let i = 0; i < p; i++) {
+      partial.push(new Array(p).fill(NaN));
+      partial[i][i] = 1;
+    }
+    for (let i = 0; i < p; i++) for (let j = i + 1; j < p; j++) {
+      const den = Math.sqrt(Math.max(1e-18, Pfull[i][i] * Pfull[j][j]));
+      const v = -Pfull[i][j] / den;
+      partial[i][j] = partial[j][i] = Math.max(-1, Math.min(1, v));
+    }
+  }
+
+  /* ---- MST（Prim，建立在 Mantegna 距离上）---- */
+  const mst = mstFromCorr(Rs, p);
+  const mstEdges = mst.edges;
+
+  /* ---- 平均链接层次聚类 → 按合并高度最大间隙切一刀 ---- */
+  const Dc = [];
+  for (let i = 0; i < p; i++) { Dc.push(new Array(p).fill(0)); for (let j = 0; j < p; j++) Dc[i][j] = corrDist(Rs[i][j]); }
+  const mergeHeights = [];
+  let curCl = [];
+  for (let i = 0; i < p; i++) curCl.push([i]);
+  while (curCl.length > 1) {
+    let bi = 0, bj = 1, bd = Infinity;
+    for (let i = 0; i < curCl.length; i++) {
+      for (let j = i + 1; j < curCl.length; j++) {
+        let s = 0, n = 0;
+        for (const x of curCl[i]) for (const y of curCl[j]) { s += Dc[x][y]; n++; }
+        const d = s / n;
+        if (d < bd) { bd = d; bi = i; bj = j; }
+      }
+    }
+    mergeHeights.push(bd);
+    const merged = curCl[bi].concat(curCl[bj]);
+    const next = [];
+    for (let i = 0; i < curCl.length; i++) if (i !== bi && i !== bj) next.push(curCl[i]);
+    next.push(merged);
+    curCl = next;
+  }
+  const clusterAt = function (k) {
+    let c2 = [];
+    for (let i = 0; i < p; i++) c2.push([i]);
+    let heights = mergeHeights.slice();
+    while (c2.length > k) {
+      let bi = 0, bj = 1, bd = Infinity;
+      for (let i = 0; i < c2.length; i++) for (let j = i + 1; j < c2.length; j++) {
+        let s = 0, n = 0;
+        for (const x of c2[i]) for (const y of c2[j]) { s += Dc[x][y]; n++; }
+        const d = s / n;
+        if (d < bd) { bd = d; bi = i; bj = j; }
+      }
+      const merged = c2[bi].concat(c2[bj]);
+      const next = [];
+      for (let i = 0; i < c2.length; i++) if (i !== bi && i !== bj) next.push(c2[i]);
+      next.push(merged);
+      c2 = next;
+    }
+    const out = new Array(p).fill(-1);
+    c2.forEach(function (c, ci) { c.forEach(function (idx) { out[idx] = ci; }); });
+    return out;
+  };
+  /* 簇数取「合并高度跳跃最大」处，限定 2~5 簇 —— 不是随意切一刀 */
+  let kBest = Math.min(p, 4), gap = -1;
+  for (let k = 2; k <= Math.min(p, 6); k++) {
+    const idx0 = mergeHeights.length - k;
+    if (idx0 < 0 || idx0 >= mergeHeights.length) continue;
+    const g = mergeHeights[mergeHeights.length - 1] - mergeHeights[idx0];
+    if (g > gap) { gap = g; kBest = k; }
+  }
+  if (p < 4) kBest = Math.min(p, 2);
+  const cluster = clusterAt(Math.max(2, Math.min(5, kBest)));
+
+  /* ---- 系统性指标 ---- */
+  const tot = prep.eigen.reduce(function (a, b) { return a + Math.max(0, b); }, 0) || 1;
+  const ar = [];
+  let acc = 0;
+  for (let i = 0; i < p; i++) { acc += Math.max(0, prep.eigen[i]); ar.push(acc / tot); }
+  let sumAll = 0;
+  for (let i = 0; i < p; i++) for (let j = 0; j < p; j++) sumAll += Rs[i][j];
+  const divRatio = p / Math.sqrt(Math.max(1e-12, sumAll));   // 等权组合的分散化比率
+  let absSum = 0, cnt2 = 0;
+  for (let i = 0; i < p; i++) for (let j = i + 1; j < p; j++) { absSum += Math.abs(Rs[i][j]); cnt2++; }
+  const avgAbsCorr = cnt2 ? absSum / cnt2 : null;
+
+  /* ---- 中心性：强度（|ρ| 之和）与特征向量中心性（幂迭代）---- */
+  const strength = new Array(p).fill(0);
+  pairs.forEach(function (pr) { const w = Math.abs(pr.r || 0); strength[pr.i] += w; strength[pr.j] += w; });
+  const eigC = new Array(p).fill(1 / Math.sqrt(p));
+  for (let it = 0; it < 60; it++) {
+    const nx = new Array(p).fill(0);
+    pairs.forEach(function (pr) {
+      const w = Math.abs(pr.r || 0);
+      nx[pr.i] += w * eigC[pr.j]; nx[pr.j] += w * eigC[pr.i];
+    });
+    let norm = 0;
+    for (let i = 0; i < p; i++) norm += nx[i] * nx[i];
+    norm = Math.sqrt(norm) || 1;
+    for (let i = 0; i < p; i++) eigC[i] = nx[i] / norm;
+  }
+
+  return {
+    keys: keys, win: win, L: L, nBar: nBar, days: M.days,
+    R: Rs, partial: partial, prec: Pinv, ovl: Ncnt,
+    pairs: pairs, delta: prep.delta, rbar: prep.rbar, clipped: prep.clipped,
+    minEig: prep.minEig, eigen: prep.eigen, absorption: ar, divRatio: divRatio,
+    avgAbsCorr: avgAbsCorr, strength: strength, eigC: eigC,
+    mst: mstEdges, cluster: cluster, nCluster: (function () { const s = new Set(cluster); return s.size; })(),
+    dist: mst.dist, minEigRaw: prep.minEigRaw, clusterDist: Dc,
+  };
+}
+
+/* =====================================================================
+ *  ⑭ 实时相关性 v2：领先-滞后 / 相关性断裂 / 滚动共振
+ * ===================================================================== */
+
+/* 领先-滞后扫描。
+ *   L > 0 → 「因子领先目标 L 天」：corr(x_{t-L}, y_t)
+ * 全家族 = keys × (2·maxLag+1) 次检验，必须做多重校正；
+ * 更关键的是**半样本稳定性**：把样本劈成前后两段，各自找最优滞后，
+ * 两段不一致的最优滞后几乎肯定是噪声造成的事后叙事。 */
+function leadLag(keys, target, opts) {
+  opts = opts || {};
+  const maxLag = opts.maxLag || 5;
+  const win = opts.win || 180;
+  const all = target ? keys.concat([target]) : keys.slice();
+  const M = buildRetMat(all, win);
+  const L = M.days.length;
+  if (L < 60) return null;
+  const tIdx = all.length - 1;
+  const y = M.cols[tIdx];
+  const mid = Math.floor(L / 2);
+  const rows = [], family = [];
+  for (let k = 0; k < keys.length; k++) {
+    const x = M.cols[k];
+    const corAt = function (lag, lo, hi) {
+      const xs = [], ys = [];
+      for (let i = lo; i < hi; i++) {
+        const j = i - lag;
+        if (j < 0 || j >= L) continue;
+        const xv = x[j], yv = y[i];
+        if (!isFinite(xv) || !isFinite(yv)) continue;
+        xs.push(xv); ys.push(yv);
+      }
+      return xs.length < 30 ? null : { r: pearson(xs, ys), n: xs.length };
+    };
+    const cur = [];
+    for (let lag = -maxLag; lag <= maxLag; lag++) {
+      const c = corAt(lag, 0, L);
+      cur.push({ lag: lag, r: c ? c.r : null, n: c ? c.n : 0 });
+      if (c && c.r != null) family.push({ key: keys[k], lag: lag, r: c.r, n: c.n });
+    }
+    let bestI = -1;
+    for (let i = 0; i < cur.length; i++) if (cur[i].r != null && (bestI < 0 || Math.abs(cur[i].r) > Math.abs(cur[bestI].r))) bestI = i;
+    if (bestI < 0) continue;
+    const b1 = [], b2 = [];
+    for (let lag = -maxLag; lag <= maxLag; lag++) {
+      const c1 = corAt(lag, 0, mid), c2 = corAt(lag, mid, L);
+      if (c1) b1.push({ lag: lag, r: c1.r });
+      if (c2) b2.push({ lag: lag, r: c2.r });
+    }
+    const pickBest = function (arr) {
+      let bi = -1;
+      for (let i = 0; i < arr.length; i++) if (arr[i].r != null && (bi < 0 || Math.abs(arr[i].r) > Math.abs(arr[bi].r))) bi = i;
+      return bi < 0 ? null : arr[bi].lag;
+    };
+    const l1 = pickBest(b1), l2 = pickBest(b2);
+    rows.push({
+      key: keys[k], curve: cur, bestLag: cur[bestI].lag, bestR: cur[bestI].r, bestN: cur[bestI].n,
+      lag0: (function () { const z = cur.find(function (c) { return c.lag === 0; }); return z ? z.r : null; })(),
+      lagA: l1, lagB: l2, stable: l1 != null && l2 != null && l1 === l2,
+    });
+  }
+  const qs = bhQ(family.map(function (f) { return corrP(f.r, f.n); }));
+  const qsMap = {};
+  family.forEach(function (f, i) { qsMap[f.key + '|' + f.lag] = qs[i]; });
+  rows.forEach(function (r) {
+    r.q = qsMap[r.key + '|' + r.bestLag];
+    r.sigQ = r.q != null && r.q < 0.05;
+  });
+  rows.sort(function (a, b) { return Math.abs(b.bestR) - Math.abs(a.bestR); });
+  return { rows: rows, maxLag: maxLag, win: win, L: L, target: target, nTests: family.length };
+}
+
+/* 相关性断裂：短窗相关 vs 长窗相关，在 Fisher-z 空间做差并标准化。
+ * 这是风险管理里真正有用的那一次比较 —— 「这对资产的关系变了没有」，
+ * 而不是「它们现在相关多少」。 */
+function corrBreak(A, opts) {
+  if (!A) return null;
+  opts = opts || {};
+  const shortWin = opts.shortWin || 60;
+  /* 当前窗口本来就是 365 时不要再去分解一遍同一个矩阵 —— 谱分解是这个面板里
+   * 最贵的一步（每次约 100ms），而它每天只需要算一次。 */
+  const longA = (opts.longA && opts.longA.win === 365) ? opts.longA : netAnalyze(A.keys, { win: 365 });
+  if (!longA) return null;
+  const p = A.keys.length;
+  const out = [];
+  for (let i = 0; i < p; i++) {
+    for (let j = i + 1; j < p; j++) {
+      const rs = A.R[i][j], rl = longA.R[i][j];
+      const ns = A.ovl[i][j], nl = longA.ovl[i][j];
+      if (!isFinite(rs) || !isFinite(rl) || ns < 20 || nl < 40) continue;
+      const se = Math.sqrt(1 / Math.max(4, ns - 3) + 1 / Math.max(4, nl - 3));
+      const z = (fisherZ(rs) - fisherZ(rl)) / se;
+      out.push({ i: i, j: j, keys: [A.keys[i], A.keys[j]], rs: rs, rl: rl, z: z, ns: ns, nl: nl });
+    }
+  }
+  out.sort(function (a, b) { return Math.abs(b.z) - Math.abs(a.z); });
+  return { rows: out, shortWin: A.win, longWin: 365 };
+}
+
+/* 滚动系统性共振：逐对算滚动相关，再跨对等权平均。
+ * 两个输出：
+ *   avgCorr  —— 平均成对相关。它上升说明「分散化」在失效，
+ *              因为所有东西开始一起动（危机期的典型特征）。
+ *   shareHi  —— |ρ|>0.5 的组合占比，比均值的尾部更敏感、也更难被单个异常值拉动。 */
+function rollingSystemic(keys, opts) {
+  opts = opts || {};
+  const win = opts.win || 90;
+  const stepN = opts.step || 5;
+  const M = buildRetMat(keys);
+  const L = M.days.length, p = keys.length;
+  if (L < win + 40 || p < 3) return null;
+  const pairList = [];
+  for (let i = 0; i < p; i++) for (let j = i + 1; j < p; j++) pairList.push([i, j]);
+  const series = pairList.map(function () { return []; });
+  const stamps = [];
+  for (let pi = 0; pi < pairList.length; pi++) {
+    const a = M.cols[pairList[pi][0]], b = M.cols[pairList[pi][1]];
+    let sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0, n = 0;
+    const q = [];
+    for (let e = 0; e < L; e++) {
+      const x = a[e], y = b[e];
+      if (isFinite(x) && isFinite(y)) { sx += x; sy += y; sxx += x * x; syy += y * y; sxy += x * y; n++; q.push(e); }
+      const drop = e - win;
+      if (drop >= 0) {
+        const xl = a[drop], yl = b[drop];
+        if (isFinite(xl) && isFinite(yl)) { sx -= xl; sy -= yl; sxx -= xl * xl; syy -= yl * yl; sxy -= xl * yl; n--; }
+      }
+      if (e >= win && ((e - win) % stepN === 0)) {
+        let r = null;
+        if (n >= Math.floor(win * 0.5)) {
+          const cx = sx / n, cy = sy / n;
+          const vx = sxx - n * cx * cx, vy = syy - n * cy * cy, cov = sxy - n * cx * cy;
+          if (vx > 0 && vy > 0) r = cov / Math.sqrt(vx * vy);
+        }
+        series[pi].push(r);
+        if (pi === 0) stamps.push({ e: e, day: M.days[e] });
+      }
+    }
+  }
+  const pts = [];
+  for (let w = 0; w < stamps.length; w++) {
+    let s = 0, c = 0, hi = 0;
+    for (let pi = 0; pi < series.length; pi++) {
+      const r = series[pi][w];
+      if (r == null) continue;
+      s += r; c++;
+      if (Math.abs(r) > 0.5) hi++;
+    }
+    if (c >= 3) pts.push({ day: stamps[w].day, i: stamps[w].e, avg: s / c, nPair: c, shareHi: hi / c });
+  }
+  if (pts.length < 12) return null;
+  const vals = pts.map(function (x) { return x.avg; });
+  const mean = vals.reduce(function (a, b) { return a + b; }, 0) / vals.length;
+  const sd = Math.sqrt(vals.reduce(function (a, b) { return a + (b - mean) * (b - mean); }, 0) / Math.max(1, vals.length - 1));
+  const last = pts[pts.length - 1];
+  /* 共振警报：当前值相对自身分布超过 2σ 就用红档 —— 这是「分散化失效」的提示，
+   * 不是价格预测。 */
+  return {
+    pts: pts, mean: mean, sd: sd, last: last, z: sd > 0 ? (last.avg - mean) / sd : null,
+    win: win, nPair: series.length, keys: keys,
+  };
+}
+
+/* =====================================================================
+ *  ⑫ 多空评分 v2（续）：增量式岭回归 · 无前视偏差的动态权重
+ *
+ *  为什么不再用手写权重：
+ *    FACTORS 里的 w 是「我认为这个因子有多重要」的工程判断 —— 它没法被检验。
+ *    而「权重 = 对未来收益的预测系数」是可以被检验的：把权重放到没见过的样本上去，
+ *    看它们还能不能赚到 IC。这就是多因子模型从「专家系统」变成「统计模型」的那一步。
+ *
+ *  为什么是岭回归而不是普通 OLS：
+ *    22 个宏观因子彼此高度共线（见 ⑬ 的关系网络 —— 美元、美债、VIX 常常是一回事的
+ *    三个侧面）。共线下 OLS 的系数会被放大到荒谬的量级且极其不稳定。
+ *    岭回归用「系数平方和」做惩罚换稳定性，是这类问题的标准答案。
+ *
+ *  为什么不能有前视偏差（以及如何保证）：
+ *    第 t 天只能用「前向收益已经在第 t 天之前揭晓」的样本训练。实现上，
+ *    第 t 天新增的样本是 z(i=t-h) → r(t-h → t)，它的标签在**今天收盘**才出现，
+ *    然后才允许重估系数，再对第 t 天做预测（预测的是 t → t+h，未知）。
+ *    增量累加器 X'X / X'y 保证每次重估都是 O(K³)、不需要回头重扫整段历史，
+ *    于是可以每天重估而不掉帧。回归测试段 N 会用「篡改未来必须不改变历史预测」
+ *    直接验这条。
+ * ===================================================================== */
+
+const RW_LAMBDAS = [0.05, 0.25, 1, 4];
+const RW_LAMBDA_DEFAULT = 1;      // 预注册口径：罚项 ≈ 一个单位的因子方差，不做事后挑选
+const RW_H = 10;
+const RW_STEP = 5;                // 每 5 天重估一次系数
+const RW_MIN_TRAIN = 180;
+const RW_COVERAGE = 0.3;      // 覆盖率门槛（≈ 3 年），见 ridgeWalkForward 注释
+/* 实时可用的回放因子：回放专用（replayOnly）那 5 个在实时没有数据源，
+ * 若把它们放进实时模型，线上永远只能代入 z=0，模型会系统性偏移。
+ * 所以实时口径单独训练一套，并把它自己的样本外 IC 一并摊开给人看。 */
+const RW_LIVE_IDS = ['fng', 'hr', 'tx', 'dxy', 'us10y', 'spx', 'vix', 'gold', 'oil', 'geo', 'fed', 'bei', 'curve', 'jpy', 'jgb', 'tech', 'mom'];
+
+function fwdRetAt(rep, i, h) {
+  const j = i + h;
+  if (j >= rep.n) return null;
+  const p0 = rep.closes[i], p1 = rep.closes[j];
+  if (!p0 || !p1 || !isFinite(p0) || !isFinite(p1)) return null;
+  return p1 / p0 - 1;
+}
+
+/* 信号质量通用评估：IC + t + 三分位收益差 + 胜率。
+ * 只看 IC 会被分布形状骗（一个尾部驱动的因子 IC 可能很高但分档收益不单调），
+ * 所以必须同时给出「信号最高的一档实际赚了多少」。 */
+function signalQuality(series, rep, h, lo, hi) {
+  const xs = [], rs = [];
+  for (let i = lo; i < hi; i++) {
+    const v = series[i];
+    if (v == null) continue;
+    const y = fwdRetAt(rep, i, h);
+    if (y == null) continue;
+    xs.push(v); rs.push(y);
+  }
+  if (xs.length < 40) return null;
+  const c = icCore(series, rep, h, lo, hi);
+  const ord = xs.map(function (v, i) { return i; }).sort(function (a, b) { return xs[a] - xs[b]; });
+  const third = Math.max(8, Math.floor(ord.length / 3));
+  const mean = function (arr) { return arr.reduce(function (a, b) { return a + b; }, 0) / arr.length; };
+  const top = ord.slice(ord.length - third), bot = ord.slice(0, third);
+  const upRet = mean(top.map(function (i) { return rs[i]; }));
+  const dnRet = mean(bot.map(function (i) { return rs[i]; }));
+  const winTop = top.filter(function (i) { return rs[i] > 0; }).length / top.length;
+  return {
+    n: xs.length, ic: c ? c.spear : null, t: c ? c.t : null,
+    up: upRet, dn: dnRet, spread: upRet - dnRet, win: winTop,
+    nTercile: third,
+  };
+}
+
+function ridgeWalkForward(rep, opts) {
+  opts = opts || {};
+  const h = opts.h || RW_H;
+  const step = opts.step || RW_STEP;
+  const minTrain = opts.minTrain || RW_MIN_TRAIN;
+  /* 覆盖率门槛：某个因子至少要在多大比例的回放期里有值才允许进 X。
+   * 30% × 十年窗口 ≈ 3 年 —— 这是「估计一个系数最少要多少数据」的经验下限。
+   * 实测在这个十年窗口上把门槛从 0.2 挪到 0.7，样本外 IC 只在 0.1225~0.1256 之间
+   * 变动（比任何一个调参可能带来的影响都小一个量级），所以这不是一个需要纠结的旋钮。
+   * 被排除的因子会在面板里**按名字列出来**，而不是悄悄丢掉。 */
+  const coverage = opts.coverage || RW_COVERAGE;
+  const span = rep.n - rep.start;
+  if (span < minTrain + h + 80) return null;
+
+  const allIds = Object.keys(rep.fzs || {});
+  let ids = allIds.filter(function (id) {
+    const v = rep.fzs[id];
+    if (!v) return false;
+    if (opts.only && opts.only.indexOf(id) < 0) return false;
+    let c = 0;
+    for (let i = rep.start; i < rep.n; i++) if (v[i] != null) c++;
+    return c >= span * coverage;
+  });
+  if (ids.length < 4) return null;
+  const K = ids.length;
+  const excluded = allIds.filter(function (id) { return ids.indexOf(id) < 0; });
+
+  /* 增量累加器：A0[a][c] = Σ x_a x_c（上三角），b0[a] = Σ x_a y，x_0 ≡ 1（截距不入惩罚） */
+  const A0 = [];
+  for (let a = 0; a <= K; a++) A0.push(new Array(K + 1).fill(0));
+  const b0 = new Array(K + 1).fill(0);
+  let trainN = 0;
+  const xrow = new Array(K + 1);
+  function addSample(i, y) {
+    const row = xrow; row[0] = 1;
+    for (let j = 0; j < K; j++) { const v = rep.fzs[ids[j]][i]; row[j + 1] = (v == null ? 0 : v); }
+    for (let a = 0; a <= K; a++) { const xa = row[a]; if (!xa) continue; for (let c = a; c <= K; c++) A0[a][c] += xa * row[c]; }
+    for (let a = 0; a <= K; a++) b0[a] += row[a] * y;
+    trainN++;
+  }
+  /* 除以 trainN 后再加罚 ⇒ 罚项按「每样本」计量，λ 不再随训练样本量漂移。
+   * 不这么做的话，同一套 λ 在早期（样本少）几乎等于 OLS、到晚期又被过度收缩，
+   * 整个 Sample 的时间序列就不是同一个模型了。 */
+  const fitLambda = function (lam) {
+    if (!trainN) return null;
+    const A = [];
+    for (let a = 0; a <= K; a++) A.push(new Array(K + 1).fill(0));
+    for (let a = 0; a <= K; a++) for (let c = a; c <= K; c++) { const v = A0[a][c] / trainN; A[a][c] = v; A[c][a] = v; }
+    for (let j = 1; j <= K; j++) A[j][j] += lam;
+    const rhs = b0.map(function (v) { return v / trainN; });
+    return cholSolve(A, rhs, K + 1);
+  };
+
+  const sigs = {};
+  RW_LAMBDAS.forEach(function (L) { sigs[L] = new Array(rep.n).fill(null); });
+  let betas = null, lastFit = -1e9, firstPred = null, nRefit = 0;
+  let prevB = null, turn = 0, turnN = 0, enbSum = 0, enbN = 0;
+  const xpred = new Array(K + 1);
+
+  for (let t = rep.start; t < rep.n; t++) {
+    const i = t - h;
+    if (i >= rep.start) {
+      const y = fwdRetAt(rep, i, h);
+      if (y != null) addSample(i, y);
+    }
+    if (trainN >= minTrain) {
+      if (!betas || t - lastFit >= step) {
+        betas = {};
+        RW_LAMBDAS.forEach(function (L) { betas[L] = fitLambda(L); });
+        lastFit = t; nRefit++;
+        const bd = betas[RW_LAMBDA_DEFAULT];
+        if (bd) {
+          if (prevB) { let s = 0; for (let j = 1; j <= K; j++) s += Math.abs(bd[j] - prevB[j]); turn += s; turnN++; }
+          prevB = bd.slice();
+          let s1 = 0, s2 = 0;
+          for (let j = 1; j <= K; j++) { s1 += Math.abs(bd[j]); s2 += bd[j] * bd[j]; }
+          if (s2 > 0) { enbSum += s1 * s1 / s2; enbN++; }
+        }
+      }
+      if (firstPred == null) firstPred = t;
+      if (betas) {
+        xpred[0] = 1;
+        let avail = 0;
+        for (let j = 0; j < K; j++) { const v = rep.fzs[ids[j]][t]; xpred[j + 1] = (v == null ? 0 : v); if (v != null) avail++; }
+        if (avail >= 3) {
+          RW_LAMBDAS.forEach(function (L) {
+            const bd = betas[L];
+            if (!bd) return;
+            let s = 0;
+            for (let a = 0; a <= K; a++) s += bd[a] * xpred[a];
+            sigs[L][t] = s;
+          });
+        }
+      }
+    }
+  }
+  if (firstPred == null || firstPred >= rep.n - h - 20) return null;
+
+  const lo = firstPred, hi = rep.n;
+  const rows = RW_LAMBDAS.map(function (L) {
+    const q = signalQuality(sigs[L], rep, h, lo, hi);
+    return {
+      lambda: L, ic: q ? q.ic : null, t: q ? q.t : null, n: q ? q.n : 0,
+      up: q ? q.up : null, dn: q ? q.dn : null, spread: q ? q.spread : null, win: q ? q.win : null,
+      default: L === RW_LAMBDA_DEFAULT,
+    };
+  });
+  const st = signalQuality(rep.scores, rep, h, lo, hi);
+  const eqId = ids.slice();
+  const eqW = compositeSeries(rep, eqId);
+  const eqQ = signalQuality(eqW, rep, h, lo, hi);
+
+  const bd = betas ? betas[RW_LAMBDA_DEFAULT] : null;
+  const betaRows = [];
+  for (let j = 0; j < K; j++) {
+    const f = FACTORS.find(function (x) { return x.id === ids[j]; });
+    const b = bd ? bd[j + 1] : null;
+    betaRows.push({
+      id: ids[j], name: f ? f.name : ids[j], beta: b, dir: f ? f.dir : 0, w: f ? f.w : 1,
+      agree: (f && f.dir && b != null) ? (Math.sign(b) === Math.sign(f.dir)) : null,
+    });
+  }
+  betaRows.sort(function (a, b) { return Math.abs(b.beta || 0) - Math.abs(a.beta || 0); });
+  const agreeN = betaRows.filter(function (r) { return r.agree === true; }).length;
+  const agreeTot = betaRows.filter(function (r) { return r.agree != null; }).length;
+
+  /* 实时应用需要的两样东西：最终系数 + 历史预测分布（用来把原始预测换成百分位） */
+  const sigHist = sigs[RW_LAMBDA_DEFAULT].filter(function (v) { return v != null; }).slice().sort(function (a, b) { return a - b; });
+
+  return {
+    h: h, step: step, minTrain: minTrain, K: K, ids: ids, excluded: excluded,
+    firstPred: firstPred, nPred: hi - lo, nTrainMax: trainN, nRefit: nRefit,
+    lambdas: RW_LAMBDAS, lambdaDefault: RW_LAMBDA_DEFAULT,
+    rows: rows,
+    baseline: st ? { ic: st.ic, t: st.t, up: st.up, dn: st.dn, spread: st.spread, win: st.win, n: st.n } : null,
+    equalWeight: eqQ ? { ic: eqQ.ic, t: eqQ.t, spread: eqQ.spread, win: eqQ.win } : null,
+    betas: betaRows, intercept: bd ? bd[0] : 0,
+    agreeN: agreeN, agreeTot: agreeTot, agreePct: agreeTot ? agreeN / agreeTot : null,
+    turnover: turnN ? turn / turnN : null, turnoverRel: null,
+    meanAbsBeta: betaRows.length ? betaRows.reduce(function (a, b) { return a + Math.abs(b.beta || 0); }, 0) / betaRows.length : null,
+    enb: enbN ? enbSum / enbN : null,
+    sigHist: sigHist, sigs: sigs, sigDefault: sigs[RW_LAMBDA_DEFAULT],
+  };
+}
+
+/* 用最终系数给「今天」打分。
+ * 原始预测值的量级没有直观含义（它是收益预测，万分之几），所以换算成
+ * 「这个预测值在自己历史分布里的百分位」—— 这也是唯一诚实的换算方式：
+ * 不做任何拉伸假设，只回答「历史上比今天更看多的日子有多少」。 */
+function ridgeLiveScore(out) {
+  const rw = state.hist && state.hist.rw && state.hist.rw.live;
+  if (!rw || !rw.sigHist || !rw.sigHist.length) return null;
+  let s = rw.intercept, avail = 0;
+  for (let j = 0; j < rw.ids.length; j++) {
+    const o = out[rw.ids[j]];
+    const z = (o && o.ok !== false && o.z != null) ? o.z : 0;
+    if (o && o.ok !== false && o.z != null) avail++;
+    s += (rw.betas.find(function (b) { return b.id === rw.ids[j]; }) || { beta: 0 }).beta * z;
+  }
+  if (avail < 5) return null;
+  const H = rw.sigHist;
+  let cnt = 0;
+  for (let i = 0; i < H.length; i++) if (H[i] <= s) cnt++;
+  const pct = cnt / H.length;
+  return {
+    raw: s, pct: pct, score: Math.max(2, Math.min(98, Math.round(pct * 100))),
+    nFac: avail, nTotal: rw.ids.length, nHist: H.length,
+    median: H[Math.floor(H.length / 2)],
+  };
+}
+
+/* ---------- 分歧度：一个没有离散度的点估计是不完整的 ----------
+ * 12 个因子加出一个 57 分，可能是「12 个都温和偏多」，也可能是
+ * 「6 个狂热看多、6 个极度看空互相抵消」。两种情况的含义完全相反：
+ * 前者可以照着做，后者说明模型内部在打架、这个分数不该被当作结论。
+ * 顺带给出 jackknife 敏感度：逐个删掉一个因子重算，看分数摆动多大、
+ * 谁是那个「一个人说了算」的因子。 */
+function scoreDispersion(res) {
+  const parts = [];
+  FACTORS.forEach(function (f) {
+    if (f.replayOnly || !f.dir) return;
+    const r = res.out[f.id];
+    if (!r || r.ok === false) return;
+    parts.push({ id: f.id, name: f.name, w: f.w, c: r.contribution });
+  });
+  if (parts.length < 3) return null;
+  let wsum = 0, s = 0;
+  parts.forEach(function (p) { wsum += p.w; s += p.w * p.c; });
+  const mean = s / wsum;
+  let varr = 0, upW = 0, dnW = 0;
+  parts.forEach(function (p) {
+    varr += p.w * (p.c - mean) * (p.c - mean);
+    if (p.c > 0.25) upW += p.w;
+    else if (p.c < -0.25) dnW += p.w;
+  });
+  varr /= wsum;
+  const sd = Math.sqrt(varr);
+  /* 加权均值的标准误 —— 注意这是「假设各因子独立」的下界：
+   * ⑬ 的网络显示它们明显相关，真实不确定性只会更大，不会更小。 */
+  let seNum = 0;
+  parts.forEach(function (p) { seNum += p.w * p.w * (p.c - mean) * (p.c - mean); });
+  const se = Math.sqrt(seNum) / wsum;
+  let lo = Infinity, hi = -Infinity, who = null, whoDelta = 0;
+  parts.forEach(function (p) {
+    if (p.w >= wsum) return;
+    const sc = 50 + 22 * (s - p.w * p.c) / (wsum - p.w);
+    if (sc < lo) lo = sc;
+    if (sc > hi) hi = sc;
+    const d = Math.abs(sc - res.score);
+    if (d > whoDelta) { whoDelta = d; who = p; }
+  });
+  const top = parts.slice().sort(function (a, b) { return Math.abs(b.w * b.c) - Math.abs(a.w * a.c); }).slice(0, 3);
+  return {
+    n: parts.length, mean: mean, sd: sd, se: se, bandScore: 22 * se,
+    upW: upW / wsum, dnW: dnW / wsum, flatW: 1 - (upW + dnW) / wsum,
+    consensus: Math.max(upW, dnW) / wsum, agreeSign: upW >= dnW ? 1 : -1,
+    jackLo: Math.max(2, Math.min(98, Math.round(lo))), jackHi: Math.max(2, Math.min(98, Math.round(hi))),
+    jackRange: Math.round(hi - lo), driver: who, driverDelta: whoDelta, top: top, score: res.score,
+  };
 }

@@ -229,6 +229,16 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
 .extsub-factors{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
 .extsub-factors .esf{font-size:9.5px;font-family:"JetBrains Mono",monospace;padding:2px 7px;border-radius:7px;background:rgba(255,255,255,.04)}
 .extsub-factors .esf.up{color:var(--green)}.extsub-factors .esf.dn{color:var(--red)}.extsub-factors .esf.n{color:var(--dim)}
+
+.sub2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+@media (max-width:920px){.sub2{grid-template-columns:1fr}}
+.netopts{display:flex;align-items:center;gap:6px;padding:9px 14px;border-bottom:1px solid var(--border);flex-wrap:wrap}
+.netopts .sep{width:1px;height:14px;background:var(--border);margin:0 3px}
+.ttab{background:var(--bg);border:1px solid var(--border);color:var(--dim);font-size:9px;font-family:'JetBrains Mono',monospace;padding:3px 8px;border-radius:5px;cursor:pointer;letter-spacing:.3px}
+.ttab:hover{color:var(--text2);border-color:#1e3355}
+.ttab.on{background:rgba(0,180,255,.12);color:var(--blue);border-color:rgba(0,180,255,.3)}
+.nopt-note{font-size:8.5px;color:var(--dim);margin-left:auto;line-height:1.5}
+.netstats{display:flex;flex-wrap:wrap;gap:6px;padding:9px 14px 2px}
 </style>
 </head>
 <body>
@@ -300,6 +310,10 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
       </div>
       <div class="fnote">每个因子先算 z（相对自身历史的偏离），再乘方向 dir 得到多空贡献：<b style="color:var(--green)">绿=利多</b> · <b style="color:var(--red)">红=利空</b> · 灰「仅展示」不参与评分。悬停卡片可看权重与原始 z。</div>
       <div id="factorGrid" class="fgrid"></div>
+      <div class="sub2" style="margin-top:2px">
+        <div class="extsub" id="dispBox"></div>
+        <div class="extsub" id="ridgeBox"></div>
+      </div>
       <div class="extsub" id="extSubBox">
         <div class="extsub-h"><span class="fttl">极端体制子评分</span><span id="extSubState" class="hint">休眠</span></div>
         <div class="extsub-row"><span class="fscore-l" id="extSubScore">—</span><span class="extsub-lbl">算力 · 黄金 · 原油（仅极端波动时启用）</span></div>
@@ -320,6 +334,9 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
     <div class="hgrid">
       <div class="hbox"><div class="fttl" style="margin-bottom:7px">合成分数 IC 检验 · 评分 vs 未来收益</div><div id="icTable"></div></div>
       <div class="hbox" id="histBars"></div>
+    </div>
+    <div class="hgrid">
+      <div class="hbox" id="rwBox" style="grid-column:1/-1"></div>
     </div>
     <div class="hgrid">
       <div class="hbox" style="grid-column:1/-1">
@@ -360,13 +377,38 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
   </div>
 
   <div class="panel">
-    <div class="phdr"><span class="icon">🕸</span><span class="lbl">因子关系网络 · 实时相关性</span><span id="netCount" class="hint">—</span></div>
+    <div class="phdr"><span class="icon">🕸</span><span class="lbl">因子关系网络 · 实时相关性 v2</span><span id="netCount" class="hint">—</span><span class="hint">PSD 修正 · BH-FDR · MST / 偏相关</span></div>
+    <div class="netopts">
+      <span class="fttl">形态</span>
+      <button class="ttab on" data-g="mode" data-v="mst">最小生成树</button>
+      <button class="ttab" data-g="mode" data-v="sig">显著网络</button>
+      <span class="sep"></span>
+      <span class="fttl">关系</span>
+      <button class="ttab on" data-g="rel" data-v="corr">总相关</button>
+      <button class="ttab" data-g="rel" data-v="part">偏相关</button>
+      <span class="sep"></span>
+      <span class="fttl">窗口</span>
+      <button class="ttab" data-g="win" data-v="60">60日</button>
+      <button class="ttab on" data-g="win" data-v="120">120日</button>
+      <button class="ttab" data-g="win" data-v="365">365日</button>
+      <span class="nopt-note">连边与否由 BH-FDR 判定（不再是 |r| 阈值）· 虚线=负相关 · 线宽=|ρ| · 节点大小=强度 · 描边颜色=数据驱动分簇</span>
+    </div>
+    <div id="netStats" class="netstats"></div>
     <div class="net-wrap">
       <div class="chart-wrap" style="padding:8px"><canvas id="netCanvas"></canvas></div>
       <div class="heat">
-        <div class="fttl" style="margin-bottom:8px">相关性矩阵 (Pearson r)</div>
+        <div class="fttl" style="margin-bottom:6px">⑬ 关系矩阵 <span id="heatTip" class="hint" style="display:block;line-height:1.6;font-size:8.5px"></span></div>
         <div id="heatmap" class="heat-grid"></div>
       </div>
+    </div>
+    <div class="hgrid" style="padding-top:12px">
+      <div class="hbox"><div class="fttl" style="margin-bottom:7px">⑭ 领先-滞后扫描（相对 BTC）</div><div id="leadLagBox"></div></div>
+      <div class="hbox"><div class="fttl" style="margin-bottom:7px">⑮ 相关性突变监控</div><div id="corrBreakBox"></div></div>
+    </div>
+    <div class="hbox" style="margin:0 14px 12px">
+      <div class="fttl" style="margin-bottom:7px">⑯ 滚动系统性共振 · 平均成对相关（90 日窗）</div>
+      <div class="chart-wrap" style="padding:0"><canvas id="corrCanvas"></canvas></div>
+      <div id="corrNote" class="rg-sub" style="border-top:none;margin-top:2px;padding-top:6px"></div>
     </div>
   </div>
 

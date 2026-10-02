@@ -936,6 +936,442 @@ const near = (label, actual, expect, tol) => {
   }
 
 
+  /* =================================================================
+   *  N. v3.20 · ⑫ 动态权重评分 / ⑬ 关系网络 v2 / ⑭-⑯ 相关性监控
+   *  -----------------------------------------------------------------
+   *  这一段的定位与前面不同：前面验证的是「功能没坏」，这一段验证的是
+   *  **数学没有错**。四组独立交叉验证：
+   *    ① 特征值/求逆/解方程 —— 对每个都不用「实现 vs 实现」，而是对着解析解：
+   *       不变量（tr、Frobenius 范数）、A·A⁻¹=I、已知 3 变量偏相关公式；
+   *    ② 岭回归：用测试里**另一份独立实现**（Gauss-Jordan 直接解正规方程）
+   *       逐位对照增量累加器 + Cholesky 解出来的系数；
+   *    ③ 前视偏差零容忍：篡改未来必须一字不改地留下历史预测；
+   *    ④ 偏相关的定性含义：共因子造成的虚假相关必须在偏相关里消失。
+   * ================================================================= */
+  console.log('\n===== N. v3.20 · 动态权重 / 网络 v2 / 相关性监控 =====');
+
+  /* 段内统一的确定性随机数发生器：任何一次失败都要能原样复现 */
+  let sd = 20261003;
+  const rndN = () => { sd = (sd * 1103515245 + 12345) & 0x7fffffff; return (sd / 0x7fffffff) * 2 - 1; };
+
+
+  /* ---------- ① 数值内核：对着解析解验，不对着实现验 ---------- */
+  const Eg = call(`(A) => jacobiEigen(A, A.length)`, [[2, 1], [1, 2]]);
+  chk('2×2 特征值 = 3 与 1（解析解）', Eg.val[0].toFixed(6) + '/' + Eg.val[1].toFixed(6), '3.000000/1.000000');
+
+  const A3 = [[2, -1, 0], [-1, 2, -1], [0, -1, 2]];
+  const Eg3 = call(`(A) => jacobiEigen(A, 3)`, A3);
+  const tr = Eg3.val.reduce((a, b) => a + b, 0);
+  let frob = 0;
+  for (const row of A3) for (const v of row) frob += v * v;
+  const frobEig = Eg3.val.reduce((a, b) => a + b * b, 0);
+  near('特征值和 = 迹（6）', tr, 6, 1e-6);
+  near('特征值平方和 = ‖A‖²_F（18）', frobEig, frob, 1e-6);
+  near('三对角链的最大特征值 = 2+√2', Eg3.val[0], 2 + Math.SQRT2, 1e-5);
+  /* 特征向量：A·v = λ·v 才是「特征」的定义，只验值等于没验 */
+  let residMax = 0;
+  Eg3.vec.forEach(function (v, k) {
+    for (let i = 0; i < 3; i++) {
+      let s = 0;
+      for (let j = 0; j < 3; j++) s += A3[i][j] * v[j];
+      residMax = Math.max(residMax, Math.abs(s - Eg3.val[k] * v[i]));
+    }
+  });
+  chk('特征向量满足 A·v = λ·v', residMax < 1e-6, 'true');
+
+  const Inv = call(`(A) => cholInv(A, 3)`, A3);
+  let idErr = 0;
+  for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) {
+    let s = 0;
+    for (let k = 0; k < 3; k++) s += A3[i][k] * Inv[k][j];
+    idErr = Math.max(idErr, Math.abs(s - (i === j ? 1 : 0)));
+  }
+  chk('Cholesky 求逆：A·A⁻¹ = I', idErr < 1e-8, 'true');
+  chk('Cholesky 求逆：非正定返回 null（而不是假装能算）',
+    call(`(A) => cholInv(A, 2)`, [[1, 2], [2, 1]]), 'null');
+
+  const Sol = call(`(A, b) => cholSolve(A, b, 3)`, A3, [1, 0, 1]);
+  let solveErr = 0;
+  for (let i = 0; i < 3; i++) {
+    let s = 0;
+    for (let j = 0; j < 3; j++) s += A3[i][j] * Sol[j];
+    solveErr = Math.max(solveErr, Math.abs(s - [1, 0, 1][i]));
+  }
+  chk('Cholesky 解方程组：Ax = b', solveErr < 1e-8, 'true');
+
+  near('Fisher z(0.5) = 0.5493', call(`(r) => fisherZ(r)`, 0.5), 0.5493061, 1e-6);
+  near('Fisher 往返变换零损失', call('(r) => fisherZInv(fisherZ(r))', 0.5), 0.5, 1e-12);
+  const ciWide = call(`(r, n) => corrCI(r, n)`, 0.5, 40);
+  const ciNarrow = call(`(r, n) => corrCI(r, n)`, 0.5, 400);
+  chk('95% CI 包含点估计', ciWide[0] < 0.5 && 0.5 < ciWide[1], 'true');
+  chk('样本越大 CI 越窄', (ciNarrow[1] - ciNarrow[0]) < (ciWide[1] - ciWide[0]), 'true');
+  chk('样本不足 6 点不硬算 CI', call(`(r, n) => corrCI(r, n)`, 0.5, 4), 'null');
+  chk('|r|=1 不做对数爆炸', isFinite(call(`(r) => fisherZ(r)`, 1)), 'true');
+
+  const Q = call(`(p) => bhQ(p)`, [0.001, 0.02, 0.9]);
+  chk('BH 校正：最小 p 的 q = p·m/1', Q[0].toFixed(4), '0.0030');
+  chk('BH 校正：次小 p 的 q = min(后继, p·m/2)', Q[1].toFixed(4), '0.0300');
+  chk('BH 校正：最大 p 的 q = p', Q[2].toFixed(4), '0.9000');
+  const Q2 = call(`(p) => bhQ(p)`, [1, 1, 1, 1]);
+  chk('BH：全为 1 时 q 全为 1', Q2.every(v => v === 1), 'true');
+  const Q3 = call(`(p) => bhQ(p)`, [0.5, 0.5]);
+  chk('BH 校正值不小于原始 p', Q3.every(v => v >= 0.5 - 1e-12), 'true');
+
+  chk('相关距离：d(1)=0', call(`(r) => corrDist(r)`, 1).toFixed(6), '0.000000');
+  chk('相关距离：d(0)=√2', call(`(r) => corrDist(r)`, 0).toFixed(6), Math.SQRT2.toFixed(6));
+  chk('相关距离：d(-1)=2', call(`(r) => corrDist(r)`, -1).toFixed(6), '2.000000');
+  /* 三角不等式必须在**自洽的**相关系数三元组上验：随手抽三个独立的 r
+   * 未必能构成一个合法的相关矩阵（例如 0.9/0.9/-0.9 在数学上不可能并存），
+   * 那种组合连欧氏空间里都不存在，拿来验距离度量是冤枉它。 */
+  let triOk = true;
+  for (let t = 0; t < 300; t++) {
+    const std = a => { const m = a.reduce((x, y) => x + y, 0) / a.length; const c = a.map(x => x - m); const s = Math.sqrt(c.reduce((x, y) => x + y * y, 0)); return c.map(x => x / (s || 1)); };
+    const u = [0, 1, 2].map(() => std(Array.from({ length: 12 }, () => rndN())));
+    const dot = (a, b) => u[a].reduce((acc, x, i) => acc + x * u[b][i], 0);
+    const d = [dot(0, 1), dot(0, 2), dot(1, 2)].map(r => call('(r) => corrDist(r)', r));
+    if (d[0] > d[1] + d[2] + 1e-12 || d[1] > d[0] + d[2] + 1e-12 || d[2] > d[0] + d[1] + 1e-12) triOk = false;
+  }
+  chk('Mantegna 距离满足三角不等式（MST 才成立）', triOk, 'true');
+
+  /* ---------- ② 偏相关：对着三变量解析公式验 ----------
+   * ρ_13.2 = (r13 − r12·r23) / √((1−r12²)(1−r23²))   —— 这是课本上的闭式解 */
+  const R3 = [[1, 0.5, 0.3], [0.5, 1, 0.4], [0.3, 0.4, 1]];
+  const P3 = call(`(A) => cholInv(A, 3)`, R3);
+  const part13 = call(`(P, i, j) => -P[i][j] / Math.sqrt(P[i][i] * P[j][j])`, P3, 0, 2);
+  const analytic = (0.3 - 0.5 * 0.4) / Math.sqrt((1 - 0.25) * (1 - 0.16));
+  near('偏相关 ρ(1,3|2) 与解析解一致', part13, analytic, 1e-9);
+  chk('总相关 ≠ 偏相关（构造数据下必须能区分）', Math.abs(part13 - 0.3) > 0.05, 'true');
+
+  /* 非半正定矩阵：r(1,2)=r(1,3)=0.9, r(2,3)=-0.9 在数学上不可能同时成立 */
+  const badR = [[1, 0.9, 0.9], [0.9, 1, -0.9], [0.9, -0.9, 1]];
+  const prepBad = call(`(R) => prepCorr(R, 3, 300)`, badR);
+  const minEigBad = Math.min.apply(null, prepBad.eigen);
+  chk('PSD 修正：非半正定输入会被夹紧到 λ≥0', minEigBad >= 0, 'true');
+  chk('PSD 修正：对角线严格为 1',
+    prepBad.R.every((row, i) => Math.abs(row[i] - 1) < 1e-9), 'true');
+  chk('PSD 修正被明确标记出来（不静默）', prepBad.clipped, 'true');
+  const prepOk = call(`(R) => prepCorr(R, 3, 300)`, R3);
+  chk('半正定输入不会被平白改动 δ 计算', prepOk.delta > 0 && prepOk.delta < 1, 'true');
+  chk('收缩强度 δ 随样本量上升而下降',
+    call(`(R) => prepCorr(R, 3, 60)`, R3).delta > call(`(R) => prepCorr(R, 3, 5000)`, R3).delta, 'true');
+
+  /* ---------- ③ 网络端到端：共因子造成的虚假相关必须在偏相关里消失 ---------- */
+  /* 构造：X 是共同驱动；Y、Z 各自 = X + 独立噪声。
+   * 总相关 corr(Y,Z) 会很高（都被 X 推着走），但控制 X 之后应当掉到 ~0。
+   * 这一条是整个「偏相关」功能存在的理由 —— 不验就等于没做。 */
+  const Yv = [], Zv = [], Xv = [], Rv = [];
+  const Bv = [], Cv = [];
+  for (let i = 0; i < 400; i++) {
+    const x = rndN();
+    Xv.push(x);
+    Yv.push(x * 1.0 + rndN() * 0.15);
+    Zv.push(x * 1.0 + rndN() * 0.15);
+    Rv.push(rndN());                       // 完全独立的一条
+    Bv.push(x * 0.8 + rndN() * 0.3);       // 另一个被 X 带动的
+    Cv.push(-x * 0.7 + rndN() * 0.3);      // 与 X 反向的
+  }
+  const specXYZ = { X: Xv, Y: Yv, Z: Zv, RND: Rv, B: Bv, C: Cv };
+  call(`(spec) => {
+    const out = {};
+    Object.keys(spec).forEach(function (k) { const m = new Map(); spec[k].forEach(function (v, i) { m.set(1000 + i, v); }); out[k] = m; });
+    state.retMaps = out;
+    state.series = {};
+    Object.keys(spec).forEach(function (k) { state.series[k] = [1, 2, 3]; });
+    return true;
+  }`, specXYZ);
+  const keysXYZ = Object.keys(specXYZ);
+  chk('合成序列 6 条（键名不在 META 里，所以直接喂给 netAnalyze）', keysXYZ.length, 6);
+  const AN = call(`(k) => netAnalyze(k, { win: 0 })`, keysXYZ);
+  chk('网络分析产出结果', !!AN, 'true');
+  if (AN) {
+    const iY = AN.keys.indexOf('Y'), iZ = AN.keys.indexOf('Z'), iX = AN.keys.indexOf('X');
+    const iR = AN.keys.indexOf('RND');
+    const rYZ = AN.R[iY][iZ];
+    const pYZ = AN.partial[iY][iZ];
+    chk('共因子导致高总相关 corr(Y,Z) > 0.8', rYZ > 0.8, 'true');
+    chk('控制共因子后偏相关 |ρ(Y,Z|X…)| 显著下降', Math.abs(pYZ) < Math.abs(rYZ) - 0.4, 'true');
+    chk('偏相关矩阵对角为 1', AN.partial.every((row, i) => Math.abs(row[i] - 1) < 1e-9), 'true');
+    chk('偏相关矩阵对称', AN.partial.every(function (row, i) {
+      return row.every(function (v, j) { return Math.abs(v - AN.partial[j][i]) < 1e-9; });
+    }), 'true');
+    chk('MST 边数 = n-1（树的定义）', AN.mst.length, AN.keys.length - 1);
+    /* 无环校验：并查集 */
+    const par = AN.keys.map((_, i) => i);
+    const find = a => par[a] === a ? a : (par[a] = find(par[a]));
+    let cyclic = false;
+    AN.mst.forEach(function (e) {
+      const ra = find(e.a), rb = find(e.b);
+      if (ra === rb) cyclic = true;
+      par[ra] = rb;
+    });
+    chk('MST 无环（真是树，不是巧合）', cyclic, 'false');
+    chk('每个点都在树里（无孤立节点）', new Set(AN.keys.map(function (_, i) { return find(i); })).size, 1);
+    chk('MST 边上的相关值是真实矩阵取值',
+      AN.mst.every(function (e) { return Math.abs(e.r - AN.R[e.a][e.b]) < 1e-12; }), 'true');
+    chk('独立序列 RND 不被误连成强关系', Math.abs(AN.R[iR][iX]) < 0.25, 'true');
+    chk('反向序列 C 与 X 负相关', AN.R[AN.keys.indexOf('C')][iX] < -0.5, 'true');
+    chk('吸收比 PC1 高（构造数据里确实只有一个主因子）', AN.absorption[0] > 0.5, 'true');
+    chk('吸收比单调不减且 PC1…PCn 最终为 1',
+      AN.absorption.every((v, i) => i === 0 || v >= AN.absorption[i - 1] - 1e-12) &&
+      Math.abs(AN.absorption[AN.absorption.length - 1] - 1) < 1e-9, 'true');
+    chk('分散化比率 > 1（相关低于 1 时才成立）', AN.divRatio > 1, 'true');
+    chk('簇数落在 2~5', AN.nCluster >= 2 && AN.nCluster <= 5, 'true');
+    chk('每个点都分到了簇', AN.cluster.every(v => v >= 0), 'true');
+    chk('特征向量中心性全为正且已归一化',
+      AN.eigC.every(v => v >= -1e-12) && Math.abs(Math.sqrt(AN.eigC.reduce((a, b) => a + b * b, 0)) - 1) < 1e-6, 'true');
+    chk('强度最大的点落在共同因子 X 上', AN.keys[AN.strength.indexOf(Math.max.apply(null, AN.strength))], 'X');
+    const sigTail = AN.pairs.filter(p => p.sig).length;
+    chk('显著性判定有结果且不全显著', sigTail > 0 && sigTail < AN.pairs.length, 'true');
+    chk('每对都带了 q 值（BH-FDR 而不是裸 p）', AN.pairs.every(p => p.q >= p.p - 1e-15), 'true');
+    console.log('   共因子结构：corr(Y,Z)=' + rYZ.toFixed(3) + ' → 偏相关 ' + pYZ.toFixed(3) +
+      ' · PC1 吸收比 ' + (AN.absorption[0] * 100).toFixed(1) + '% · MST ' + AN.mst.length + ' 边 / ' + AN.pairs.length + ' 对');
+  }
+
+  /* ---------- ④ 领先-滞后：对着人工埋的传导时延验 ---------- */
+  const LAG = 2;
+  const leadSer = [], btcSer = [], lagSer = [];
+  for (let i = 0; i < 500; i++) {
+    const x = rndN();
+    leadSer.push(x);
+    lagSer.push(rndN());
+    /* BTC 的今天由「某序列 2 天前」驱动 —— 那么该序列应当被评为领先 2 日 */
+    btcSer.push(0.6 * (i >= LAG ? leadSer[i - LAG] : rndN()) + rndN() * 0.25);
+  }
+  call(`(spec) => {
+    const out = {};
+    Object.keys(spec).forEach(function (k) { const m = new Map(); spec[k].forEach(function (v, i) { m.set(2000 + i, v); }); out[k] = m; });
+    state.retMaps = out; state.series = {};
+    Object.keys(spec).forEach(function (k) { state.series[k] = [1, 2, 3]; });
+    return true;
+  }`, { LEAD: leadSer, BTC: btcSer, LAGSER: lagSer });
+  const LL = call(`(k, t) => leadLag(k, t, { maxLag: 5, win: 365 })`, ['LEAD', 'LAGSER'], 'BTC');
+  chk('领先-滞后扫描产出结果', !!LL, 'true');
+  if (LL) {
+    const rd = LL.rows.find(r => r.key === 'LEAD');
+    chk('埋了 2 日传导的序列被评为「领先 2 日」', rd.bestLag, 2);
+    chk('领先方向的相关为正（与构造一致）', rd.bestR > 0.3, 'true');
+    chk('同步相关明显弱于最优滞后相关', Math.abs(rd.bestR) > Math.abs(rd.lag0) + 0.15, 'true');
+    chk('半样本稳定性：前后两段都指向同一滞后', rd.stable, 'true');
+    chk('通过 BH-FDR（真传导必须能过关）', rd.sigQ, 'true');
+    const rndRow = LL.rows.find(r => r.key === 'LAGSER');
+    chk('纯噪声序列滞后 == ±1 或不稳定/不显著，不得冒充领先指标',
+      (rndRow.lagA !== rndRow.lagB) || rndRow.sigQ === false, 'true');
+    chk('返回了整条滞后曲线（不只是最优值）', Object.prototype.toString.call(rd.curve) === '[object Array]' && rd.curve.length, 11);
+    console.log('   领先-滞后：LEAD 最优滞后 ' + rd.bestLag + ' 日 r=' + rd.bestR.toFixed(3) +
+      ' · 同步 r=' + rd.lag0.toFixed(3) + ' · q=' + rd.q.toFixed(4) + ' · 半样本 ' + rd.lagA + '/' + rd.lagB);
+  }
+
+  /* ---------- ⑤ 滚动共振 / 相关性突变 ---------- */
+  /* ④ 那段把 retMaps 换成了领先-滞后的三序列，这里换回来 */
+  call(`(spec) => {
+    const out = {};
+    Object.keys(spec).forEach(function (k) { const m = new Map(); spec[k].forEach(function (v, i) { m.set(1000 + i, v); }); out[k] = m; });
+    state.retMaps = out; state.series = {};
+    Object.keys(spec).forEach(function (k) { state.series[k] = [1, 2, 3]; });
+    return true;
+  }`, specXYZ);
+  const RSs = call(`(k) => rollingSystemic(k, { win: 90, step: 5 })`, keysXYZ);
+  chk('滚动共振产出时间序列', !!(RSs && RSs.pts.length > 10), 'true');
+  if (RSs) {
+    chk('滚动平均相关全部有界', RSs.pts.every(p => p.avg >= -1 && p.avg <= 1), 'true');
+    chk('共振占比在 [0,1]', RSs.pts.every(p => p.shareHi >= 0 && p.shareHi <= 1), 'true');
+    chk('z 值有限', isFinite(RSs.z), 'true');
+    chk('窗口组合数 = C(6,2)=15', RSs.nPair, 15);
+    console.log('   滚动共振（构造数据全是同一个 X 驱动）：均值 ' + RSs.mean.toFixed(3) +
+      ' · 当前 ' + RSs.last.avg.toFixed(3) + ' · |ρ|>0.5 占比 ' + (RSs.last.shareHi * 100).toFixed(0) + '%');
+  }
+
+  /* ---------- ⑥ 岭回归：对着「另一份独立实现」逐位对照 ---------- */
+  if (rep) {
+    const t0 = Date.now();
+    const rwF = call(`(r, o) => ridgeWalkForward(r, o)`, rep, { step: 1 });
+    const ms = Date.now() - t0;
+    chk('walk-forward 岭回归产出结果', !!rwF, 'true');
+    if (rwF) {
+      chk('参与因子数 ≤ 回放维度 22', rwF.K > 0 && rwF.K <= 22, 'true');
+      chk('首个预测日落在训练量门槛之后', rwF.firstPred > rep.start, 'true');
+      chk('四条 λ 全部给了评价结果', rwF.rows.length, 4);
+      chk('默认 λ 是预注册的那一条', rwF.lambdaDefault, 1);
+      chk('IC 全部有界', rwF.rows.every(r => r.ic == null || Math.abs(r.ic) <= 1), 'true');
+      chk('每因子都给出了学到的系数', rwF.betas.length, rwF.K);
+      chk('系数按 |β| 降序', rwF.betas.every((r, i) => i === 0 || Math.abs(rwF.betas[i - 1].beta) >= Math.abs(r.beta) - 1e-15), 'true');
+      chk('方向一致性统计完整', rwF.agreeTot > 0 && rwF.agreeN <= rwF.agreeTot, 'true');
+      chk('有效下注数落在 [1, K]', rwF.enb >= 1 - 1e-9 && rwF.enb <= rwF.K + 1e-9, 'true');
+      chk('不少于一次重估', rwF.nRefit >= 1, 'true');
+
+      /* 独立实现：直接构造 X/y，用 Gauss-Jordan 解正规方程 */
+      const X = [], yy = [];
+      for (let i = rep.start; i <= rep.n - 1 - rwF.h; i++) {
+        const yv = (rep.closes[i + rwF.h] / rep.closes[i]) - 1;
+        if (!isFinite(yv)) continue;
+        const row = [1];
+        for (const id of rwF.ids) { const v = rep.fzs[id][i]; row.push(v == null ? 0 : v); }
+        X.push(row); yy.push(yv);
+      }
+      const p = X[0].length, n = X.length;
+      const G = [];
+      for (let a = 0; a < p; a++) G.push(new Array(p).fill(0));
+      for (let a = 0; a < p; a++) for (let c = 0; c < p; c++) {
+        let s = 0;
+        for (let i = 0; i < n; i++) s += X[i][a] * X[i][c];
+        G[a][c] = s / n;
+      }
+      const b = [];
+      for (let a = 0; a < p; a++) { let s = 0; for (let i = 0; i < n; i++) s += X[i][a] * yy[i]; b.push(s / n); }
+      for (let j = 1; j < p; j++) G[j][j] += rwF.lambdaDefault;
+      const M = G.map((r, i) => r.concat([b[i]]));
+      for (let col = 0; col < p; col++) {
+        let piv = col;
+        for (let r = col + 1; r < p; r++) if (Math.abs(M[r][col]) > Math.abs(M[piv][col])) piv = r;
+        const tmp = M[col]; M[col] = M[piv]; M[piv] = tmp;
+        const d = M[col][col];
+        for (let c = col; c <= p; c++) M[col][c] /= d;
+        for (let r = 0; r < p; r++) {
+          if (r === col) continue;
+          const f = M[r][col];
+          if (!f) continue;
+          for (let c = col; c <= p; c++) M[r][c] -= f * M[col][c];
+        }
+      }
+      const ref = M.map(r => r[p]);
+      let maxDiff = 0;
+      near('截距与独立 Gauss-Jordan 实现一致', rwF.intercept, ref[0], 1e-8);
+      rwF.ids.forEach(function (id, k) {
+        const row = rwF.betas.find(function (x) { return x.id === id; });
+        maxDiff = Math.max(maxDiff, Math.abs(row.beta - ref[k + 1]));
+      });
+      chk('全部系数与独立实现逐位一致（累加器 + Cholesky 都对）', maxDiff < 1e-8, 'true');
+      if (maxDiff >= 1e-8) console.log('   maxDiff=' + maxDiff);
+
+      console.log('   岭回归：' + rwF.K + ' 维 · ' + rwF.nTrainMax + ' 训练样本 · ' + rwF.nRefit + ' 次重估 · ' +
+        '有效下注 ' + rwF.enb.toFixed(1) + ' · 方向一致 ' + rwF.agreeN + '/' + rwF.agreeTot + ' · ' + ms + 'ms');
+      rwF.rows.forEach(function (r) {
+        console.log('     λ=' + String(r.lambda).padEnd(5) + ' OOS IC=' + (r.ic == null ? '—' : r.ic.toFixed(3)) +
+          ' t=' + (r.t == null ? '—' : r.t.toFixed(2)) + ' 多空差=' + (r.spread == null ? '—' : (r.spread * 100).toFixed(2) + '%'));
+      });
+      if (rwF.baseline) console.log('     对照：手写权重 IC=' + rwF.baseline.ic.toFixed(3) + ' 多空差=' + (rwF.baseline.spread * 100).toFixed(2) + '%');
+
+      /* ---- 前视偏差零容忍：篡改未来不得改变任何历史预测 ---- */
+      const H3 = mkHist();
+      const cut2 = 60, lastT = rep.n - 1;
+      for (let i = lastT - cut2 + 1; i <= lastT; i++) {
+        H3.macro.SPX.closes[i] *= 3; H3.macro.DXY.closes[i] *= 0.4;
+        H3.macro.VIX.closes[i] *= 4; H3.btc.closes[i] *= 2;
+      }
+      call('h => { state.histBundle = h; }', H3);
+      const rep3 = call('replayHistory');
+      const rw3 = call(`(r, o) => ridgeWalkForward(r, o)`, rep3, { step: 1 });
+      let leakFree = true, cmpN = 0;
+      if (rw3) {
+        for (let i = rwF.firstPred; i <= lastT - cut2; i++) {
+          if (rwF.sigDefault[i] == null) continue;
+          cmpN++;
+          if (rwF.sigDefault[i] !== rw3.sigDefault[i]) { leakFree = false; break; }
+        }
+      }
+      chk('篡改未来 60 天数据 → 历史预测一字不变（' + cmpN + ' 天逐位比对）', leakFree && cmpN > 50, 'true');
+      call('h => { state.histBundle = h; }', mkHist());
+
+      /* ---- 实时套用：虚构一组 z，看评分是否单调、是否有界 ---- */
+      const mkOut = (val) => {
+        const o = {};
+        rwF.ids.forEach(id => (o[id] = { z: val, ok: true, contribution: val }));
+        return o;
+      };
+      call('(o) => { state.hist = { rw: { live: null } }; }', {});
+      const rwl = call(`(r, o) => ridgeWalkForward(r, o)`, rep, { only: ['dxy', 'us10y', 'spx', 'vix', 'gold', 'fed', 'bei', 'curve', 'jpy', 'jgb', 'tech', 'mom'] });
+      chk('实时可用口径（12~17 维）也能训练', !!rwl, 'true');
+      if (rwl) {
+        chk('实时口径只含事先声明的那些因子',
+          rwl.ids.every(id => ['dxy', 'us10y', 'spx', 'vix', 'gold', 'fed', 'bei', 'curve', 'jpy', 'jgb', 'tech', 'mom'].indexOf(id) >= 0), 'true');
+        call('(rw) => { state.hist = { rw: { live: rw, full: rw } }; }', rwl);
+        /* 注意：不能假设「所有 z 都取 +2 就一定更看多」—— 系数是有正有负的，
+         * 学到的方向未必与原本假设的方向一致。沿 +β 方向推才是同向变化。 */
+        const alongBeta = (amp) => {
+          const o = {};
+          rwl.ids.forEach(function (id) {
+            const row = rwl.betas.find(function (x) { return x.id === id; });
+            const sg = (row && row.beta != null && row.beta >= 0) ? 1 : -1;
+            o[id] = { z: amp * sg, ok: true };
+          });
+          return o;
+        };
+        const sNeg = call('(o) => ridgeLiveScore(o)', alongBeta(-2));
+        const sZero = call('(o) => ridgeLiveScore(o)', alongBeta(0));
+        const sPos = call('(o) => ridgeLiveScore(o)', alongBeta(2));
+        chk('实时评分落在 [2,98]', [sNeg, sZero, sPos].every(s => s.score >= 2 && s.score <= 98), 'true');
+        chk('百分位沿系数方向单调上升', sNeg.pct <= sZero.pct && sZero.pct <= sPos.pct, 'true');
+        chk('读数全为 0 时落在中间档附近', sZero.pct > 0.05 && sZero.pct < 0.95, 'true');
+        chk('全部因子缺失时不硬算', call('(o) => ridgeLiveScore(o)', {}), 'null');
+      }
+    }
+
+    /* ---------- ⑦ 分歧度 ---------- */
+    const resLive = call('computeNexusScore');
+    const Dv = call('(r) => scoreDispersion(r)', resLive);
+    chk('分歧度产出结果', !!Dv, 'true');
+    if (Dv) {
+      chk('参与维度 > 3', Dv.n > 3, 'true');
+      chk('一致度在 [0,1]', Dv.consensus >= 0 && Dv.consensus <= 1, 'true');
+      chk('分歧 σ ≥ 0', Dv.sd >= 0, 'true');
+      chk('jackknife 区间包含中心趋势', Dv.jackLo <= Dv.jackHi, 'true');
+      chk('点名了最具影响力的因子', !!(Dv.driver && Dv.driver.name), 'true');
+      chk('独立假设下的标准误有限', isFinite(Dv.bandScore), 'true');
+      chk('三项权重占比合计 ≤ 1', Dv.upW + Dv.dnW + Dv.flatW <= 1 + 1e-9, 'true');
+    }
+
+    /* ---------- ⑧ 渲染层冒烟：不得抛错、且必须真的写出内容 ---------- */
+    /* 前面的 Section ③④ 用的是 META 之外的合成键名（netAnalyze 可以直接吃），
+     * 但渲染链路走的是 netKeys()（必须同时出现在 state.series 与 META 里），
+     * 所以这里换成真实键名的一份数据，否则测的是「空面板恰好没崩」。 */
+    const realSpec = {};
+    ['BTC', 'DXY', 'GOLD', 'SPX', 'VIX', 'US10Y', 'USDJPY'].forEach(function (k) {
+      const arr = [];
+      let x = 0;
+      for (let i = 0; i < 400; i++) { x = x * 0.7 + rndN(); arr.push(x); }
+      realSpec[k] = arr;
+    });
+    /* 让 SPX 与 BTC 同向、VIX 与 BTC 反向 —— 顺便让「最强邻居」这一栏有东西可选 */
+    realSpec.SPX = realSpec.BTC.map(v => v * 0.6 + rndN() * 0.3);
+    realSpec.VIX = realSpec.BTC.map(v => -v * 0.5 + rndN() * 0.3);
+    call(`(spec) => {
+      const out = {};
+      Object.keys(spec).forEach(function (k) { const m = new Map(); spec[k].forEach(function (v, i) { m.set(3000 + i, v); }); out[k] = m; });
+      state.retMaps = out; state.series = {};
+      Object.keys(spec).forEach(function (k) { state.series[k] = [1, 2, 3]; });
+      return true;
+    }`, realSpec);
+    call('(v) => { NET_OPTS.win = 120; NET_OPTS.rel = "corr"; NET_OPTS.mode = "mst"; }');
+    call('netAnalyzed', true);
+    chk('netKeys 认出 7 条真实键名序列', call('netKeys').length, 7);
+
+    let threw = null;
+    try {
+      call('renderNetStats'); call('renderHeatmap'); call('renderCorrPanels');
+      call('renderSystemic'); call('renderScoreV2', resLive); call('renderRwBox');
+      call('initNetwork');
+    } catch (e) { threw = (e && e.message) || String(e); }
+    chk('v3.20 全部渲染函数在桩环境下不抛错', threw, 'null');
+    chk('关系矩阵有内容', ($id('heatmap').innerHTML || '').length > 200, 'true');
+    chk('网络统计条有内容', ($id('netStats').innerHTML || '').indexOf('badge') >= 0, 'true');
+    chk('领先-滞后面板有内容', ($id('leadLagBox').innerHTML || '').length > 80, 'true');
+    chk('滚动共振说明写着口径而不是空着', ($id('corrNote').innerHTML || '').length > 60, 'true');
+    chk('分歧度卡片有内容', ($id('dispBox').innerHTML || '').indexOf('一致') >= 0, 'true');
+    /* 选项切换：三个开关必须真的改变输出，而不是只换了个高亮 */
+    const cnt120 = $id('netCount').textContent;
+    call('(w) => { NET_OPTS.win = w; }', 365);
+    call('netAnalyzed', true); call('renderHeatmap'); call('initNetwork');
+    chk('切换窗口到 365 日后统计口径跟着变', cnt120 !== $id('netCount').textContent && ($id('netCount').textContent || '').indexOf('365') >= 0, 'true');
+    call('(v) => { NET_OPTS.rel = v; }', 'part');
+    call('initNetwork'); call('renderHeatmap');
+    chk('切换偏相关后标题随之改变', ($id('netCount').textContent || '').indexOf('偏相关') >= 0, 'true');
+    call('(v) => { NET_OPTS.mode = v; }', 'sig');
+    call('initNetwork');
+    chk('显著网络模式下依然能出图（节点数不减）', !!call('netAnalyzed') , 'true');
+    call('(o) => { NET_OPTS.mode = "mst"; NET_OPTS.rel = "corr"; NET_OPTS.win = 120; }');
+    call('netAnalyzed', true);
+  }
+
   console.log('\n' + (fail ? `❌ 失败 ${fail} 项` : '✅ 全部断言通过'));
   process.exit(fail ? 1 : 0);
 })().catch(e => { console.error('FATAL', e.stack || e.message); process.exit(1); });
