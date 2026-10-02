@@ -333,19 +333,41 @@ function parseEconVal(s) {
 }
 function econFind(re) {
   const arr = state.econ || [];
-  for (let i = arr.length - 1; i >= 0; i--) if (re.test(arr[i].title)) return arr[i];
-  return null;
+  let pub = null, pend = null;
+  for (let i = arr.length - 1; i >= 0; i--) {
+    if (!re.test(arr[i].title)) continue;
+    /* 只有真的填了 actual 才算「已发布」；纯倒序会让下周的预告盖掉本周刚出来的真值 */
+    if (parseEconVal(arr[i].a) != null) { if (!pub) pub = arr[i]; }
+    else if (!pend) pend = arr[i];
+  }
+  return pub || pend;
 }
 /* 事件因子: surprise = 实际 − 预期（正数=强于预期），
  * 这里只算「原始 surprise 的标准化值」，方向由因子表的 dir 决定（避免方向被应用两次）。
  * 未发布时退化为「预期 − 前值」× 0.5 权重。 */
+/* 发布时刻 + 该缓冲之后仍没有实际值 → 判定为「数据缺口」。
+ * 只有带具体时刻的 ISO 才做此判断（老缓存里 MM-DD-YYYY 无钟点，跳过以免误伤未来事件）。
+ * 60 分钟是给数据源留的更新余量，不是拍脑袋：FF 通常几分钟内回填，慢也不过半小时。 */
+const ECON_GRACE_MS = 60 * 60 * 1000;
+function econOverdue(e) {
+  const t = e && typeof e.t === 'string' ? e.t : '';
+  if (t.indexOf('T') < 0) return false;
+  const ms = Date.parse(t);
+  if (!isFinite(ms)) return false;
+  return (Date.now() - ms) > ECON_GRACE_MS;
+}
 function econFactor(cfg) {
   const e = econFind(cfg.re);
   if (!e) return { z: 0, note: '本周无发布' };
   const a = parseEconVal(e.a), f = parseEconVal(e.f), p = parseEconVal(e.p);
-  if (a != null && f != null) return { z: clampZ((a - f) / cfg.std), note: `实际 ${e.a} / 预期 ${e.f}` };
-  if (f != null && p != null) return { z: clampZ((f - p) / cfg.std * 0.5), note: `预期 ${e.f}（未发布·半权重）` };
-  return { z: 0, note: '待发布' };
+  if (a != null && f != null) return { z: clampZ((a - f) / cfg.std), note: `实际 ${e.a} / 预期 ${e.f}`, ev: e.t };
+  const late = econOverdue(e);
+  if (f != null && p != null) return {
+    z: clampZ((f - p) / cfg.std * 0.5),
+    note: late ? `预期 ${e.f}（已过时辰·数据未到）` : `预期 ${e.f}（未发布·半权重）`,
+    stale: late, ev: e.t
+  };
+  return { z: 0, note: late ? '已过时辰·无数据' : '待发布', stale: late, ev: e.t };
 }
 
 /* =====================================================================
@@ -636,7 +658,7 @@ function computeNexusScore(ids) {
     }
     const z = clampZ(r.z);
     const contribution = Math.max(-2.5, Math.min(2.5, (f.dir || 0) * z));   // 方向化贡献
-    out[f.id] = { z, contribution, dir: f.dir || 0, note: r.note, ok: has };
+    out[f.id] = { z, contribution, dir: f.dir || 0, note: r.note, ok: has, stale: r.stale === true, evTime: r.ev };
     if (f.dir && has) { sum += contribution * f.w; wsum += f.w; nScored++; }
     else if (f.dir && !has) nDead++;
   });
@@ -1164,12 +1186,14 @@ function renderFactors() {
     const c = r.contribution;                       // dir × z：正=利多、负=利空
     const show = f.dir === 0;
     const dead = r.ok === false;
-    const col = dead || show ? '#3a5070' : c > 0.25 ? '#00e5a0' : c < -0.25 ? '#ff3d6e' : '#ffc107';
-    const tag = dead ? '无数据' : show ? '仅展示' : c > 0.25 ? '利多' : c < -0.25 ? '利空' : '中性';
+    const stl = !dead && !show && r.stale === true;
+    const col = dead || show ? '#3a5070' : stl ? '#8a93a6' : c > 0.25 ? '#00e5a0' : c < -0.25 ? '#ff3d6e' : '#ffc107';
+    const tag = dead ? '无数据' : show ? '仅展示' : stl ? '数据未到' : c > 0.25 ? '利多' : c < -0.25 ? '利空' : '中性';
     const dirTxt = f.dir > 0 ? 'z↑=利多' : f.dir < 0 ? 'z↑=利空' : '不参与评分';
     const card = document.createElement('div');
     card.className = 'fcard';
-    card.title = `${f.name}\n权重 ${f.w} · 方向 ${f.dir > 0 ? '+1' : f.dir < 0 ? '-1' : '0'}（${dirTxt}）\n原始 z ${r.z.toFixed(2)} · 贡献 ${c.toFixed(2)}\n${r.note}`;
+    const evT = (r.evTime ? `\n发布时刻 ${r.evTime}` : '');
+    card.title = `${f.name}\n权重 ${f.w} · 方向 ${f.dir > 0 ? '+1' : f.dir < 0 ? '-1' : '0'}（${dirTxt}）\n原始 z ${r.z.toFixed(2)} · 贡献 ${c.toFixed(2)}\n${r.note}${evT}`;
     card.innerHTML = `<div class="fc-name">${f.name}</div><div class="fc-z" style="color:${col}">${show || dead ? '—' : (c >= 0 ? '+' : '') + c.toFixed(1)}</div><div class="fc-str"><div class="fc-strbar" style="width:${Math.min(100, Math.abs(c) / 2.5 * 100)}%;background:${col}"></div></div><div class="fc-sig" style="color:${col}">${tag} · ${r.note}</div>`;
     box.appendChild(card);
   });

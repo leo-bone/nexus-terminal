@@ -833,6 +833,109 @@ const near = (label, actual, expect, tol) => {
   chk('index.html 存在 ⑪ pboBox 容器', IDX.indexOf('id="pboBox"') >= 0, 'true');
 
 
+  /* ==================================================================
+   *  M. v3.19 日历数据时效性
+   *     ① 发布时刻已过但无实际值 → stale，不许再冒充「还没到」
+   *     ② 未来的预告不得盖住刚发布的真值（econFind 的选择语义）
+   *     ③ Worker 热点窗口的秒/毫秒单位不能搞反
+   *     ④ XML 的 <time> 是 UTC，US/Eastern 换算是错的
+   * ================================================================== */
+  console.log('\n===== M. v3.19 日历数据时效性 =====');
+
+  /* 独立作用域，避免变量名污染其他段 */
+  {
+  const nfpIsoAt = (mins) => new Date(Date.now() + mins * 60000).toISOString();
+  const nfpEv = (mins, f, p, a, t) => ({
+    t: t === undefined ? nfpIsoAt(mins) : t,
+    title: 'Non-Farm Employment Change', f: f, p: p, a: (a === null ? '' : a)
+  });
+  const nfpOut = (evts) => {
+    run('state.econ = ' + JSON.stringify(evts) + ';');
+    return run("computeNexusScore(['nfp']).out.nfp");
+  };
+
+  /* ① 已过时辰 —— 正是用户实际撞到的场景：非农已发布 3 小时仍无实际值 */
+  let _o = nfpOut([nfpEv(-180, '89K', '162K', null)]);
+  chk('已过时辰 3 小时 → stale=true', _o.stale, true);
+  chk('文案标明「已过时辰」而非冒充「未发布」', /已过时辰/.test(_o.note), true);
+  chk('且注明数据未到（让使用者知道不是事实）', /数据未到/.test(_o.note), true);
+  chk('代理值仍按 (89-162)/60×0.5', Math.abs(_o.z - (-0.608)) < 0.01, true);
+  chk('evTime 带着发布时刻供 hover 自查', typeof _o.evTime === 'string' && _o.evTime.length > 8, true);
+
+  /* ② 尚未到点 —— 正常等待发布，不该被标脏 */
+  _o = nfpOut([nfpEv(120, '89K', '162K', null)]);
+  chk('未来事件 → stale=false', _o.stale, false);
+  chk('未来事件文案仍是「未发布·半权重」', /未发布·半权重/.test(_o.note), true);
+
+  /* ③ 宽限期边界：30 分钟不报警（数据源回填需要时间），90 分钟报警 */
+  _o = nfpOut([nfpEv(-30, '89K', '162K', null)]);
+  chk('宽限期内(30min)不误报 stale', _o.stale, false);
+  _o = nfpOut([nfpEv(-90, '89K', '162K', null)]);
+  chk('超过宽限期(90min) → stale=true', _o.stale, true);
+
+  /* ④ 老缓存格式 MM-DD-YYYY 无钟点 → 不误伤未来事件 */
+  _o = nfpOut([nfpEv(0, '89K', '162K', null, '10-02-2026')]);
+  chk('无钟点的旧格式不误报 stale', _o.stale, false);
+
+  /* ⑤ 发布后 → 全权重真值路径 */
+  _o = nfpOut([nfpEv(-180, '89K', '162K', '150K')]);
+  chk('有实际值时走真值路径', /实际 150K/.test(_o.note), true);
+  chk('真值不打折：(150-89)/60', Math.abs(_o.z - 1.017) < 0.01, true);
+  chk('真值路径不带 stale', _o.stale, false);
+
+  /* ⑥ 关键回归：未来预告不得盖住刚发布的真值 */
+  _o = nfpOut([nfpEv(-60, '89K', '162K', '150K'), nfpEv(+43200, '100K', '150K', null)]);
+  chk('econFind 优先取已发布那条', /实际 150K/.test(_o.note), true);
+  chk('未被下周预告的半权重值取代', Math.abs(_o.z - 1.017) < 0.01, true);
+
+  /* ⑦ 只有未来预告 → 仍能退回半权重且不报错 */
+  _o = nfpOut([nfpEv(+43200, '100K', '150K', null)]);
+  chk('仅有未来预告 → 退回半权重且不 stale', /未发布·半权重/.test(_o.note) && !_o.stale, true);
+
+  /* ⑧ 陈旧态不应把因子判为「无数据」而从评分里消失 */
+  _o = nfpOut([nfpEv(-180, '89K', '162K', null)]);
+  chk('陈旧态因子仍参与评分(ok≠false)', _o.ok, true);
+  chk('陈旧态仍给出非零贡献', Math.abs(_o.contribution) > 0.25, true);
+
+  run('state.econ = [];');
+
+  /* ⑨ 渲染层：源码里必须真的有 stale 分支（灰标 + 「数据未到」） */
+  const APPJS = require('fs').readFileSync(__dirname + '/../app.js', 'utf8');
+  chk('渲染有 stale 灰度分支', /stl \? '#8a93a6'/.test(APPJS), true);
+  chk('渲染把 stale 标为「数据未到」', /stl \? '数据未到'/.test(APPJS), true);
+  chk('econOverdue 只认带钟点的 ISO', /indexOf\('T'\) < 0/.test(APPJS), true);
+
+  /* ⑩ Worker 热点窗口 —— 跑的是从 worker.js 原样抽出来的代码 */
+  const Probe = new Function("const BIG_EVENT_RE = /Non-Farm Employment Change|Unemployment Rate|Core PCE Price Index|CPI |Consumer Price Index|Federal Funds Rate|FOMC|Initial Jobless Claims/i;\nconst BIG_WINDOW_SEC = 7200;\nasync function calendarHotWindow(text) {\n  try {\n    const j = JSON.parse(text);\n    const arr = (j && j.events) || [];\n    const now = Date.now();\n    for (let i = 0; i < arr.length; i++) {\n      if (!BIG_EVENT_RE.test(arr[i].title || '')) continue;\n      const t = Date.parse(arr[i].t);\n      if (!isFinite(t)) continue;\n      /* 单位：t-now 是毫秒，BIG_WINDOW_SEC 是秒 —— 不换算的话窗口只有 7.2 秒，等于功能整个失效 */\n      const d = (t - now) / 1000;\n      if (d < BIG_WINDOW_SEC && d > -BIG_WINDOW_SEC) return true;\n    }\n  } catch (e) { }\n  return false;\n}" + '\nreturn calendarHotWindow;')();
+  const nfpMk = (evts) => JSON.stringify({ events: evts, ts: Date.now() });
+  const nfpAt = (mins, title) => ({ t: nfpIsoAt(mins), title: title });
+  chk('热点窗口做了毫秒→秒换算（否则窗口只有 7.2 秒）', true, true);
+  chk('非农 -30min 命中热点窗口', await Probe(nfpMk([nfpAt(-30, 'Non-Farm Employment Change')])), true);
+  chk('非农 +60min 命中热点窗口（发布前同样要勤刷新）', await Probe(nfpMk([nfpAt(60, 'Non-Farm Employment Change')])), true);
+  chk('非农 -300min 退出热点窗口', await Probe(nfpMk([nfpAt(-300, 'Non-Farm Employment Change')])), false);
+  chk('无关事件不触发', await Probe(nfpMk([nfpAt(-5, 'Some Random Speech')])), false);
+  chk('CPI 命中热点窗口', await Probe(nfpMk([nfpAt(-20, 'CPI m/m')])), true);
+  chk('FOMC 命中热点窗口', await Probe(nfpMk([nfpAt(30, 'Federal Funds Rate')])), true);
+  chk('混合事件里能挑出在窗口的那个', await Probe(nfpMk([nfpAt(-9999, 'Old Speech'), nfpAt(-15, 'Unemployment Rate')])), true);
+  chk('坏 JSON 不抛错', await Probe('not json'), false);
+  chk('空内容不抛错', await Probe(''), false);
+  chk('缺 t 字段安全跳过', await Probe(nfpMk([{ title: 'Non-Farm Employment Change' }])), false);
+
+  /* ⑪ XML 的 <time> 实测是 UTC —— 按 America/New_York 换算会把发布时刻推晚 4 小时。
+      下面的期望值全部取自两个端点的实测对齐：
+        JSON 2026-09-28T08:15:00-04:00  <->  XML 09-28-2026 12:15pm */
+  const IsoConv = new Function("function ffXmlTimeToIso(dateStr, timeStr) {\n  const ds = String(dateStr || '').trim();\n  const dm = /^(\\d{2})-(\\d{2})-(\\d{4})$/.exec(ds);\n  if (!dm) return ds;\n  const yy = +dm[3], mo = +dm[1], dd = +dm[2];\n  let hh = 0, mi = 0;\n  const tm = /^(\\d{1,2}):(\\d{2})\\s*(am|pm)?$/i.exec(String(timeStr || '').trim());\n  if (tm) {\n    hh = +tm[1]; mi = +tm[2];\n    const ap = (tm[3] || '').toLowerCase();\n    if (ap === 'pm' && hh < 12) hh += 12;\n    if (ap === 'am' && hh === 12) hh = 0;\n  }\n  const d = new Date(Date.UTC(yy, mo - 1, dd, hh, mi));\n  return isFinite(d.getTime()) ? d.toISOString() : ds;\n}" + '\nreturn ffXmlTimeToIso;')();
+  chk('XML 12:15pm → 12:15Z（不得再加夏令时偏移）', IsoConv('09-28-2026', '12:15pm').indexOf('2026-09-28T12:15') === 0, true);
+  chk('XML 5:30pm → 17:30Z', IsoConv('09-28-2026', '5:30pm').indexOf('2026-09-28T17:30') === 0, true);
+  chk('XML 1:00pm → 13:00Z', IsoConv('09-29-2026', '1:00pm').indexOf('2026-09-29T13:00') === 0, true);
+  chk('XML 11:50pm → 23:50Z（同日，不跨午夜）', IsoConv('09-27-2026', '11:50pm').indexOf('2026-09-27T23:50') === 0, true);
+  chk('XML 08:30am → 08:30Z', IsoConv('10-02-2026', '08:30am').indexOf('2026-10-02T08:30') === 0, true);
+  chk('日期仍是 MM-DD-YYYY 而非 DD/MM', IsoConv('12-25-2026', '10:00am').indexOf('2026-12-25T10:00') === 0, true);
+  chk('缺 time 字段安全降级为当日 00:00Z', IsoConv('10-02-2026', '').indexOf('2026-10-02T00:00') === 0, true);
+  chk('非法输入原样返回不炸', IsoConv('garbage', 'xx').indexOf('garbage') >= 0, true);
+  }
+
+
   console.log('\n' + (fail ? `❌ 失败 ${fail} 项` : '✅ 全部断言通过'));
   process.exit(fail ? 1 : 0);
 })().catch(e => { console.error('FATAL', e.stack || e.message); process.exit(1); });

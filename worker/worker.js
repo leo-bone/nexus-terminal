@@ -362,10 +362,60 @@ const CAL_URLS = [
   'https://nfs.faireconomy.media/ff_calendar_thisweek.json',
   'https://nfs.faireconomy.media/ff_calendar_thisweek.xml',
 ];
-const CAL_DATA_KEY = 'https://nexus-cache.internal/calendar-v1';
-const CAL_META_KEY = 'https://nexus-cache.internal/calendar-meta-v1';
+const CAL_DATA_KEY = 'https://nexus-cache.internal/calendar-v2';
+const CAL_META_KEY = 'https://nexus-cache.internal/calendar-meta-v2';
 const CAL_TTL = 21600;        // 成功结果在缓存里保留 6 小时
 const CAL_MIN_RETRY = 1800;   // 距上次尝试不足 30 分钟 → 不再打 FF（退避）
+const CAL_MIN_RETRY_HOT = 300; // 重大事件发布窗口内：压到 5 分钟
+const BIG_WINDOW_SEC = 7200;   // 发布时刻 ±2 小时算「窗口内」
+/* 这几项一旦发布，BTC 常在数分钟内反应；30 分钟的退避会把整段行情错过。 */
+const BIG_EVENT_RE = /Non-Farm Employment Change|Unemployment Rate|Core PCE Price Index|CPI |Consumer Price Index|Federal Funds Rate|FOMC|Initial Jobless Claims/i;
+
+/* FF 的 <date> 是 MM-DD-YYYY、<time> 是 '08:30am'（美东）。
+ * 老实现只取 <date>，于是降级到 XML 时发布时刻被整个丢掉 —— 前端无法区分
+ * 「还没到点」和「该发了但数据没来」两种情况，这正是这次要修的根。
+ * 夏令时由 Intl 按该时刻实时求解，不用硬编码 -4/-5。 */
+/* FF XML 的 <date> 是 MM-DD-YYYY、<time> 是 '08:30am'。
+ * 【时区实测】<time> 已经是 UTC，不是美东。实证办法：把同一批事件在两个端点上逐条对齐——
+ *   JSON  2026-09-28T08:15:00-04:00  <->  XML  09-28-2026 12:15pm
+ *   JSON  2026-09-28T13:30:00-04:00  <->  XML  09-28-2026  5:30pm
+ *   JSON  2026-09-29T10:00:00-04:00  <->  XML  09-29-2026  2:00pm
+ *   左边 -04:00 是夏令时 ET，折算成 UTC 正好等于右边的钟点。
+ * 曾按 America/New_York 做过换算，结果把发布时间推晚 4 小时，
+ * 令「发布已过时而数据没到」的报警迟到整整一下午。不要再加偏移。 */
+function ffXmlTimeToIso(dateStr, timeStr) {
+  const ds = String(dateStr || '').trim();
+  const dm = /^(\d{2})-(\d{2})-(\d{4})$/.exec(ds);
+  if (!dm) return ds;
+  const yy = +dm[3], mo = +dm[1], dd = +dm[2];
+  let hh = 0, mi = 0;
+  const tm = /^(\d{1,2}):(\d{2})\s*(am|pm)?$/i.exec(String(timeStr || '').trim());
+  if (tm) {
+    hh = +tm[1]; mi = +tm[2];
+    const ap = (tm[3] || '').toLowerCase();
+    if (ap === 'pm' && hh < 12) hh += 12;
+    if (ap === 'am' && hh === 12) hh = 0;
+  }
+  const d = new Date(Date.UTC(yy, mo - 1, dd, hh, mi));
+  return isFinite(d.getTime()) ? d.toISOString() : ds;
+}
+/* 缓存内容里是否有重大事件正处在发布窗口 —— 是则不走长退避 */
+async function calendarHotWindow(text) {
+  try {
+    const j = JSON.parse(text);
+    const arr = (j && j.events) || [];
+    const now = Date.now();
+    for (let i = 0; i < arr.length; i++) {
+      if (!BIG_EVENT_RE.test(arr[i].title || '')) continue;
+      const t = Date.parse(arr[i].t);
+      if (!isFinite(t)) continue;
+      /* 单位：t-now 是毫秒，BIG_WINDOW_SEC 是秒 —— 不换算的话窗口只有 7.2 秒，等于功能整个失效 */
+      const d = (t - now) / 1000;
+      if (d < BIG_WINDOW_SEC && d > -BIG_WINDOW_SEC) return true;
+    }
+  } catch (e) { }
+  return false;
+}
 
 /* 把 FF 的 XML 日历也解析成同一结构（JSON 端点 429 时的备用出口） */
 function parseFfXml(text) {
@@ -376,7 +426,7 @@ function parseFfXml(text) {
     const country = get(b, 'country');
     const title = get(b, 'title');
     if (country !== 'USD' || !title) return;
-    out.push({ t: get(b, 'date'), title, impact: get(b, 'impact'), f: get(b, 'forecast'), p: get(b, 'previous'), a: get(b, 'actual') });
+    out.push({ t: ffXmlTimeToIso(get(b, 'date'), get(b, 'time')), td: get(b, 'date'), tm: get(b, 'time'), title, impact: get(b, 'impact'), f: get(b, 'forecast'), p: get(b, 'previous'), a: get(b, 'actual') });
   });
   return out.sort((a, b) => Date.parse(a.t) - Date.parse(b.t));
 }
@@ -392,7 +442,7 @@ async function fetchCalendar() {
         const arr = JSON.parse(text);
         if (!Array.isArray(arr)) throw new Error('ff shape');
         const ev = arr.filter(e => e && e.country === 'USD' && e.title)
-          .map(e => ({ t: e.date, title: e.title, impact: e.impact || '', f: e.forecast || '', p: e.previous || '', a: e.actual || '' }))
+          .map(e => ({ t: e.date, td: e.date, tm: '', title: e.title, impact: e.impact || '', f: e.forecast || '', p: e.previous || '', a: e.actual || '' }))
           .sort((a, b) => Date.parse(a.t) - Date.parse(b.t));
         if (!ev.length) throw new Error('ff empty');
         return ev;
@@ -414,7 +464,11 @@ async function calendarWithFallback() {
   const ageSec = (Date.now() - lastTry) / 1000;
   const wrap = (body, src) => new Response(body, { status: 200, headers: { ...CORS, 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=900', 'X-Calendar-Source': src } });
 
-  if (hit && ageSec < CAL_MIN_RETRY) return wrap(await hit.text(), 'edge-cache');
+  if (hit) {
+    const cached = await hit.clone().text();
+    const minAge = (await calendarHotWindow(cached)) ? CAL_MIN_RETRY_HOT : CAL_MIN_RETRY;
+    if (ageSec < minAge) return wrap(cached, 'edge-cache');
+  }
   try {
     const events = await fetchCalendar();
     const payload = JSON.stringify({ events, ts: Date.now() });
@@ -989,7 +1043,7 @@ export default {
     }
 
     if (url.pathname === '/' || url.pathname === '/health') {
-      return jsonResp({ name: 'nexus-proxy', version: '3.18', status: 'ok', source: 'yahoo+stooq+nyfed+treasury+mof+coinlore+finforexfactory+bitcoin-data+bybit+deribit+proxy', symbols: Object.keys(SIMPLE).concat(['EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'JGB10Y', 'DVOL', 'DVHV']) });
+      return jsonResp({ name: 'nexus-proxy', version: '3.19', status: 'ok', source: 'yahoo+stooq+nyfed+treasury+mof+coinlore+finforexfactory+bitcoin-data+bybit+deribit+proxy', symbols: Object.keys(SIMPLE).concat(['EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'JGB10Y', 'DVOL', 'DVHV']) });
     }
 
     return new Response('Not Found', { status: 404, headers: CORS });
