@@ -53,6 +53,7 @@ const PROXY_ALLOW = [
   'bitcoin-data.com',       // BGeometrics 免费 BTC 链上指标 API（MVRV/活跃地址，无 key，免费档 8 次/小时）
   'fapi.binance.com',       // Binance USDT 本位永续历史（资金费率/持仓量/多空比，供 /api/history 用）
   'futures-data.binance.com', // Binance 衍生品统计备用域
+  'www.deribit.com',          // Deribit 期权 DVOL/IV/持仓（crypto 原生恐惧温度计）
 ];
 
 // 简单序列：按顺序尝试多个源（yahoo 主源 / stooq 兜底）
@@ -507,8 +508,8 @@ const HIST_MIN_RETRY = 900;     // failure backoff 15min
 /* NOTE: bump vN whenever this endpoint's payload shape or semantics change,
  * otherwise the previous edge cache masks the change and it looks like the new
  * code never shipped (hit this twice in practice). */
-const HIST_DATA_KEY = 'https://nexus-cache.internal/history-v9';
-const HIST_META_KEY = 'https://nexus-cache.internal/history-meta-v9';
+const HIST_DATA_KEY = 'https://nexus-cache.internal/history-v10';
+const HIST_META_KEY = 'https://nexus-cache.internal/history-meta-v10';
 
 const trimS = (s, n = HIST_KEEP) => {
   if (!s || !s.ts || !s.ts.length) return null;
@@ -642,6 +643,50 @@ async function fetchOIHist() {
   return { ts: rows.map(x => x.t), closes: rows.map(x => x.c) };
 }
 
+/* ---------- v3.12: Deribit 期权原生指标（crypto 恐惧温度计）----------
+ * 本地沙箱出口受限，Deribit 必须由 CF Worker 抓取（与 Yahoo/Bybit 同路径）。
+ *   DVOL  Deribit 波动率指数（VIX 同款，隐含波动率预期），日频，~2020 起
+ *   DVHV  Deribit 历史已实现波动率（BTC 30d realized vol），日频，~2019 起
+ * 这俩是 crypto 原生的「恐惧/波动」量度，比 DXY/美债等宏观代理更贴近 BTC。
+ * 单独长缓存（成功 12h / 失败 30min 冷却），从稳态重建路径剥出，避免烧请求。 */
+const DERIBIT_KEY = 'https://nexus-cache.internal/deribit-v1';
+async function deribitWithCache() {
+  const cache = caches.default, key = new Request(DERIBIT_KEY);
+  try {
+    const hit = await cache.match(key);
+    if (hit) { const j = await hit.json(); return j.failed ? null : j; }
+  } catch (e) { /* 缓存读失败按无缓存处理 */ }
+  try {
+    const val = await fetchDeribitAll();
+    await cache.put(key, new Response(JSON.stringify(val), { headers: { 'Cache-Control': 'public, max-age=43200' } }));
+    return val;
+  } catch (e) {
+    console.warn('deribit hist fail, cooldown 30min:', e.message);
+    await cache.put(key, new Response(JSON.stringify({ failed: true, err: e.message, t: Date.now() }), { headers: { 'Cache-Control': 'public, max-age=1800' } }));
+    return null;
+  }
+}
+async function fetchDeribitAll() {
+  const UA = { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NexusTerminal/3.12)' } };
+  // DVOL：按年翻页（resolution=1D），2020 起；每根 [ts,o,h,l,c]
+  const dvol = [];
+  const now = new Date().getUTCFullYear();
+  for (let y = 2020; y <= now; y++) {
+    const s = Date.UTC(y, 0, 1), e = (y < now) ? Date.UTC(y + 1, 0, 1) : Date.now();
+    const u = 'https://www.deribit.com/api/v2/public/get_volatility_index_data?currency=BTC&start_timestamp=' + s + '&end_timestamp=' + e + '&resolution=1D';
+    const r = await fetch(u, UA);
+    if (!r.ok) throw new Error('deribit dvol HTTP ' + r.status);
+    const d = await r.json();
+    const arr = (d.result && d.result.data) || [];
+    arr.forEach(x => { if (x[0] && isFinite(x[4])) dvol.push({ t: x[0], c: x[4] }); });
+  }
+  dvol.sort((a, b) => a.t - b.t);
+  if (dvol.length < 300) throw new Error('dvol short: ' + dvol.length);
+  /* DVHV（Deribit 历史已实现波动率）本想一并抓，但 get_historical_volatility 不带时间范围参数、
+   * 只返回最近 ~16 天滚动窗口，无历史深度；且已实现波动率回放里本来就自己从 BTC 价格算，冗余 —— 砍掉。 */
+  return { DVOL: { ts: dvol.map(x => x.t), closes: dvol.map(x => x.c) } };
+}
+
 async function fetchHistoryBundle() {
   const out = { macro: {}, fng: null, tx: null, hr: null, btc: null, srcs: {} };
 
@@ -687,6 +732,11 @@ async function fetchHistoryBundle() {
     if (bb.value.PREM) putM('PREM', bb.value.PREM, 'bybit:premium');
     if (bb.value.OIH) putM('OIH', bb.value.OIH, 'bybit:oi');
   } else console.warn('hist bybit unavailable (cooldown or fail)');
+
+  // —— v3.12: Deribit 期权原生指标（crypto 恐惧温度计，分析用，不入评分）——
+  const drb = await deribitWithCache();
+  if (drb && drb.DVOL) putM('DVOL', drb.DVOL, 'deribit:dvol');
+  else console.warn('hist deribit DVOL unavailable (cooldown or fail)');
 
   // —— 链上 / 情绪 ——
   await Promise.all([
@@ -894,7 +944,7 @@ export default {
     }
 
     if (url.pathname === '/' || url.pathname === '/health') {
-      return jsonResp({ name: 'nexus-proxy', version: '3.11', status: 'ok', source: 'yahoo+stooq+nyfed+treasury+mof+coinlore+finforexfactory+bitcoin-data+bybit+proxy', symbols: Object.keys(SIMPLE).concat(['EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'JGB10Y']) });
+      return jsonResp({ name: 'nexus-proxy', version: '3.12', status: 'ok', source: 'yahoo+stooq+nyfed+treasury+mof+coinlore+finforexfactory+bitcoin-data+bybit+deribit+proxy', symbols: Object.keys(SIMPLE).concat(['EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'JGB10Y', 'DVOL', 'DVHV']) });
     }
 
     return new Response('Not Found', { status: 404, headers: CORS });

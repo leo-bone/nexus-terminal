@@ -1459,12 +1459,15 @@ async function runHistoryCheck() {
     });
     const reg = regimeTest(rep);
     const per = periodIC(rep);
+    /* v3.12: Deribit 期权原生指标（分析专用参考，不入评分）—— 测真实 IC，先看有没有用 */
+    const aux = {};
+    ['DVOL', 'DVHV'].forEach(function (k) { const a = auxRegimeIC(rep, k); if (a) aux[k] = a; });
     /* v3.11 实践延展：极端体制子评分的回测验证（同 10 年样本，非样本外） */
     const exSeries = extremeSubSeries(rep);
     const exWildIC = icCore(regimeMasked(exSeries, rep, 'wild'), rep, 10, rep.start, rep.n);
     const exAllIC = icCore(exSeries, rep, 10, rep.start, rep.n);
     const exMainWild = reg.byRegime.wild ? reg.byRegime.wild.ic : null;
-    state.hist = { rep: rep, ics: ics, facs: facs, oos: oos, roll: roll, ext: ext, reg: reg, per: per,
+    state.hist = { rep: rep, ics: ics, facs: facs, oos: oos, roll: roll, ext: ext, reg: reg, per: per, aux: aux,
       extreme: { series: exSeries, wildIC: exWildIC, mainWildIC: exMainWild, allIC: exAllIC } };
     renderHistory();
     renderReview();
@@ -1744,6 +1747,64 @@ function regimeMasked(series, rep, regimeKey) {
   return out;
 }
 
+/* ---------- v3.12: Deribit 期权原生指标作为「分析专用参考」----------
+ * 设计纪律：OOS 验证已证明「往评分里加因子 + 调权重」会过拟合（训练集 IC 0.246 →
+ * 测试集转负、CV 无优势）。所以 Deribit 的 DVOL（隐含波动率指数）不进 Nexus Score，
+ * 只作为独立参考指标，在回放里测它对未来 10 日收益的真实 IC 并按体制展示——
+ * 先看清它到底有没有用，再决定是否进评分。 */
+/* 把任意外部日频序列对齐到 rep.calTs（取 ≤ calTs[i] 的最近值；缺失段填 null） */
+function alignToCalTs(srcTs, srcVals, calTs) {
+  const n = calTs.length, out = new Array(n).fill(null);
+  if (!srcTs || !srcTs.length) return out;
+  let j = 0;
+  for (let i = 0; i < n; i++) {
+    const t = calTs[i];
+    while (j < srcTs.length && srcTs[j] <= t) j++;
+    if (j > 0) out[i] = srcVals[j - 1];
+  }
+  return out;
+}
+/* 带缺失值保护的滚动 z（窗口 win）；窗口不足或窗口内含 null → null */
+function auxZ(aligned, win) {
+  const n = aligned.length, out = new Array(n).fill(null);
+  for (let i = 0; i < n; i++) {
+    if (aligned[i] == null) continue;
+    const m = Math.min(win, i + 1);
+    if (m < 10) continue;
+    let s = 0, bad = false;
+    for (let k = i - m + 1; k <= i; k++) { if (aligned[k] == null) { bad = true; break; } s += aligned[k]; }
+    if (bad) continue;
+    const mean = s / m;
+    let acc = 0;
+    for (let k = i - m + 1; k <= i; k++) { const d = aligned[k] - mean; acc += d * d; }
+    const sd = Math.sqrt(acc / m);
+    out[i] = sd > 1e-12 ? (aligned[i] - mean) / sd : 0;
+  }
+  return out;
+}
+/* 对某个历史包里的序列（如 DVOL）算全样本 + 分体制 IC(10) */
+function auxRegimeIC(rep, key) {
+  const b = state.histBundle;
+  if (!b || !b.macro || !b.macro[key] || !b.macro[key].ts) return null;
+  const src = b.macro[key];
+  const aligned = alignToCalTs(src.ts, src.closes, rep.calTs);
+  if (!aligned.some(function (x) { return x != null; })) return null;
+  const z = auxZ(aligned, 60);
+  const vol = realizedVol(rep, 20), H = 10;
+  const full = icCore(z, rep, H, rep.start, rep.n);
+  const byRegime = {};
+  REGIMES.forEach(function (R) {
+    const sub = new Array(rep.n).fill(null);
+    for (let i = rep.start; i < rep.n; i++) {
+      const v = vol[i];
+      if (v == null || v < R.lo || v >= R.hi) continue;
+      sub[i] = z[i];
+    }
+    byRegime[R.k] = icCore(sub, rep, H, rep.start, rep.n);
+  });
+  return { key: key, full: full, byRegime: byRegime };
+}
+
 /* 实时：从 BTC 日线 K 线算当前 20 日年化已实现波动率，判定当前体制 */
 function currentRegime() {
   const k = state.klines['BTC1d'];
@@ -1870,6 +1931,33 @@ function renderReview() {
         : '极端期样本不足，无法判定。';
       html += '<div class="rg-sub">' + verdict + '</div>';
       box.innerHTML = html;
+    }
+  }
+
+  /* v3.12: Deribit 期权原生指标（DVOL 隐含波动率指数）作为分析参考，不入评分 */
+  const auxBox = $('auxBox');
+  if (auxBox) {
+    const dv = (h.aux || {}).DVOL;
+    if (!dv) {
+      auxBox.innerHTML = '<div class="rg-sub">Deribit DVOL（隐含波动率指数）暂无可用的历史数据。</div>';
+    } else {
+      const icTxt = function (c) { return c == null || c.spear == null ? '—' : c.spear.toFixed(3) + (c.t == null ? '' : ' (' + c.t.toFixed(2) + ')'); };
+      const cls = function (c) { return c == null || c.spear == null ? 'rg-y' : (Math.abs(c.spear) > 0.15 ? (c.spear > 0 ? 'rg-g' : 'rg-r') : (c.spear > 0 ? 'rg-y' : 'rg-r')); };
+      let html = '<div class="fttl" style="margin-bottom:7px">⑧ Deribit 期权原生指标 · 参考（不入评分）</div>';
+      html += '<div class="rg-sub">DVOL 是 Deribit 的波动率指数（VIX 同款，隐含波动率 = 市场对未来波动的预期，crypto 原生的「恐惧温度计」）。它<b>没有</b>塞进 Nexus Score——OOS 验证已证明往评分里加因子会过拟合。这里只测它对未来 10 日收益的真实 IC，先看有没有用：</div>';
+      html += '<div class="rg-tbl"><div class="rg-hd"><span>指标</span><span>全样本 IC</span><span>平静</span><span>震荡</span><span>极端</span><span>样本</span></div>';
+      html += '<div class="rg-row"><span class="rg-nm">DVOL 隐含波动率</span>';
+      html += '<span class="' + cls(dv.full) + '">' + icTxt(dv.full) + '</span>';
+      ['calm', 'chop', 'wild'].forEach(function (k) { const c = dv.byRegime[k]; html += '<span class="' + cls(c) + '">' + icTxt(c) + '</span>'; });
+      html += '<span>' + (dv.full ? dv.full.n : '—') + '</span></div>';
+      html += '</div>';
+      const verdict = (dv.full && dv.full.spear != null)
+        ? (Math.abs(dv.full.spear) > 0.15
+            ? 'DVOL 与未来 10 日收益的相关达到 |IC|>0.15，是值得纳入考虑的 crypto 原生情绪/风险信号；下一步用 walk-forward 验证稳定性后再决定是否进评分。'
+            : 'DVOL 的 IC 落在噪声区（|IC|<0.15），作为「恐惧温度计」定性看看可以，但不足以单独预测方向。它真正的价值在<b>极端期</b>：波动率指数飙升本身就是风险事件警报，比任何因子都直接。')
+        : 'DVOL 样本不足，无法判定。';
+      html += '<div class="rg-sub">' + verdict + '</div>';
+      auxBox.innerHTML = html;
     }
   }
 

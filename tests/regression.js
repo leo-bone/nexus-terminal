@@ -445,6 +445,7 @@ const near = (label, actual, expect, tol) => {
     ser.FEE    = mk(i => 5e5  * (1 + K * SP(i)));
     ser.PREM   = mk(i => 0.0004 * (1 - 2 * K * SP(i)), 1800);   // 第 1800 天才上线
     ser.OIH    = mk(i => 8e8  * (1 - K * SP(i)), 2400);         // 第 2400 天才上线
+    ser.DVOL   = mk(i => 70   * (1 + 0.8 * K * SP(i)), 800);    // 第 800 天才上线（crypto 原生，晚于核心宏观）
     return { macro: ser, fng: mk(i => 50 - 25 * SP(i), 400),
              tx: mk(i => 500000 * (1 + 0.20 * SP(i))),
              hr: mk(i => 1e21   * (1 + 0.20 * SP(i))),
@@ -597,6 +598,15 @@ const near = (label, actual, expect, tol) => {
     chk('子评分极端期 IC 算得出或样本不足为 null', exWild === null || (exWild.spear != null && Math.abs(exWild.spear) <= 1), 'true');
     console.log('   子评分：全样本 IC(10)=' + (exAll ? exAll.spear.toFixed(3) : '—') +
       ' · 极端期 IC(10)=' + (exWild ? exWild.spear.toFixed(3) + ' (n=' + exWild.n + ')' : '样本不足'));
+
+    /* ④ v3.12: Deribit DVOL 作为分析专用参考（不入评分）—— auxRegimeIC 必须优雅工作 */
+    chk('auxRegimeIC(不存在的键) 返回 null', call('auxRegimeIC', repL, 'NOPE') === null, 'true');
+    const auxDV = call('auxRegimeIC', repL, 'DVOL');
+    chk('auxRegimeIC(DVOL) 返回结构', !!(auxDV && auxDV.full && auxDV.byRegime), 'true');
+    chk('auxRegimeIC(DVOL) 三档齐全', auxDV && ['calm', 'chop', 'wild'].every(k => auxDV.byRegime[k] && typeof auxDV.byRegime[k].n === 'number'), 'true');
+    chk('auxRegimeIC(DVOL) 全样本 IC 有界', auxDV && (auxDV.full.spear == null || Math.abs(auxDV.full.spear) <= 1), 'true');
+    console.log('   DVOL 参考 IC(10): 全样本=' + (auxDV && auxDV.full.spear != null ? auxDV.full.spear.toFixed(3) : '—') +
+      ' · 分体制=' + (auxDV ? ['calm', 'chop', 'wild'].map(k => auxDV.byRegime[k].spear == null ? '—' : auxDV.byRegime[k].spear.toFixed(2)).join('/') : ''));
   }
 
   /* —— 回放不得污染实时状态 —— */
