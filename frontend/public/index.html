@@ -180,6 +180,17 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
 .rg-r{color:var(--red);font-weight:600}
 .rg-y{color:var(--yellow)}
 .rg-dim{color:var(--dim)}
+/* ---------- v3.16 ⑨ 关键事件时间线 ---------- */
+.evtl{font-size:10px;font-family:"JetBrains Mono",monospace}
+.evtl-h,.evtl-r{display:grid;grid-template-columns:.72fr 1.9fr .68fr .5fr .55fr .6fr;gap:5px;align-items:start}
+.evtl-h{padding:4px 3px;font-size:8.5px;color:var(--dim);border-bottom:1px solid var(--border);line-height:1.35}
+.evtl-h>span,.evtl-r>span{text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.evtl-h>span:first-child,.evtl-r>span:first-child{text-align:left}
+.evtl-r{padding:5px 3px;border-bottom:1px solid rgba(255,255,255,.04);color:var(--text2)}
+.evtl-r:hover{background:rgba(0,180,255,.04)}
+.evtl-r.ev-big{background:rgba(0,180,255,.05);box-shadow:inset 2px 0 0 var(--blue)}
+.evtl-nm{color:var(--text3);font-family:'Inter',sans-serif;font-size:9.5px;text-align:left;white-space:normal!important;line-height:1.5}
+.evtl-nm i{font-style:normal;color:var(--dim);font-size:7.5px}
 .ex-wrap{padding:0 14px 12px;display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:8px}
 .ex-card{background:var(--bg);border:1px solid var(--border);border-left-width:3px;border-radius:7px;padding:8px 10px;transition:border-color .2s,transform .2s}
 .ex-card:hover{transform:translateX(2px);border-color:var(--border2)}
@@ -342,6 +353,8 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
     </div>
     <div class="fttl" style="padding:14px 14px 7px">⑥ 极端行情 · 事件归因（哪些是因子推的，哪些是外部打进来的）</div>
     <div id="extList" class="ex-wrap"></div>
+    <div class="fttl" style="padding:14px 14px 7px">⑨ 十年关键事件时间线 · 当时价格与后续走势</div>
+    <div id="evtBox" class="ex-wrap"></div>
   </div>
 
   <div class="panel">
