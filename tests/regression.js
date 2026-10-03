@@ -3206,6 +3206,61 @@ const near = (label, actual, expect, tol) => {
     state.uniScore = null; state.composite = null; state.risk = null; state.oos = null; state.guardrail = null; state.klines = null;
   }
 
+  /* ===== X. 护栏 RED 通知（v3.30）—— 文案 + 触发/禁用路径（vm 内 stub fetch） ===== */
+  {
+    const G = {
+      status: 2, label: 'RED', dvolLevel: 2, regimeLevel: 2, nCrash: 2, accelLevel: 1, nAccel: 1, ready: true,
+      asof: Date.UTC(2022, 2, 1),
+      firing: [
+        { cat: 'rate', zh: '利率', kind: '超历史峰值', vsCrash: 1.1 },
+        { cat: 'vol', zh: '波动率', kind: '逼近历史峰值(≥0.8×)', vsCrash: 0.85 },
+      ],
+    };
+    const txt = run('buildGuardrailNotifyText')(G);
+    chk('X 通知文案含 RED 警报标题', txt.indexOf('RED 警报') >= 0, 'true');
+    chk('X 通知文案含分量危级', txt.indexOf('危') >= 0, 'true');
+    chk('X 通知文案含 超历史峰值 / vs崩溃', txt.indexOf('超历史峰值') >= 0 && txt.indexOf('vs崩溃') >= 0, 'true');
+    chk('X 通知文案无 NaN/undefined', txt.indexOf('NaN') < 0 && txt.indexOf('undefined') < 0, 'true');
+
+    /* 捕获 fetch 调用（stub 覆盖 vm 全局 fetch） */
+    let fetched = false, captured = null;
+    const realFetch = run('typeof fetch === "function" ? fetch : null');
+    vmSet('fetch', function (u, opt) { fetched = true; captured = { u: u, opt: opt }; return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve({ ok: true }); } }); });
+
+    /* 禁用路径：不调用 fetch、不抛异常、记录 prevStatus。
+     * 注意：fetch/captured 在 sendGuardrailNotify 跑到首个 await 之前即同步置位，
+     * 故同步断言即可，无需 await 冲刷（冲刷会让更早段落排队的 setTimeout(renderGuardrailInto)
+     * 触发、用真实非 RED 的 G 覆盖 _prevGuardStatus，造成误判）。 */
+    state.notify = { enabled: false, lastTs: 0, lastResult: null };
+    state._prevGuardStatus = 0;
+    fetched = false; captured = null;
+    let threw = false;
+    try { run('maybeNotifyGuardrail')(G); } catch (e) { threw = true; console.warn('X 禁用 threw', e); }
+    chk('X 禁用时 maybeNotifyGuardrail 不抛异常', !threw, 'true');
+    chk('X 禁用时不调用 fetch（未发通知）', !fetched, 'true');
+    chk('X 禁用时记录 prevStatus=2', state._prevGuardStatus === 2, 'true');
+
+    /* 启用 + 新一波 RED：应调用 fetch 且 POST /api/notify 携带 token/text */
+    state.notify = { enabled: true, lastTs: 0, lastResult: null };
+    state._prevGuardStatus = 0;
+    fetched = false; captured = null;
+    try { run('maybeNotifyGuardrail')(G); } catch (e) { threw = true; console.warn('X 启用 threw', e); }
+    chk('X 启用且新 RED 时调用 fetch', fetched, 'true');
+    chk('X 启用且新 RED 时 POST /api/notify', !!captured && /api\/notify$/.test(String(captured.u)), 'true');
+    const bodyStr = captured && captured.opt ? captured.opt.body : '';
+    chk('X 发送 payload 含 token 与 RED 警报文本', bodyStr.indexOf('"token"') >= 0 && bodyStr.indexOf('RED 警报') >= 0, 'true');
+
+    /* 持续 RED 冷却：60 分钟内不重复发 */
+    state.notify = { enabled: true, lastTs: Date.now(), lastResult: null };
+    state._prevGuardStatus = 2;
+    fetched = false;
+    try { run('maybeNotifyGuardrail')(G); } catch (e) { threw = true; }
+    chk('X 持续 RED 冷却期内不重复发（lastTs 在 60min 内）', !fetched, 'true');
+
+    /* 恢复 fetch（X 之后无更多 fetch 依赖，但保持卫生） */
+    if (realFetch) vmSet('fetch', realFetch);
+  }
+
   console.log('\n' + (fail ? `❌ 失败 ${fail} 项` : '✅ 全部断言通过'));
   process.exit(fail ? 1 : 0);
 })().catch(e => { console.error('FATAL', e.stack || e.message); process.exit(1); });

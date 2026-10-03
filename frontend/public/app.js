@@ -1,5 +1,5 @@
 /* =====================================================================
- * NEXUS TERMINAL v3.29 — 加密货币实时监测与因子关系终端
+ * NEXUS TERMINAL v3.30 — 加密货币实时监测与因子关系终端
  * 纯前端 / 无后端 / 无构建步骤。可直接 file:// 打开，也可部署到 Cloudflare。
  *
  * 数据源（全经 Cloudflare Worker 代理，解决中国大陆无法直连 + 浏览器 CORS）:
@@ -77,6 +77,7 @@ const state = {
   lastUpdate: null, interval: '1h',
   asof: null, histBundle: null, hist: null, zT: null, btcZ: null, klIdx: null,
   positions: [], acct: null, btStrat: 'ma',
+  notify: null, _prevGuardStatus: 0,  /* v3.30 护栏 RED 通知：配置 + 上次状态（边缘检测） */
 };
 
 /* ---------- 工具 ---------- */
@@ -3264,6 +3265,18 @@ function bindUI() {
     });
   });
   const refresh = $('refreshBtn'); if (refresh) refresh.addEventListener('click', refreshAll);
+  /* v3.30 护栏 RED 通知开关（默认关闭，需用户主动开启；状态存 localStorage） */
+  const nchk = $('notifyChk');
+  if (nchk) {
+    if (!state.notify) state.notify = loadNotifyCfg();
+    nchk.checked = !!state.notify.enabled;
+    nchk.addEventListener('change', function () {
+      if (!state.notify) state.notify = loadNotifyCfg();
+      state.notify.enabled = nchk.checked;
+      saveNotifyCfg(); updateNotifyUI();
+    });
+    updateNotifyUI();
+  }
 }
 
 /* =====================================================================
@@ -8705,6 +8718,109 @@ function guardrail(S, opts) {
 }
 
 /* =====================================================================
+ * ㉟+ 护栏 RED 通知（v3.30）—— 带外通道：群机器人 Webhook
+ * ---------------------------------------------------------------------
+ * 护栏进入 RED 时，前端经数据 Worker 的 /api/notify，把告警转发到用户配置的
+ * 群机器人 Webhook（企业微信 / 飞书 / 钉钉 / 自建均可，Worker 按 host 自动识别格式）。
+ * 这样用户不必 24h 盯盘也能被提醒 —— 直击「守城」减压需求。
+ *
+ * 触发规则（边缘 + 冷却，避免刷屏）：
+ *   · 仅在用户主动开启（state.notify.enabled，默认关闭）且 G.ready 时生效；
+ *   · 从非 RED 转入 RED（新一波）→ 立即发；
+ *   · 持续 RED 期间，每 60 分钟最多再发一次（冷却）；
+ *   · 不报方向，只报状态（与护栏自身一致）。
+ *
+ * 诚实边界：通知由前端触发，故「终端页面处于打开 / 后台运行」时才生效；
+ *   若要做到标签页关闭也照常推送，需要把护栏逻辑搬进 Worker 跑 Cron —— 那是更大的下一步，
+ *   本版明确不做（避免把上千行因子管线移植到边缘、引入分叉风险）。
+ *   另外 /api/notify 用共享 TOKEN + Origin 校验做基本防护；Webhook URL 本身作为
+ *   Worker 密钥（env.NOTIFY_WEBHOOK）存储，不进源码。
+ * ===================================================================== */
+const NOTIFY = {
+  TOKEN: 'nexus-rg-v330',
+  COOLDOWN_MS: 60 * 60 * 1000,
+  ENDPOINT: CONFIG.PROXY + '/api/notify',
+};
+
+function loadNotifyCfg() {
+  try {
+    const s = JSON.parse(localStorage.getItem('nexus_notify') || '{}');
+    return { enabled: !!s.enabled, lastTs: s.lastTs || 0, lastResult: s.lastResult || null };
+  } catch (e) { return { enabled: false, lastTs: 0, lastResult: null }; }
+}
+function saveNotifyCfg() {
+  try { if (state.notify) localStorage.setItem('nexus_notify', JSON.stringify(state.notify)); } catch (e) {}
+}
+
+function buildGuardrailNotifyText(G) {
+  const LVL = ['静', '警', '危'];
+  const lv = function (x) { return LVL[x == null ? 0 : x]; };
+  const d = (G.asof ? new Date(G.asof).toISOString().slice(0, 10) : '—');
+  const lines = [];
+  lines.push('【NEXUS 护栏 RED 警报】');
+  lines.push('时间：' + d);
+  lines.push('总状态：RED（危）');
+  lines.push('分量 → DVOL体制:' + lv(G.dvolLevel) + ' · 极端分位联动:' + lv(G.regimeLevel) + '(nCrash=' + (G.nCrash || 0) + ') · 变化率联动:' + lv(G.accelLevel) + '(nAccel=' + (G.nAccel || 0) + ')');
+  if (G.firing && G.firing.length) {
+    lines.push('触发项：');
+    G.firing.slice(0, 12).forEach(function (f) {
+      let s = '· ' + (f.zh || f.cat) + '：' + f.kind;
+      if (f.vsCrash != null) s += (f.vsCrash >= 1 ? '（超历史峰值）' : '（vs崩溃 ' + f.vsCrash.toFixed(2) + '×）');
+      lines.push(s);
+    });
+  }
+  lines.push('说明：报状态不报方向。各维度风险温度计已达 RED，建议复核仓位与波动暴露。');
+  lines.push('（nexus.uichain.org）');
+  return lines.join('\n');
+}
+
+function updateNotifyUI() {
+  if (typeof document === 'undefined') return;
+  const el = document.getElementById('notifyStat');
+  if (!el || !state.notify) return;
+  let t = state.notify.enabled ? 'RED 通知已开启' : 'RED 通知已关闭';
+  if (state.notify.lastResult) t += ' · ' + state.notify.lastResult;
+  el.textContent = t;
+}
+
+function maybeNotifyGuardrail(G) {
+  try {
+    if (!state.notify) state.notify = loadNotifyCfg();
+    const prev = state._prevGuardStatus || 0;
+    const now = Date.now();
+    if (state.notify.enabled && G && G.ready && G.status === 2) {
+      const freshEdge = prev !== 2;
+      const cooled = (now - (state.notify.lastTs || 0)) > NOTIFY.COOLDOWN_MS;
+      if (freshEdge || cooled) {
+        state.notify.lastTs = now;
+        sendGuardrailNotify(G);  /* 不 await：通知失败不应阻塞面板渲染 */
+      }
+    }
+    state._prevGuardStatus = (G ? G.status : 0);
+    saveNotifyCfg();
+    updateNotifyUI();
+  } catch (e) { console.warn('notify hook', e && e.message); }
+}
+
+async function sendGuardrailNotify(G) {
+  if (!state.notify) state.notify = loadNotifyCfg();
+  const text = buildGuardrailNotifyText(G);
+  try {
+    const r = await fetch(NOTIFY.ENDPOINT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: NOTIFY.TOKEN, text: text })
+    });
+    const j = await r.json().catch(function () { return {}; });
+    state.notify.lastResult = j.ok ? ('已发送 ' + new Date().toLocaleTimeString()) : ('失败:' + (j.error || ('HTTP ' + r.status)));
+  } catch (e) {
+    state.notify.lastResult = '失败:' + (e && e.message ? e.message : '网络');
+  }
+  saveNotifyCfg();
+  updateNotifyUI();
+}
+
+/* =====================================================================
  * ㉛ 径向影响星系图
  * ---------------------------------------------------------------------
  * 原来的力导向网络解决的是「因子之间怎么互相连」；这一版要回答的是另一个
@@ -9098,6 +9214,7 @@ function renderGuardrailInto(S) {
   if (!node) return;
   try {
     const G = state.guardrail || (state.guardrail = guardrail(S));
+    maybeNotifyGuardrail(G);  /* v3.30：RED 时经 Worker 转发到群机器人 Webhook（边缘触发 + 冷却）*/
     node.outerHTML = guardrailHTML(G);
   } catch (e) {
     console.warn('guardrail fail', e && e.message);

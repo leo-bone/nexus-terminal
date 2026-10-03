@@ -1,4 +1,4 @@
-# Nexus Terminal v3.29
+# Nexus Terminal v3.30
 
 加密货币 **实时监测 + 因子关系终端**。纯前端单页应用，无后端、无构建步骤。整站托管在 **Cloudflare**（前端 Workers Assets + 数据代理 Worker），并绑定自定义域名。
 
@@ -58,7 +58,22 @@
 
 ---
 
-## v3.29 变更（本次）
+## v3.30 变更（本次）
+
+**主题：护栏 RED 通知——进入 RED 时经数据 Worker 把告警转发到群机器人 Webhook，带外提醒，不必 24h 盯盘。**
+
+把 v3.28 落地的三联警报从"只在页面里亮红条"升级成"能主动找你"：
+
+1. **新增数据 Worker `/api/notify` 端点**：接收前端 POST 的告警文本，按 Webhook 的 host 自动识别 **企业微信 / 飞书 / 钉钉 / 自建** 的 payload 格式并转发；**Webhook URL 与校验 TOKEN 作为 Cloudflare Worker 密钥（`env.NOTIFY_WEBHOOK` / `env.NOTIFY_TOKEN`）存储，不进源码**；CORS 放行 POST（含预检）。
+2. **前端触发逻辑（`maybeNotifyGuardrail` + `sendGuardrailNotify`）**：护栏每轮计算后检查状态；仅在用户**主动开启**（开关默认关闭、状态存 localStorage）且信号就绪（`G.ready`）时生效；**边缘触发 + 冷却**——从非 RED 转入 RED（新一波）立即发，持续 RED 期间每 60 分钟最多再发一次，避免刷屏。
+3. **通知文案 `buildGuardrailNotifyText`**：含总状态 RED、三分量级别（DVOL 体制 / 极端分位联动 nCrash / 变化率联动 nAccel）、触发项清单（含 `vs崩溃` 倍数），并明确"**报状态不报方向**"，与护栏自身口径一致；顶部开关显示"已开启 / 已关闭 + 上次发送结果"。
+4. **版本号**：前端标题/徽标/页脚、数据 Worker `/health` 的 `version` 同步到 **v3.30**；README 新增本节。
+
+**诚实边界**：通知由**前端触发**，故"终端页面处于打开 / 后台运行"时才生效；标签页关闭则不推送——要做到真·无人值守，需要把护栏逻辑搬进 Worker 跑 Cron（更大的下一步，本版不做，避免移植上千行因子管线引入分叉风险）。`/api/notify` 用共享 TOKEN + Origin 做基本防护，Webhook URL 本身不暴露在前端。回归新增 **X 段**（文案无 NaN/undefined + 禁用不发送 + 启用且新 RED 时 POST `/api/notify` 携带 token/text），全量 T+U+V+W+X 断言全绿。
+
+---
+
+## v3.29 变更（上一版）
 
 **主题：给风险监测加「历史崩溃对照」，让护栏分量②的「极端」阈值有历史锚点、更可辩护。**
 

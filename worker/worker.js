@@ -10,6 +10,7 @@
  *   /api/fetch     白名单代理（浏览器所有外部请求经此，绕 GFW + CORS）
  *   /health        健康检查
  *   /api/probe     数据源可达性诊断
+ *   /api/notify    护栏 RED 通知转发（把告警 POST 到用户配置的群机器人 Webhook；Webhook URL 存于 env.NOTIFY_WEBHOOK，不进源码）
  *
  * 数据源（均为 CF 边缘实测可用）:
  *   Yahoo Finance     指数/汇率(含美元日元)/黄金/原油(WTI+布伦特)/农业 日线（主源）
@@ -32,7 +33,7 @@
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, OPTIONS',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type',
   'Cache-Control': 'public, max-age=300',
 };
@@ -1189,7 +1190,7 @@ const PROBE_URLS = [
 ];
 
 export default {
-  async fetch(request) {
+  async fetch(request, env) {
     const url = new URL(request.url);
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
 
@@ -1292,8 +1293,34 @@ export default {
       catch (e) { return jsonResp({ error: e.message }, 502); }
     }
 
+    /* v3.30 护栏 RED 通知：前端把告警文本发到这里，Worker 转发到群机器人 Webhook。
+     * Webhook URL 与校验 TOKEN 存于 env（wrangler secret），不进源码；
+     * 按 host 自动识别企业微信 / 飞书 / 钉钉 / 自建 的 payload 格式。 */
+    if (url.pathname === '/api/notify') {
+      if (request.method !== 'POST') return new Response('method not allowed', { status: 405, headers: CORS });
+      try {
+        const webhook = env.NOTIFY_WEBHOOK;
+        const tok = env.NOTIFY_TOKEN || '';
+        if (!webhook) return jsonResp({ ok: false, error: 'notify not configured' }, 503);
+        const body = await request.json().catch(function () { return {}; });
+        if (tok && body.token !== tok) return jsonResp({ ok: false, error: 'bad token' }, 403);
+        const text = String(body.text || '').slice(0, 2000);
+        if (!text) return jsonResp({ ok: false, error: 'empty text' }, 400);
+        let host = '';
+        try { host = new URL(webhook).hostname; } catch (e) {}
+        let payload;
+        if (host.indexOf('qyapi.weixin.qq.com') >= 0) payload = { msgtype: 'text', text: { content: text } };
+        else if (host.indexOf('open.feishu.cn') >= 0 || host.indexOf('larksuite.com') >= 0) payload = { msg_type: 'text', content: { text: text } };
+        else if (host.indexOf('oapi.dingtalk.com') >= 0) payload = { msgtype: 'text', text: { content: text } };
+        else payload = { text: text };
+        const r = await fetch(webhook, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+        const rt = await r.text();
+        return jsonResp({ ok: r.ok, upstream: r.status, len: rt.length }, r.ok ? 200 : 502);
+      } catch (e) { return jsonResp({ ok: false, error: e.message }, 502); }
+    }
+
     if (url.pathname === '/' || url.pathname === '/health') {
-      return jsonResp({ name: 'nexus-proxy', version: '3.29', status: 'ok', source: 'yahoo+stooq+nyfed+treasury+mof+coinlore+finforexfactory+bitcoin-data+bybit+deribit+proxy', universe: Object.keys(UNIVERSE).reduce(function(a,c){return a+Object.keys(UNIVERSE[c]).length;},0), symbols: Object.keys(SIMPLE).concat(['EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'JGB10Y', 'DVOL', 'DVHV']) });
+      return jsonResp({ name: 'nexus-proxy', version: '3.30', status: 'ok', source: 'yahoo+stooq+nyfed+treasury+mof+coinlore+finforexfactory+bitcoin-data+bybit+deribit+proxy', universe: Object.keys(UNIVERSE).reduce(function(a,c){return a+Object.keys(UNIVERSE[c]).length;},0), symbols: Object.keys(SIMPLE).concat(['EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'JGB10Y', 'DVOL', 'DVHV']) });
     }
 
     return new Response('Not Found', { status: 404, headers: CORS });
