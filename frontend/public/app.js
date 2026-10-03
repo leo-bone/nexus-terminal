@@ -2706,6 +2706,10 @@ function renderHistory() {
   /* v3.22 ㉒㉓：换手率与可执行性 + 信号健康度 */
   try { renderExecBox(); } catch (e) { console.warn('exec fail', e && e.message); }
   try { renderHealthBox(); } catch (e) { console.warn('health fail', e && e.message); }
+  /* v3.23 ㉔㉕㉖：仓位政策对比 / 收益归因 / 选择偏差（失败不影响主面板） */
+  try { renderPolicyBox(); } catch (e) { console.warn('policy box fail', e && e.message); }
+  try { renderAttrBox(); } catch (e) { console.warn('attr box fail', e && e.message); }
+  try { renderSelectBox(); } catch (e) { console.warn('select box fail', e && e.message); }
   renderOOS(S.oos);
   drawRollChart($('rollCanvas'), S.roll);
   drawHistChart($('histCanvas'), rep);
@@ -6197,5 +6201,749 @@ function renderHealthBox() {
         : ' —— 已越出检测带。') + '</div>';
   }
 
+  box.innerHTML = h;
+}
+
+/* =====================================================================
+ * v3.23 · 从「它好不好」到「好多少、好在哪、这个『好』能不能信」
+ *
+ * v3.22 留下了一句很难听但必须回答的话：这套评分加的仓位，毛夏普 0.85
+ * vs 躺平 1.02 —— **跑不赢躺着不动**。本轮把这句话拆开：
+ *
+ * ㉔ 不是「这个映射行不行」，而是「在几个**事前定死**的仓位政策里，
+ *     哪个最接近躺平，以及差距是否超过抽样噪声」。6 个政策全部披露，
+ *     不挑好看的；差距用 **平稳 bootstrap（Politis–Romano）** 给置信区间。
+ *     为什么必须用 block bootstrap：日收益有波动聚集，iid bootstrap 会
+ *     把波动 clustering 洗掉，从而低估夏普差的标准误 —— 那是自欺。
+ *
+ * ㉕ 收益归因：E[w·r] = E[w]·E[r] + Cov(w,r)。这是**恒等式**，不是模型，
+ *     所以它不会「算错」，只会被误读。它一句话回答「到底差在哪」：
+ *     第一部分是 beta（你平均端着多少敞口 × 市场平均涨多少），
+ *     第二部分才是 timing（仓位和收益的协变），也就是**信号真正贡献的部分**。
+ *
+ * ㉖ 选择偏差：从 6 个政策里挑最好的那个，其夏普必然被抬高 ——
+ *     这是**选择本身**造成的，不是政策好。用 Bailey–López de Prado 的
+ *     去通胀夏普（复用既有 deflatedSharpe，N = 政策数）压回去；
+ *     再用「循环移位」造零信息对照：把评分整体平移，时序对齐被切断而
+ *     单序列统计特性不变，看这 6 个政策还能吐出多好看的数字。
+ *     移位后仍然拿得到的夏普，就是**纯 beta 白送的那部分**。
+ * ===================================================================== */
+
+/* ---------- 预注册的仓位政策表 ----------
+ * 全部事前定死、全部展示。这里的任何「选一个最好的」都是多次比较，
+ * 所以 ㉖ 一定会把选择偏差算回来。改这张表 = 改 N，去通胀项随之变。 */
+const POLICIES = [
+  { id: 'linear', nm: '线性（现状）', d: 'w = clamp((评分−50)/50, ±1)' },
+  { id: 'longonly', nm: '只做多', d: '同上但不允许做空 —— 在年化 +69% 的资产上做空本就吃亏' },
+  { id: 'voltarget', nm: '波动率目标', d: 'w = 信号 × (目标波动 / 当前已实现波动)，上限 ±1' },
+  { id: 'slow', nm: '慢化 20 日', d: '先对评分做 20 日 EMA 再线性映射 —— 换手更低' },
+  { id: 'deadband', nm: '死区 ±8 分', d: '评分离 50 不足 8 分就不持仓，只在信号够强时动手' },
+  { id: 'bh', nm: '买入持有（基准）', d: 'w ≡ 1，不动', bench: true },
+];
+const VOLT_WIN = 60;          // 已实现波动窗口（事前定死，非调参）
+const SLOW_WIN = 20;          // 慢化窗口
+const DEADBAND = 8;           // 死区阈值（评分点）
+const BOOT_B = 600;           // 平稳 bootstrap 次数
+const BOOT_SEED = 20261003;   // 固定种子 —— 结果必须可复现，否则无法回归
+
+/* ---------- 基础统计量 ---------- */
+/* 注意 γ4 取**原始**标准化四阶矩（正态 = 3），不是超额峰度。
+ * Lo(2002) / Mertens(2002) 的夏普方差公式是
+ *   Var(SR̂) = [1 − γ3·SR + ((γ4 − 1)/4)·SR²] / n
+ * 代入 γ3=0, γ4=3 得 1 + SR²/2，与经典式一致 —— 这条正好可以用来验。
+ * 若误把 γ4 当超额峰度（正态 = 0），会算出 1 − SR²/4，符号都反了。 */
+function statMoments(x) {
+  const n = x.length;
+  if (n < 4) return null;
+  let m = 0;
+  for (let i = 0; i < n; i++) m += x[i];
+  m /= n;
+  let s2 = 0, s3 = 0, s4 = 0;
+  for (let i = 0; i < n; i++) {
+    const d = x[i] - m;
+    s2 += d * d; s3 += d * d * d; s4 += d * d * d * d;
+  }
+  s2 /= n; s3 /= n; s4 /= n;
+  const sd = Math.sqrt(s2);
+  if (!(sd > 0)) return null;
+  return { n: n, mean: m, sd: sd, g3: s3 / (sd * sd * sd), g4: s4 / (s2 * s2) };
+}
+
+/* ---------- 平稳 bootstrap（Politis & Romano 1994）----------
+ * 块长服从几何分布（均值 L），起点均匀，越界**循环回绕** —— 回绕是
+ * 「平稳」二字的来源：它保证重抽样序列的平稳分布与原序列一致。
+ * 为什么不用固定块长（moving block）：固定块的拼接点会破坏平稳性。
+ * L 的常规取法 ≈ n^(1/3)，事前定死，不按结果调。 */
+function statBootIdx(n, L, rnd) {
+  const idx = new Array(n);
+  const p = 1 / L;
+  const lg1p = Math.log(1 - p);
+  let i = 0;
+  while (i < n) {
+    const s = Math.floor(rnd() * n) % n;
+    const u = rnd();
+    let len = Math.ceil(Math.log(1 - u) / lg1p);
+    if (!(len >= 1)) len = 1;
+    for (let k = 0; k < len && i < n; k++, i++) idx[i] = (s + k) % n;
+  }
+  return idx;
+}
+
+/* 确定性 LCG —— bootstrap 必须可复现：不可复现的数字没法写回归断言，
+ * 也没法在界面上被人复核。 */
+function lcg(seed) {
+  let s = (seed >>> 0) || 1;
+  return function () { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; };
+}
+
+/* ---------- 回撤路径 ---------- */
+/* 输入为**单期净收益序列**，输出最大回撤、水下天数、最长水下、前三大回撤。
+ * 只看「最大回撤」一个数是不够的：同样是 −40%，三天修复和三年不修复
+ * 是完全不同的两件事，而后者才是真正让人拿不住的。 */
+function drawdownPath(rets) {
+  const n = rets.length;
+  if (n < 30) return null;
+  let eq = 1, peak = 1, mdd = 0;
+  const eqs = new Array(n);
+  for (let i = 0; i < n; i++) { eq *= (1 + rets[i]); eqs[i] = eq; if (eq > peak) peak = eq; const d = 1 - eq / peak; if (d > mdd) mdd = d; }
+  /* 分段统计每一次「下峰—回本」 */
+  const eps = [];
+  let pk = 1, pkI = -1, curMdd = 0, curI = -1, uw = 0, maxUw = 0;
+  for (let i = 0; i < n; i++) {
+    if (eqs[i] >= pk) {
+      if (curMdd > 0) { eps.push({ dd: curMdd, len: i - curI, rec: i - curI, start: curI, trough: curI }); uw = 0; maxUw = Math.max(maxUw, curI - pkI); }
+      pk = eqs[i]; pkI = i; curMdd = 0; curI = -1;
+    } else {
+      const d = 1 - eqs[i] / pk;
+      uw++;
+      if (uw > maxUw) maxUw = uw;
+      if (d > curMdd) { curMdd = d; curI = i; }
+    }
+  }
+  if (curMdd > 0) eps.push({ dd: curMdd, len: n - 1 - curI, rec: null, start: curI, trough: curI });
+  eps.sort(function (a, b) { return b.dd - a.dd; });
+  let uwDays = 0;
+  let pk2 = 1;
+  for (let i = 0; i < n; i++) { if (eqs[i] >= pk2) { pk2 = eqs[i]; } else uwDays++; }
+  return {
+    mdd: mdd, uwDays: uwDays, uwShare: uwDays / n, maxUw: maxUw,
+    top: eps.slice(0, 3), finalEq: eq, totalRet: eq - 1,
+  };
+}
+
+/* ---------- 仓位序列 ---------- */
+function policyW(rep, key) {
+  if (!rep || !rep.scores) return null;
+  const n = rep.n, start = rep.start, s = rep.scores;
+  const w = new Array(n).fill(null);
+  const firstValid = function () { for (let i = start; i < n; i++) { const v = s[i]; if (v != null && isFinite(v)) return v; } return null; };
+  if (key === 'bh') {
+    for (let i = start; i < n; i++) if (s[i] != null && isFinite(s[i])) w[i] = 1;
+    return w;
+  }
+  if (key === 'slow') {
+    const a = 2 / (SLOW_WIN + 1);
+    let e = firstValid();
+    if (e == null) return null;
+    for (let i = start; i < n; i++) {
+      const v = s[i];
+      if (v == null || !isFinite(v)) continue;
+      e = e + a * (v - e);
+      w[i] = Math.max(-1, Math.min(1, (e - 50) / 50));
+    }
+    return w;
+  }
+  if (key === 'voltarget') {
+    /* 目标波动率 = 买入持有的全样本已实现年化波动。
+     * 事前定死为「与基准同风险水平」，不是调出来的 —— 这样比较才公平：
+     * 波动目标政策被允许承担的总风险与躺平相当，剩下的差距就是择时本事。 */
+    const rs = [];
+    for (let i = start; i + 1 < n; i++) {
+      const a = rep.closes[i], b = rep.closes[i + 1];
+      if (a && b) rs.push(b / a - 1);
+    }
+    if (rs.length < 100) return null;
+    const M0 = statMoments(rs);
+    const target = M0.sd * Math.sqrt(365);
+    const vol = realizedVol(rep, VOLT_WIN);
+    for (let i = start; i < n; i++) {
+      const v = s[i];
+      if (v == null || !isFinite(v)) continue;
+      const raw = Math.max(-1, Math.min(1, (v - 50) / 50));
+      const sg = vol[i];
+      /* σ 缺失（开头或数据洞）时退回线性 —— 不能因为缺数据就变成 0 仓，
+       * 那会让政策凭空多出一堆「不持仓」的日子，比较就不干净了。 */
+      const sc = (sg && sg > 1e-8) ? target / sg : 1;
+      w[i] = Math.max(-1, Math.min(1, raw * sc));
+    }
+    return w;
+  }
+  if (key === 'deadband') {
+    for (let i = start; i < n; i++) {
+      const v = s[i];
+      if (v == null || !isFinite(v)) continue;
+      w[i] = Math.abs(v - 50) < DEADBAND ? 0 : Math.max(-1, Math.min(1, (v - 50) / 50));
+    }
+    return w;
+  }
+  if (key === 'longonly') {
+    for (let i = start; i < n; i++) {
+      const v = s[i];
+      if (v == null || !isFinite(v)) continue;
+      w[i] = Math.max(0, Math.min(1, (v - 50) / 50));
+    }
+    return w;
+  }
+  /* linear（默认） */
+  for (let i = start; i < n; i++) {
+    const v = s[i];
+    if (v == null || !isFinite(v)) continue;
+    w[i] = Math.max(-1, Math.min(1, (v - 50) / 50));
+  }
+  return w;
+}
+
+/* ---------- 单政策评估 ---------- */
+/* 返回：毛/净日收益序列、年化、波动、夏普、回撤、换手。
+ * 成本口径与 ㉒ 一致：往返 SIZE_ROUNDTRIP，每变动 |Δw| 付 |Δw|×往返/2。 */
+function policyEval(rep, w) {
+  if (!rep || !w) return null;
+  const n = rep.n, start = rep.start;
+  const gross = [], net = [], mkt = [];
+  let turn = 0, nT = 0, prev = null;
+  for (let i = start; i + 1 < n; i++) {
+    const a = w[i], b = w[i + 1];
+    const r = (rep.closes[i] && rep.closes[i + 1]) ? rep.closes[i + 1] / rep.closes[i] - 1 : null;
+    if (a == null || r == null || !isFinite(r)) { continue; }
+    /* 换手：从前一个有效仓位走到当前仓位；建仓首日按 0→|w| 计 */
+    const tv = (prev == null) ? Math.abs(a) : Math.abs(a - prev);
+    turn += tv; nT++; prev = a;
+    const g = a * r;
+    gross.push(g);
+    net.push(g - tv * SIZE_ROUNDTRIP / 2);
+    mkt.push(r);
+    if (b == null) prev = null;
+  }
+  if (gross.length < 200) return null;
+  const Mg = statMoments(gross), Mn = statMoments(net), Mm = statMoments(mkt);
+  if (!Mg || !Mn || !Mm) return null;
+  const ANN = Math.sqrt(365);
+  const shOf = function (M) { return M.sd > 0 ? M.mean / M.sd * ANN : null; };
+  const ddN = drawdownPath(net), ddB = drawdownPath(mkt);
+  /* 归因恒等式（用**总体**协方差，保证 mean(w·r) = mean(w)·mean(r) + cov 精确成立） */
+  const ws = [];
+  for (let i = start; i + 1 < n; i++) {
+    const a = w[i];
+    const r = (rep.closes[i] && rep.closes[i + 1]) ? rep.closes[i + 1] / rep.closes[i] - 1 : null;
+    if (a == null || r == null || !isFinite(r)) continue;
+    ws.push(a);
+  }
+  const at = attribution(ws, mkt);
+  return {
+    n: gross.length,
+    grossD: Mg.mean, netD: Mn.mean, mktD: Mm.mean,
+    grossY: Mg.mean * 365, netY: Mn.mean * 365, mktY: Mm.mean * 365,
+    volY: Mn.sd * ANN,
+    shG: shOf(Mg), shN: shOf(Mn), shMkt: shOf(Mm),
+    turnD: turn / Math.max(1, nT), costY: (turn / Math.max(1, nT)) * SIZE_ROUNDTRIP / 2 * 365,
+    g3: Mn.g3, g4: Mn.g4,
+    ddN: ddN, ddB: ddB,
+    calmarN: (ddN && ddN.mdd > 1e-9) ? (Mn.mean * 365) / ddN.mdd : null,
+    calmarB: (ddB && ddB.mdd > 1e-9) ? (Mm.mean * 365) / ddB.mdd : null,
+    attr: at, avgW: ws.length ? ws.reduce(function (a, b) { return a + b; }, 0) / ws.length : null,
+    gross: gross, net: net, mkt: mkt,
+  };
+}
+
+/* E[w·r] = E[w]·E[r] + Cov(w,r) —— 恒等式。
+ * beta 项 = 平均敞口 × 市场平均收益：这部分**不需要任何预测能力**，
+ * 只要一直端着仓位就有。timing 项 = 仓位于收益的协变：只有它才是信号挣来的。 */
+function attribution(w, r) {
+  const n = Math.min(w.length, r.length);
+  if (n < 50) return null;
+  let mw = 0, mr = 0, mwr = 0;
+  for (let i = 0; i < n; i++) { mw += w[i]; mr += r[i]; mwr += w[i] * r[i]; }
+  mw /= n; mr /= n; mwr /= n;
+  let cv = 0;
+  for (let i = 0; i < n; i++) cv += (w[i] - mw) * (r[i] - mr);
+  cv /= n;   // 总体协方差 ⇒ 恒等式精确成立
+  /* 敞口诊断 —— v3.23 实测发现这是整套系统最要紧的一个数：
+   * 评分的理论范围是 0–100，但真实十年里它只在 **20–77** 之间波动，
+   * 于是 |w| 平均只有 ~0.15，最大也不过 0.6。
+   * 也就是说这套评分**几乎从不表达强烈观点** —— 它大部分时间接近空仓。
+   * 这直接解释了两件事：为什么净年化只有 +10%（敞口本来就小），
+   * 以及为什么最大回撤只有 −19%（因为根本没怎么持仓，不是因为择时准）。
+   * 不把这层说破，很容易把「回撤小」误读成「风险控制得好」。 */
+  const absW = w.slice(0, n).map(function (v) { return Math.abs(v); }).sort(function (a, b) { return a - b; });
+  const qa = function (pp) { return absW[Math.min(absW.length - 1, Math.max(0, Math.floor(pp * absW.length)))]; };
+  return { n: n, meanW: mw, meanR: mr, cov: cv, total: mwr, beta: mw * mr, timing: cv,
+    betaY: mw * mr * 365, timingY: cv * 365, totalY: mwr * 365,
+    avgAbsW: absW.reduce(function (a, b) { return a + b; }, 0) / Math.max(1, absW.length),
+    p50AbsW: qa(0.5), p95AbsW: qa(0.95), maxAbsW: absW[absW.length - 1] };
+}
+
+/* ---------- ㉔ 政策对比 + 成对 bootstrap ---------- */
+function policyCompare(rep, opts) {
+  if (!rep || !rep.scores) return null;
+  const o = opts || {};
+  const B = o.B || BOOT_B;
+  const rows = [];
+  let bhRow = null;
+  for (let k = 0; k < POLICIES.length; k++) {
+    const P = POLICIES[k];
+    const w = policyW(rep, P.id);
+    if (!w) continue;
+    const ev = policyEval(rep, w);
+    if (!ev) continue;
+    const row = { id: P.id, nm: P.nm, d: P.d, bench: !!P.bench, ev: ev };
+    rows.push(row);
+    if (P.bench) bhRow = row;
+  }
+  if (!bhRow || rows.length < 2) return null;
+
+  /* 夏普差 vs 基准：单期（日）口径，成对 —— 两条序列用**同一份**重抽样的
+   * 下标序列，保留它们之间的横截面依赖。若各抽各的，会漏掉「两条序列
+   * 共享同一个市场」这件事，Δ 的标准误会被严重低估。 */
+  const base = bhRow.ev;
+  const nObs = Math.min(base.n, rows[0].ev.n);
+  const L = Math.max(5, Math.round(Math.pow(base.net.length, 1 / 3)));
+  const dS = [], dSg = [];
+  const rnd = lcg(o.seed || BOOT_SEED);
+  for (let b = 0; b < B; b++) {
+    const idx = statBootIdx(base.net.length, L, rnd);
+    for (let j = 0; j < rows.length; j++) {
+      if (rows[j].bench) continue;
+      const sn = sharpeOfIdx(rows[j].ev.net, idx);
+      const bn = sharpeOfIdx(base.net, idx);
+      const sg = sharpeOfIdx(rows[j].ev.gross, idx);
+      const bg = sharpeOfIdx(base.mkt, idx);
+      if (sn == null || bn == null) continue;
+      (rows[j].dNet || (rows[j].dNet = [])).push(sn - bn);
+      if (sg != null && bg != null) (rows[j].dGross || (rows[j].dGross = [])).push(sg - bg);
+    }
+  }
+  for (let j = 0; j < rows.length; j++) {
+    const R = rows[j];
+    if (R.bench) continue;
+    const a = R.dNet || [];
+    a.sort(function (x, y) { return x - y; });
+    const q = function (p) { return a.length ? a[Math.min(a.length - 1, Math.max(0, Math.floor(p * a.length)))] : null; };
+    let nPos = 0;
+    for (let i = 0; i < a.length; i++) if (a[i] > 0) nPos++;
+    R.boot = { B: a.length, L: L, lo: q(0.025), hi: q(0.975), med: q(0.5), pBeat: a.length ? nPos / a.length : null };
+    R.dNet = null; R.dGross = null;   // 不留在结果里占内存
+  }
+  return { rows: rows, bh: bhRow, nObs: base.net.length, L: L, B: B, policies: POLICIES.length };
+}
+function sharpeOfIdx(x, idx) {
+  let m = 0;
+  const n = idx.length;
+  for (let i = 0; i < n; i++) m += x[idx[i]];
+  m /= n;
+  let s = 0;
+  for (let i = 0; i < n; i++) { const d = x[idx[i]] - m; s += d * d; }
+  s /= (n - 1);
+  return s > 0 ? m / Math.sqrt(s) * Math.sqrt(365) : null;
+}
+
+/* ---------- ㉖ 零信息对照：循环移位 ---------- */
+/* 把评分序列整体循环移位 k 天：它自己的边际分布、波动、自相关**全部原样保留**，
+ * 只有「与未来收益的时序对齐」被切断。所以移位后剩下的任何表现，
+ * 都只能来自「平均敞口 × 市场漂移」—— 也就是纯 beta 白送的那部分。
+ * 这正是 ㉕ 归因里的第一项，两块在这里互相印证。 */
+function policyNull(rep, opts) {
+  if (!rep || !rep.scores) return null;
+  const o = opts || {};
+  const shifts = o.shifts || 10;
+  const n = rep.n, start = rep.start;
+  /* 有效评分区间的长度与起点 */
+  let lo = -1, hi = -1;
+  for (let i = start; i < n; i++) { const v = rep.scores[i]; if (v != null && isFinite(v)) { if (lo < 0) lo = i; hi = i; } }
+  if (lo < 0) return null;
+  const len = hi - lo + 1;
+  if (len < 400) return null;
+  const orig = new Array(len);
+  for (let i = 0; i < len; i++) orig[i] = rep.scores[lo + i];
+  const out = {};
+  for (let k = 0; k < POLICIES.length; k++) {
+    const P = POLICIES[k];
+    if (P.bench) continue;
+    out[P.id] = [];
+  }
+  const shiftsUsed = [];
+  for (let sIdx = 0; sIdx < shifts; sIdx++) {
+    /* 均匀铺开，且跳过太小的位移（太小则对齐几乎没被破坏） */
+    const k = Math.round(len * (sIdx + 1) / (shifts + 1));
+    if (k < 30) continue;
+    shiftsUsed.push(k);
+    const rep2 = { n: n, start: start, closes: rep.closes, calTs: rep.calTs, scores: new Array(n).fill(null) };
+    for (let i = 0; i < len; i++) rep2.scores[lo + i] = orig[(i + k) % len];
+    for (let kk = 0; kk < POLICIES.length; kk++) {
+      const P = POLICIES[kk];
+      if (P.bench) continue;
+      const w = policyW(rep2, P.id);
+      if (!w) continue;
+      const ev = policyEval(rep2, w);
+      if (!ev) continue;
+      out[P.id].push({ shN: ev.shN, shG: ev.shG, netY: ev.netY, k: k });
+    }
+  }
+  const res = { shifts: shiftsUsed, byPolicy: {}, n: len };
+  for (const id in out) {
+    const arr = out[id];
+    if (!arr.length) continue;
+    const shs = arr.map(function (a) { return a.shN == null ? -Infinity : a.shN; }).sort(function (a, b) { return a - b; });
+    const med = shs[Math.floor(shs.length / 2)];
+    const p95 = shs[Math.min(shs.length - 1, Math.floor(0.95 * shs.length))];
+    const nys = arr.map(function (a) { return a.netY == null ? -Infinity : a.netY; }).sort(function (a, b) { return a - b; });
+    res.byPolicy[id] = { n: arr.length, medShN: med === -Infinity ? null : med, p95ShN: p95 === -Infinity ? null : p95,
+      maxShN: shs[shs.length - 1] === -Infinity ? null : shs[shs.length - 1],
+      medNetY: nys[Math.floor(nys.length / 2)] === -Infinity ? null : nys[Math.floor(nys.length / 2)] };
+  }
+  return res;
+}
+
+/* ---------- ㉖ 去通胀夏普（政策选择的选择偏差）---------- */
+/* 复用既有 deflatedSharpe；这里的关键是把 N 取成**政策数**，
+ * 因为「挑一个最好的」这件事本身就是 N 次试验。
+ * V = 各政策夏普的样本方差（试验间的离散度）—— 试验越多、彼此差异越大，
+ * 挑出来的最大值里属于运气的成分就越多。 */
+function policySelectionBias(cmp) {
+  if (!cmp || !cmp.rows) return null;
+  const cand = cmp.rows.filter(function (r) { return !r.bench && r.ev && r.ev.shN != null; });
+  if (cand.length < 2) return null;
+  /* V 必须与交给 deflatedSharpe 的 srHat **同频率**，否则门槛会被放大 √(周期数) 倍。
+   * v3.23 实测踩到：直接拿年化夏普的样本方差（4.48e-2）当 V，
+   * 算出的门槛 SR0 是 **4.82（年化）** —— 比任何政策实测值都高一大截，
+   * 于是 DSR 恒为 0%，看上去像「所有政策都没本事」。
+   * 那不是结论，那是把年化的方差塞进了日频公式里：
+   * Var(年化夏普) = 365 × Var(日夏普)。除以 365 之后门槛回到 0.25，合理。
+   * 教训：**所有把「方差」传给另一个函数的场合，都要先确认两边的频率一致。** */
+  const ANN0 = Math.sqrt(365);
+  const srsDay = cand.map(function (r) { return r.ev.shN / ANN0; });
+  const M = statMoments(srsDay);
+  const V = (M && M.n > 1) ? (M.sd * M.sd * M.n / (M.n - 1)) : 0;
+  let best = null, bestJ = -1;
+  for (let i = 0; i < cand.length; i++) if (best == null || cand[i].ev.shN > best.ev.shN) { best = cand[i]; bestJ = i; }
+  const N = cand.length;
+  /* 全部换算到**单期（日）**口径再交给 deflatedSharpe，避免尺度串味 */
+  const ANN = Math.sqrt(365);
+  const srDay = best.ev.shN / ANN;   // 与上面的 V 同为日频
+  const bhDay = cmp.bh.ev.shN / ANN;
+  const T = best.ev.net.length;
+  const d = deflatedSharpe(srDay, T, best.ev.g3, best.ev.g4, N, V, bhDay);
+  return {
+    N: N, V: V, bestId: best.id, bestNm: best.nm,
+    srAnn: best.ev.shN, srDay: srDay,
+    sr0Ann: d.sr0 * ANN, sr0Day: d.sr0,
+    dsr: d.psr, psr0: d.psr0, psrBH: d.psrBH,
+    bhAnn: cmp.bh.ev.shN, T: T,
+    g3: best.ev.g3, g4: best.ev.g4,
+  };
+}
+
+/* ---------- ㉔ 渲染：仓位政策对比 ---------- */
+function renderPolicyBox() {
+  const box = $('policyBox');
+  if (!box) return;
+  const H = state.hist;
+  if (!H || !H.rep) { box.innerHTML = '<div class="rg-sub">需要先跑一次十年回放。</div>'; return; }
+  const C = H.policy || (H.policy = policyCompare(H.rep));
+  if (!C) { box.innerHTML = '<div class="rg-sub">数据不足以比较仓位政策（需要 ≥200 个连续交易日）。</div>'; return; }
+  const pc = function (v, dp) { return v == null ? '—' : (v >= 0 ? '+' : '') + (v * 100).toFixed(dp == null ? 2 : dp) + '%'; };
+  const num = function (v, dp) { return v == null ? '—' : v.toFixed(dp == null ? 2 : dp); };
+
+  /* 多一列「平均敞口」是必需的，不是装饰。理由见下面那条警告。 */
+  const COLS = '1.5fr .62fr .66fr .62fr .68fr .66fr .78fr .55fr';
+  let h = '<div class="rg-sub"><b>为什么要有这张表</b>：v3.22 说「毛夏普 0.85 vs 躺平 1.02」，' +
+    '但那只是<b>一种</b>把评分变成仓位的办法。换一种映射，结论可能不同 —— ' +
+    '所以这里<b>事前定死</b> 6 个政策（含基准），<b>全部列出</b>，不挑好看的。<br>' +
+    '成本口径同 ㉒：往返 ' + (SIZE_ROUNDTRIP * 100).toFixed(2) + '%，每变动 |Δw| 付 |Δw| × ' +
+    (SIZE_ROUNDTRIP / 2 * 100).toFixed(2) + '%。净额已扣成本。<b>关键看「净夏普 − 基准夏普」这一列</b>，' +
+    '以及它的 bootstrap 置信区间是否把 0 排除在外。</div>';
+
+  h += '<div class="rg-tbl" style="margin-top:8px">';
+  h += '<div class="rg-hd" style="grid-template-columns:' + COLS + '">' +
+    '<span>政策</span><span>净年化</span><span>净夏普</span><span>Δ夏普</span>' +
+    '<span>95% 区间</span><span>P(赢)</span><span>最大回撤</span><span>敞口</span></div>';
+  const bh = C.bh.ev;
+  for (let i = 0; i < C.rows.length; i++) {
+    const R = C.rows[i], E = R.ev;
+    const d = R.bench ? 0 : (E.shN - bh.shN);
+    const b = R.boot;
+    const wins = !R.bench && b && b.lo != null && b.hi != null && b.lo > 0;
+    const cls = R.bench ? 'rg-dim' : (d >= 0 ? 'rg-g' : 'rg-r');
+    h += '<div class="rg-row" style="grid-template-columns:' + COLS + '" title="' + R.d + '">' +
+      '<span class="rg-nm">' + (R.bench ? '<b>' + R.nm + '</b>' : R.nm) + (wins ? ' <i class="rg-g">✓</i>' : '') + '</span>' +
+      '<span class="' + cls + '">' + pc(E.netY, 1) + '</span>' +
+      '<span class="' + cls + '">' + num(E.shN) + '</span>' +
+      '<span class="' + (R.bench ? 'rg-dim' : cls) + '">' + (R.bench ? '基准' : (d >= 0 ? '+' : '') + num(d)) + '</span>' +
+      '<span>' + (R.bench || !b ? '—' : '[' + num(b.lo) + ', ' + num(b.hi) + ']') + '</span>' +
+      '<span>' + (R.bench || !b || b.pBeat == null ? '—' : (b.pBeat * 100).toFixed(0) + '%') + '</span>' +
+      '<span>' + (E.ddN ? pc(-E.ddN.mdd, 1) : '—') + '<i>' + (E.ddN ? ' 水下' + (E.ddN.uwShare * 100).toFixed(0) + '%' : '') + '</i></span>' +
+      '<span class="' + (Math.abs(E.avgW) < 0.25 ? 'rg-y' : '') + '">' + num(E.avgW) + '</span>' +
+      '</div>';
+  }
+  h += '</div>';
+  /* 夏普陷阱 —— 本轮实测撞上的最危险一处误读，必须写在表下面。
+   * 只做多的净夏普 1.14 > 躺平 1.02，看上去「赢了」；
+   * 但它的平均敞口只有 0.07（几乎全程空仓），年化 +9.6% vs 躺平 +68.9%。
+   * 夏普是「单位波动的收益」，而几乎空仓天然就低波动 ——
+   * 于是**什么都不做也能刷出高夏普**。跨敞口水平比较夏普是无效比较。 */
+  const lowExp = C.rows.filter(function (r) { return !r.bench && Math.abs(r.ev.avgW) < 0.25 && r.ev.shN > bh.shN; });
+  if (lowExp.length) {
+    h += '<div class="rg-sub"><b style="color:var(--yellow)">夏普陷阱（先读这段再看表）</b>：' +
+      lowExp.map(function (R) { return '「' + R.nm + '」'; }).join('、') +
+      ' 的净夏普 ' + lowExp.map(function (R) { return num(R.ev.shN); }).join(' / ') +
+      ' 高于基准 ' + num(bh.shN) + '，<b>但这不是它更优秀，而是它更空仓</b> —— ' +
+      '平均敞口只有 ' + lowExp.map(function (R) { return num(R.ev.avgW); }).join(' / ') +
+      '（基准恒为 1.00），年化却只有 ' + lowExp.map(function (R) { return pc(R.ev.netY, 1); }).join(' / ') +
+      '（基准 ' + pc(bh.netY, 1) + '）。' +
+      '<br>夏普是「每单位波动换来的收益」。几乎不持仓 ⇒ 波动极低 ⇒ 夏普天然被抬高，' +
+      '<b>几乎什么都没做也能刷出好看的夏普</b>。' +
+      '所以<b>敞口水平差得多的两个东西，不能直接比夏普</b> —— 这就是表上多一列「敞口」的原因。</div>';
+  }
+  h += '<div class="rg-sub"><span class="rg-dim">Δ夏普为「净夏普 − 买入持有夏普」；95% 区间来自<b>平稳 bootstrap</b>' +
+    '（块长 L=' + C.L + ' ≈ n^(1/3)，' + C.B + ' 次，两条序列共用同一份重抽样下标以保留横截面依赖）。' +
+    'P(赢) = 重抽样中 Δ>0 的比例。年化收益的绝对水平不要跨资产比较 —— BTC 十年年化 +69%，' +
+    '任何降低敞口的政策在收益上都会吃亏，所以要看<b>风险调整后</b>的差。</span></div>';
+
+  /* 诚实结论 */
+  let anyWin = false, bestD = -Infinity, bestNm = '';
+  for (let i = 0; i < C.rows.length; i++) {
+    const R = C.rows[i];
+    if (R.bench) continue;
+    const d = R.ev.shN - bh.shN;
+    if (d > bestD) { bestD = d; bestNm = R.nm; }
+    if (R.boot && R.boot.lo != null && R.boot.lo > 0) anyWin = true;
+  }
+  h += '<div class="rg-sub">' + (anyWin
+    ? '<b style="color:var(--green)">存在 Δ夏普 95% 区间整体在 0 之上的政策</b> —— 这才叫「赢过躺平」，不是点估计好看就算。'
+    : '<b style="color:var(--yellow)">没有任何一个政策的 Δ夏普 95% 区间把 0 排除在外</b>（最好的一个是「' +
+      bestNm + '」，Δ = ' + (bestD >= 0 ? '+' : '') + num(bestD) + '）。' +
+      '<br>这句话的准确含义：<b>不是证明它赢不了，是这段样本证明不了它赢了</b>。' +
+      '十年日频听起来很多，但 h=10 的非重叠观测只有 ~' + Math.round(C.nObs / 10) + ' 个 —— ' +
+      '这才是真正的样本量。') + '</div>';
+
+  /* 政策各自的一句话 */
+  h += '<div class="rg-sub"><b>各政策在做什么</b>：';
+  h += C.rows.filter(function (r) { return !r.bench; }).map(function (R) {
+    return '<br>· <b>' + R.nm + '</b>（' + R.d + '）：日均换手 ' + num(R.ev.turnD, 4) +
+      '，年化成本 ' + pc(-R.ev.costY, 2) + '，平均敞口 ' + num(R.ev.avgW) + '，' +
+      'Calmar ' + num(R.ev.calmarN);
+  }).join('') + '</div>';
+
+  box.innerHTML = h;
+}
+
+/* ---------- ㉕ 渲染：收益归因与回撤路径 ---------- */
+function renderAttrBox() {
+  const box = $('attrBox');
+  if (!box) return;
+  const H = state.hist;
+  if (!H || !H.rep) { box.innerHTML = '<div class="rg-sub">需要先跑一次十年回放。</div>'; return; }
+  const C = H.policy || (H.policy = policyCompare(H.rep));
+  if (!C) { box.innerHTML = '<div class="rg-sub">需要先完成政策对比。</div>'; return; }
+  const pc = function (v, dp) { return v == null ? '—' : (v >= 0 ? '+' : '') + (v * 100).toFixed(dp == null ? 2 : dp) + '%'; };
+  const num = function (v, dp) { return v == null ? '—' : v.toFixed(dp == null ? 2 : dp); };
+
+  /* 归因用「线性」政策讲，因为它是现状且不含任何平滑，最能暴露本质 */
+  const P0 = C.rows.filter(function (r) { return r.id === 'linear'; })[0] || C.rows.filter(function (r) { return !r.bench; })[0];
+  const A = P0 && P0.ev.attr;
+  const bh = C.bh.ev;
+
+  let h = '<div class="rg-sub"><b>一句话回答「到底差在哪」</b> —— 用恒等式把策略收益劈成两半：<br>' +
+    '<span style="font-family:JetBrains Mono,monospace">E[w·r] = E[w]·E[r] + Cov(w, r)</span><br>' +
+    '左边是你实际拿到的；右边第一项是<b>beta</b>（平均端着多少敞口 × 市场平均涨多少 —— ' +
+    '<b>不需要任何预测能力</b>），第二项是<b>timing</b>（仓位与收益的协变 —— ' +
+    '<b>只有这一项才是信号挣来的</b>）。这是恒等式不是模型，所以它不会算错，只会被误读。</div>';
+
+  if (A) {
+    const share = Math.abs(A.totalY) > 1e-9 ? A.timingY / A.totalY : null;
+    h += '<div class="rg-tbl" style="margin-top:8px">';
+    h += '<div class="rg-hd" style="grid-template-columns:1.6fr .8fr .8fr .8fr .9fr">' +
+      '<span>组成</span><span>年化</span><span>占总额</span><span>平均敞口</span><span>说明</span></div>';
+    h += '<div class="rg-row" style="grid-template-columns:1.6fr .8fr .8fr .8fr .9fr">' +
+      '<span class="rg-nm">beta（白送）</span><span class="rg-dim">' + pc(A.betaY, 1) + '</span>' +
+      '<span class="rg-dim">' + (A.totalY ? (A.betaY / A.totalY * 100).toFixed(0) + '%' : '—') + '</span>' +
+      '<span>' + num(A.meanW) + '</span><span class="rg-dim" style="text-align:left">不预测也有</span></div>';
+    h += '<div class="rg-row" style="grid-template-columns:1.6fr .8fr .8fr .8fr .9fr">' +
+      '<span class="rg-nm">timing（真本事）</span><span class="' + (A.timingY >= 0 ? 'rg-g' : 'rg-r') + '">' + pc(A.timingY, 1) + '</span>' +
+      '<span class="' + (A.timingY >= 0 ? 'rg-g' : 'rg-r') + '">' + (share == null ? '—' : (share * 100).toFixed(0) + '%') + '</span>' +
+      '<span class="rg-dim">—</span><span class="rg-dim" style="text-align:left">只有这部分是技能</span></div>';
+    h += '<div class="rg-row" style="grid-template-columns:1.6fr .8fr .8fr .8fr .9fr">' +
+      '<span class="rg-nm"><b>合计</b></span><span><b>' + pc(A.totalY, 1) + '</b></span>' +
+      '<span>100%</span><span>' + num(A.meanW) + '</span><span class="rg-dim" style="text-align:left">= 策略毛年化</span></div>';
+    h += '<div class="rg-row" style="grid-template-columns:1.6fr .8fr .8fr .8fr .9fr">' +
+      '<span class="rg-nm">买入持有</span><span class="rg-g">' + pc(bh.mktY, 1) + '</span>' +
+      '<span class="rg-dim">—</span><span>1.00</span><span class="rg-dim" style="text-align:left">敞口永远打满</span></div>';
+    h += '</div>';
+
+    h += '<div class="rg-sub">' + (A.timingY > 0
+      ? '<b>timing 项为正（' + pc(A.timingY, 1) + '，占 ' + (share == null ? '—' : (share * 100).toFixed(0)) + '%）</b> —— ' +
+        '说明这个评分确实挣到了一点钱，不是纯 beta。<b>但它太小了</b>：' +
+        '为了拿到它，你把平均敞口从 1.00 降到 ' + num(A.meanW) + '，' +
+        '白白放弃了 ' + pc(bh.mktY - A.betaY, 1) + ' 的 beta —— 捡了芝麻丢了西瓜。'
+      : '<b style="color:var(--red)">timing 项为负（' + pc(A.timingY, 1) + '）</b> —— ' +
+        '这比「贡献小」还糟：仓位与收益是<b>反向</b>协变的，' +
+        '也就是说在这个尺度上，评分变动带来的调仓<b>平均而言是在亏钱</b>。' +
+        '策略还能赚，全靠平均敞口 ' + num(A.meanW) + ' 端着的 beta。') +
+      '<br><span class="rg-dim">判据很清楚：一个择时策略要值得做，timing 项不仅要为正，' +
+      '还要大到能补回「因为降低敞口而少赚的 beta」。在十年年化 +69% 的资产上，' +
+      '这道坎高得离谱 —— 这就是为什么 ⑲ 的答案是「建议仓位 0」。</span></div>';
+
+    /* 敞口诊断 —— 本轮最要紧的一个数，必须单独讲。
+     * 不看它，「回撤只有 −19%」会被当成风控做得好；
+     * 看了才知道，那是因为<b>根本没怎么持仓</b>。 */
+    h += '<div class="rg-sub"><b>敞口诊断：这套评分几乎从不表达强烈观点</b>' +
+      '<br>评分的理论范围是 0–100，但真实十年里它的实际动态范围窄得多 —— ' +
+      '于是实际仓位 |w| 的平均值只有 <b>' + num(A.avgAbsW) + '</b>，' +
+      '中位数 ' + num(A.p50AbsW) + '，95 分位 <b>' + num(A.p95AbsW) + '</b>，' +
+      '历史最大也只有 <b>' + num(A.maxAbsW) + '</b>（满仓 = 1）。' +
+      '<br><b style="color:var(--yellow)">这句话把前面所有数都重新解释了一遍</b>：' +
+      '净年化只有 ' + pc(P0.ev.netY, 1) + ' 而躺平是 ' + pc(bh.mktY, 1) +
+      '，主要不是因为方向看错，而是因为<b>平均只端着 ' + (A.avgAbsW * 100).toFixed(0) + '% 的仓</b>；' +
+      '最大回撤只有 ' + pc(-P0.ev.ddN.mdd, 1) + ' 而躺平是 ' + pc(-bh.ddB.mdd, 1) +
+      '，也不是因为择时准，而是因为<b>大部分时间接近空仓</b>。' +
+      '<br><span class="rg-dim">所以真正该追问的不是「换个仓位政策能不能救」，' +
+      '而是<b>评分本身为什么这么保守</b> —— 22 个因子加权求和后，' +
+      '正负相消把幅度磨平了（v3.20 的分歧度面板就在讲这件事）。' +
+      '在评分的动态范围被打开之前，任何仓位政策都只能在很小的敞口上做文章。</span></div>';
+  }
+
+  /* 回撤路径 */
+  const dn = bh.ddB, ds = P0 && P0.ev.ddN;
+  if (dn && ds) {
+    h += '<div class="rg-sub"><b>回撤路径</b>：只看最大回撤一个数不够 —— 同样 −40%，三天修复和三年不修复是两回事，' +
+      '而后者才是真正让人拿不住的。';
+    h += '<br>· 买入持有：最大回撤 <b>' + pc(-dn.mdd, 1) + '</b>，水下天数占比 ' + (dn.uwShare * 100).toFixed(0) +
+      '%，最长连续水下 <b>' + dn.maxUw + '</b> 天，Calmar ' + num(bh.calmarB);
+    h += '<br>· 信号（' + P0.nm + '，净）：最大回撤 <b>' + pc(-ds.mdd, 1) + '</b>，水下天数占比 ' +
+      (ds.uwShare * 100).toFixed(0) + '%，最长连续水下 <b>' + ds.maxUw + '</b> 天，Calmar ' + num(P0.ev.calmarN);
+    if (ds.mdd < dn.mdd) {
+      h += '<br><b style="color:var(--green)">回撤深度确实被削掉了</b>（' + pc(-dn.mdd, 1) + ' → ' + pc(-ds.mdd, 1) + '）。' +
+        '但必须同时看下面两行，否则会得出完全相反的印象：' +
+        '<br>· <b>水下时间反而更长</b>：' + (dn.uwShare * 100).toFixed(0) + '% → ' + (ds.uwShare * 100).toFixed(0) +
+        '%，最长连续水下 ' + dn.maxUw + ' → <b>' + ds.maxUw + '</b> 天。' +
+        '<span class="rg-dim">因为它十年只涨 ' + pc(P0.ev.netY, 1) + '/年，净值曲线又平又慢，' +
+        '「回到前高」这件事反而更难发生 —— 回撤浅，但一直在水下。</span>' +
+        '<br>· <b>代价是年化 ' + pc(bh.mktY - P0.ev.netY, 1) + '</b>。' +
+        '<br>把这两条放在一起，这笔买卖才说得清楚：用 ' + pc(bh.mktY - P0.ev.netY, 1) +
+        ' 的年化，换「最深那一下从 ' + pc(-dn.mdd, 1) + ' 变成 ' + pc(-ds.mdd, 1) + '」，' +
+        '但同时换来「几乎全程在水下」。<b>只有明确受不了 ' + pc(-dn.mdd, 1) + ' 那一下的人，这笔才划算</b>；' +
+        '受不了「长期不回本」的人，它比躺平更难受。</div>';
+    } else {
+      h += '<br><b style="color:var(--red)">连回撤都没削下来</b> —— 那么这个信号在这段样本上<b>没有任何可辩护的用途</b>。</div>';
+    }
+    if (ds.top && ds.top.length) {
+      h += '<div class="rg-sub" style="padding-top:4px">信号策略前三大回撤：' +
+        ds.top.map(function (e, i) {
+          return '#' + (i + 1) + ' ' + pc(-e.dd, 1) + '（' + (e.rec == null ? '截至末尾未修复' : '历时 ' + e.rec + ' 天修复') + '）';
+        }).join('　') + '</div>';
+    }
+  }
+  box.innerHTML = h;
+}
+
+/* ---------- ㉖ 渲染：选择偏差与零信息对照 ---------- */
+function renderSelectBox() {
+  const box = $('selectBox');
+  if (!box) return;
+  const H = state.hist;
+  if (!H || !H.rep) { box.innerHTML = '<div class="rg-sub">需要先跑一次十年回放。</div>'; return; }
+  const C = H.policy || (H.policy = policyCompare(H.rep));
+  if (!C) { box.innerHTML = '<div class="rg-sub">需要先完成政策对比。</div>'; return; }
+  const S = policySelectionBias(C);
+  const NU = H.policyNull || (H.policyNull = policyNull(H.rep));
+  const num = function (v, dp) { return v == null ? '—' : v.toFixed(dp == null ? 2 : dp); };
+  const pc = function (v, dp) { return v == null ? '—' : (v >= 0 ? '+' : '') + (v * 100).toFixed(dp == null ? 2 : dp) + '%'; };
+
+  let h = '<div class="rg-sub"><b>从 6 个政策里挑最好的那一个，夏普必然虚高</b> —— ' +
+    '这是<b>选择本身</b>造成的，不是那个政策真的好。' +
+    '看的人只看到被挑出来的那个，看不到被丢掉的 5 个，于是运气被当成了本事。<br>' +
+    '这里用 Bailey–López de Prado 的去通胀夏普把这部分压回去（N = 政策数 = ' +
+    (S ? S.N : '—') + '，V = 各政策夏普的样本方差）。</div>';
+
+  if (S) {
+    h += '<div class="rg-tbl" style="margin-top:8px">';
+    h += '<div class="rg-hd" style="grid-template-columns:1.3fr .7fr .8fr .8fr .8fr">' +
+      '<span>口径</span><span>年化夏普</span><span>门槛 SR₀</span><span>去通胀后 P</span><span>对照</span></div>';
+    h += '<div class="rg-row" style="grid-template-columns:1.3fr .7fr .8fr .8fr .8fr">' +
+      '<span class="rg-nm">最好的政策（' + S.bestNm + '）</span>' +
+      '<span><b>' + num(S.srAnn) + '</b></span>' +
+      '<span class="rg-dim">—</span>' +
+      '<span class="' + (S.psr0 > 0.95 ? 'rg-g' : 'rg-dim') + '">' + (S.psr0 * 100).toFixed(1) + '%</span>' +
+      '<span class="rg-dim" style="text-align:left">P(夏普 &gt; 0)</span></div>';
+    h += '<div class="rg-row" style="grid-template-columns:1.3fr .7fr .8fr .8fr .8fr">' +
+      '<span class="rg-nm">扣掉「挑过一轮」的运气</span>' +
+      '<span class="rg-dim">' + num(S.srAnn) + '</span>' +
+      '<span class="rg-y">' + num(S.sr0Ann) + '</span>' +
+      '<span class="' + (S.dsr > 0.95 ? 'rg-g' : 'rg-r') + '">' + (S.dsr * 100).toFixed(1) + '%</span>' +
+      '<span class="rg-dim" style="text-align:left">去通胀夏普 DSR</span></div>';
+    h += '<div class="rg-row" style="grid-template-columns:1.3fr .7fr .8fr .8fr .8fr">' +
+      '<span class="rg-nm">真正该问的</span>' +
+      '<span class="rg-dim">' + num(S.bhAnn) + '（基准）</span>' +
+      '<span class="rg-dim">—</span>' +
+      '<span class="' + (S.psrBH > 0.95 ? 'rg-g' : 'rg-r') + '">' + (S.psrBH == null ? '—' : (S.psrBH * 100).toFixed(1) + '%') + '</span>' +
+      '<span class="rg-dim" style="text-align:left">P(赢过躺平)</span></div>';
+    h += '</div>';
+    h += '<div class="rg-sub"><b>门槛 SR₀ = ' + num(S.sr0Ann) + '</b>：即使 6 个政策全无真本事，' +
+      '「挑最好的那个」这件事本身也会平均送出这么高的年化夏普。' +
+      '实测最好的那个是 ' + num(S.srAnn) + ' —— ' +
+      (S.srAnn > S.sr0Ann
+        ? '<b>仍然高于门槛</b>，去通胀后 P = ' + (S.dsr * 100).toFixed(1) + '%。'
+        : '<b style="color:var(--red)">已经低于门槛</b>，即「挑最好的」这件事本身就足以解释它 —— ' +
+          '去通胀后 P = ' + (S.dsr * 100).toFixed(1) + '%，<b>没有证据表明它有任何真本事</b>。') +
+      '<br><span class="rg-dim">样本偏度 γ3 = ' + num(S.g3) + '，峰度 γ4 = ' + num(S.g4) +
+      '（正态=3）。已经用矩调整后的夏普方差计算 —— 加密资产收益厚尾得厉害，' +
+      '用正态假设会低估方差、把显著性算高。</span></div>';
+
+    /* 三个检验给出三个答案，必须说清楚它们问的不是同一件事，
+     * 否则 99.8% 这种数字会一个人把整个面板的结论带跑。 */
+    h += '<div class="rg-sub"><b>三个检验问的是三件不同的事，不一致时以最严的为准</b>：' +
+      '<br>① <b>去通胀夏普 DSR = ' + (S.dsr * 100).toFixed(1) + '%</b> —— 问的是「是否超过 ' + S.N +
+      ' 次随机尝试里最好的那个」。门槛 SR₀ = ' + num(S.sr0Ann) + '，比较低，所以容易过。' +
+      '<br>② <b>P(赢过躺平) = ' + (S.psrBH == null ? '—' : (S.psrBH * 100).toFixed(1) + '%') +
+      '</b> —— 问的是「是否超过基准」。这才是你真正想知道的，而它远没有 DSR 那么好看。' +
+      '<br>③ <b>零信息对照</b>（下表）—— 问的是「是否超过同一套政策在<b>假信号</b>上的表现」，' +
+      '门槛最贴近实际、也最严。' +
+      '<br><span class="rg-dim"><b>为什么 DSR 能到 99.8% 而赢过躺平只有 ' +
+      (S.psrBH == null ? '—' : (S.psrBH * 100).toFixed(0)) + '%？</b>' +
+      '因为这两件事的难度差得远：「比随机噪声强」和「比躺平强」不是一个量级的要求 —— ' +
+      '在十年年化 +69% 的市场里，躺平本身就是一个极强的对手。' +
+      '看到 DSR 很高时，请先看 ② 和 ③。</span></div>';
+  }
+
+  /* 零信息对照 */
+  if (NU && NU.shifts && NU.shifts.length) {
+    h += '<div class="rg-sub"><b>零信息对照</b>：把评分<b>整体循环移位</b>（' + NU.shifts.length +
+      ' 个不同位移，见 ' + NU.shifts.slice(0, 5).join('/') + '… 天）。' +
+      '移位后评分自己的边际分布、波动、自相关<b>全部原样保留</b>，' +
+      '只有「与未来收益的时序对齐」被切断。所以移位之后还拿得到的收益，' +
+      '只可能来自「平均敞口 × 市场漂移」—— 也就是 ㉕ 里那个 beta 项，白送的。</div>';
+    h += '<div class="rg-tbl" style="margin-top:6px">';
+    h += '<div class="rg-hd" style="grid-template-columns:1.4fr .8fr .8fr .8fr .9fr">' +
+      '<span>政策</span><span>实测净夏普</span><span>零信息中位</span><span>零信息 95%</span><span>判定</span></div>';
+    const bhS = C.bh.ev.shN;
+    for (let i = 0; i < C.rows.length; i++) {
+      const R = C.rows[i];
+      if (R.bench) continue;
+      const z = NU.byPolicy[R.id];
+      if (!z) continue;
+      const passes = R.ev.shN > z.p95ShN;
+      h += '<div class="rg-row" style="grid-template-columns:1.4fr .8fr .8fr .8fr .9fr">' +
+        '<span class="rg-nm">' + R.nm + '</span>' +
+        '<span class="' + (R.ev.shN >= 0 ? 'rg-g' : 'rg-r') + '">' + num(R.ev.shN) + '</span>' +
+        '<span class="rg-dim">' + num(z.medShN) + '</span>' +
+        '<span class="rg-dim">' + num(z.p95ShN) + '</span>' +
+        '<span class="' + (passes ? 'rg-g' : 'rg-r') + '" style="text-align:left">' +
+        (passes ? '超出噪声带' : '落在噪声带内') + '</span></div>';
+    }
+    h += '</div>';
+    h += '<div class="rg-sub"><span class="rg-dim">判定标准：实测值要超过零信息的 <b>95% 分位</b>才算"不是运气"。' +
+      '注意零信息的中位夏普往往<b>并不接近 0</b> —— 因为平均敞口仍然是正的，' +
+      '在牛市里照样白捡 beta。这正是 ㉕ 归因里第一项在另一个场景下的再现。' +
+      '换句话说：<b>一个"夏普显著为正"的策略，可能只是"端着多头仓"而已</b>。</span></div>';
+  }
   box.innerHTML = h;
 }

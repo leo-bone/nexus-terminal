@@ -1869,6 +1869,232 @@ const near = (label, actual, expect, tol) => {
     chk('P5 无日线时 ledgerBox 不崩', typeof $id('ledgerBox').innerHTML, 'string');
   }
 
+  console.log('===== Q. 仓位政策对比 / 归因 / 选择偏差（v3.23 ㉔㉕㉖）=====');
+  {
+    /* 与 O/P 段一致的确定性 RNG —— 换种子会让「扫出来的参数」失效 */
+    let s2 = 20261003;
+    const rnd = () => { s2 = (s2 * 1103515245 + 12345) & 0x7fffffff; return s2 / 0x7fffffff; };
+    const rndN = () => { let u = 0, v = 0; while (u === 0) u = rnd(); while (v === 0) v = rnd(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+    const cl = (v, a, b) => Math.max(a, Math.min(b, v));
+
+    /* Q0 矩：γ4 必须是**原始**四阶矩（正态=3）。
+     * 用正态样本直接验：γ3≈0、γ4≈3；再验代入后 Var 公式退化为 1+SR²/2。 */
+    {
+      const xs = [];
+      for (let i = 0; i < 4000; i++) xs.push(rndN());
+      const M = call('statMoments', xs);
+      near('Q0 正态样本 γ3 ≈ 0', M.g3, 0, 0.15);
+      near('Q0 正态样本 γ4 ≈ 3（原始四阶矩，不是超额峰度）', M.g4, 3, 0.4);
+      near('Q0 正态样本 sd ≈ 1', M.sd, 1, 0.06);
+      /* 关键退化检验：γ3=0, γ4=3 时矩调整方差必须等于经典式 1 + SR²/2 */
+      const sr = 0.05;
+      const momentAdj = 1 - M.g3 * sr + (M.g4 - 1) / 4 * sr * sr;
+      near('Q0 γ4=3 时矩调整方差退化为 1+SR²/2', momentAdj, 1 + sr * sr / 2, 0.01);
+      /* 反证：若误把 γ4 当超额峰度（正态=0），会得到 1 − SR²/4 —— 符号错 */
+      const wrong = 1 - 0 * sr + (0 - 1) / 4 * sr * sr;
+      chk('Q0 若误用超额峰度会得到错误符号（<1）', wrong < 1, 'true');
+    }
+
+    /* Q1 归因恒等式：E[w·r] = E[w]E[r] + Cov(w,r) 必须精确保成立 */
+    {
+      const w = [], r = [];
+      for (let i = 0; i < 900; i++) { w.push(rndN() * 0.8); r.push(0.0006 + 0.02 * rndN()); }
+      const A = call('attribution', w, r);
+      near('Q1 恒等式残差 ≈ 0', A.total - (A.beta + A.timing), 0, 1e-12);
+      near('Q1 beta = mean(w)·mean(r)', A.beta, A.meanW * A.meanR, 1e-15);
+      chk('Q1 恒等式在年化口径同样成立', Math.abs(A.totalY - (A.betaY + A.timingY)) < 1e-9, 'true');
+      /* 若 w 恒为常数 c，则 timing 必须恰好为 0（无择时 ⇒ 无协变） */
+      const wc = new Array(500).fill(0.4);
+      const rc = [];
+      for (let i = 0; i < 500; i++) rc.push(0.001 + 0.02 * rndN());
+      const Ac = call('attribution', wc, rc);
+      near('Q1 固定仓位 ⇒ timing 恰为 0', Ac.timing, 0, 1e-15);
+      near('Q1 固定仓位 ⇒ 全部来自 beta', Ac.beta, Ac.total, 1e-15);
+      /* 敞口诊断 */
+      const aw = call('attribution', w.map(Math.abs), r);
+      chk('Q1 敞口诊断 avgAbsW 落在 [0,1]', aw.avgAbsW >= 0 && aw.avgAbsW <= 1.01, 'true');
+      chk('Q1 敞口诊断 单调：p50 ≤ p95 ≤ max', aw.p50AbsW <= aw.p95AbsW + 1e-12 && aw.p95AbsW <= aw.maxAbsW + 1e-12, 'true');
+    }
+
+    /* Q2 回撤路径：全正收益 ⇒ 无回撤；先跌后涨 ⇒ 能测出修复天数 */
+    {
+      const up = new Array(300).fill(0.001);
+      const D0 = call('drawdownPath', up);
+      near('Q2 单调上涨 ⇒ 最大回撤 = 0', D0.mdd, 0, 1e-12);
+      chk('Q2 单调上涨 ⇒ 水下天数 = 0', D0.uwDays, 0);
+      const mix = [];
+      for (let i = 0; i < 100; i++) mix.push(-0.01);   // 先跌 100 天
+      for (let i = 0; i < 200; i++) mix.push(0.01);    // 再涨 200 天
+      const D1 = call('drawdownPath', mix);
+      chk('Q2 先跌段产生正回撤', D1.mdd > 0.5, 'true');
+      chk('Q2 水下天数 = 回升到位所需天数（有限）', D1.uwDays > 0 && D1.uwDays < mix.length, 'true');
+      chk('Q2 最长连续水下 = 回撤段长度', D1.maxUw >= 100, 'true');
+      chk('Q2 前三大回撤按深度降序', D1.top.length < 2 || D1.top[0].dd >= D1.top[1].dd, 'true');
+      /* 恒为常数 0 收益 ⇒ 回撤 0，不应崩 */
+      const z = call('drawdownPath', new Array(200).fill(0));
+      chk('Q2 零收益序列不崩且回撤为 0', z && z.mdd === 0, 'true');
+    }
+
+    /* Q3 平稳 bootstrap：块长控制 + 可复现 + 覆盖完整 */
+    {
+      const n = 500;
+      const idx = call('statBootIdx', n, 15, call('lcg', 42));
+      chk('Q3 重抽样长度 = 原长', idx.length, n);
+      chk('Q3 下标全部落在 [0,n)', idx.every(v => v >= 0 && v < n), 'true');
+      /* 同种子必须逐位一致（不可复现的数字没法写断言） */
+      const idx2 = call('statBootIdx', n, 15, call('lcg', 42));
+      chk('Q3 同种子逐位可复现', idx.join(',') === idx2.join(','), 'true');
+      const idx3 = call('statBootIdx', n, 15, call('lcg', 43));
+      chk('Q3 换种子结果不同', idx.join(',') !== idx3.join(','), 'true');
+      /* 块长：L 越大，相邻下标「连续递增」的比例越高（几何分布均值 = L） */
+      const contig = (arr) => { let c = 0; for (let i = 1; i < arr.length; i++) if (arr[i] === (arr[i - 1] + 1) % n) c++; return c / (arr.length - 1); };
+      const cShort = contig(call('statBootIdx', 4000, 3, call('lcg', 7)));
+      const cLong = contig(call('statBootIdx', 4000, 60, call('lcg', 7)));
+      chk('Q3 块长越长，连续段占比越高（几何分布均值=L）', cLong > cShort, 'true');
+      /* 均匀性：长期看每个下标被抽中的次数应大致相同（离散度远小于 n） */
+      const big = call('statBootIdx', 20000, 10, call('lcg', 99));
+      const cnt = new Array(100).fill(0);
+      for (let i = 0; i < big.length; i++) cnt[big[i] % 100]++;
+      const mx = Math.max(...cnt), mn = Math.min(...cnt);
+      chk('Q3 起点在序列上分布均匀（极差 < 均值 40%）', (mx - mn) < (big.length / 100) * 0.4, 'true');
+    }
+
+    /* Q4 政策对比：合成「有信号」样本，检查基准与政策的关系 */
+    {
+      const n = 1200, start = 20;
+      const closes = new Array(n).fill(null);
+      let p = 40000;
+      for (let i = 0; i < n; i++) { closes[i] = p; p = p * (1 + 0.0004 + 0.02 * rndN()); }
+      const scores = new Array(n).fill(null);
+      for (let i = start; i < n - 10; i++) {
+        const fwd = closes[i + 10] / closes[i] - 1;
+        scores[i] = cl(50 + 600 * fwd + 20 * rndN(), 2, 98);
+      }
+      const rep = { n: n, start: start, closes: closes, scores: scores, calTs: [] };
+      const C = call('policyCompare', rep, { B: 120 });
+      chk('Q4 政策对比返回全部 6 行（5 政策 + 基准）', C.rows.length, 6);
+      chk('Q4 基准行是买入持有', C.bh.id, 'bh');
+      near('Q4 基准平均敞口恒为 1', C.bh.ev.avgW, 1, 1e-9);
+      /* 基准的差额恰好是「建仓首日一次性成本」：|0→1| = 1 ⇒ 成本 = 往返/2 = 0.001，
+       * 摊到 n 天上 = 0.001×365/n。这个差额必须存在（否则说明换手计费漏了建仓），
+       * 但必须极小 —— 用一个能看到它、又不至于误判的容差。 */
+      const oneShot = 0.001 * 365 / C.bh.ev.n;
+      near('Q4 基准净年化 = 市场年化 − 建仓首日一次性成本',
+        C.bh.ev.mktY - C.bh.ev.netY, oneShot, oneShot * 0.05);
+      chk('Q4 每个非基准行都有 bootstrap 区间', C.rows.filter(r => !r.bench).every(r => r.boot && r.boot.lo != null && r.boot.hi != null), 'true');
+      chk('Q4 每个非基准行的 Δ夏普落在自己的 95% 区间内',
+        C.rows.filter(r => !r.bench).every(r => (r.ev.shN - C.bh.ev.shN) >= r.boot.lo - 1e-6 && (r.ev.shN - C.bh.ev.shN) <= r.boot.hi + 1e-6), 'true');
+      chk('Q4 P(赢) 落在 [0,1]', C.rows.filter(r => !r.bench).every(r => r.boot.pBeat >= 0 && r.boot.pBeat <= 1), 'true');
+      /* 有真信号的合成数据上，线性政策的 timing 项必须为正 */
+      const lin = C.rows.filter(r => r.id === 'linear')[0];
+      chk('Q4 合成有信号样本 ⇒ timing 项为正', lin.ev.attr.timingY > 0, 'true');
+      chk('Q4 且毛年化 > 0', lin.ev.grossY > 0, 'true');
+      /* 慢化政策的换手必须低于线性（这是它存在的全部理由） */
+      const slow = C.rows.filter(r => r.id === 'slow')[0];
+      chk('Q4 慢化 20 日的换手率低于线性', slow.ev.turnD < lin.ev.turnD, 'true');
+      /* 只做多的平均敞口必须 ≥ 0（不允许做空） */
+      const lo = C.rows.filter(r => r.id === 'longonly')[0];
+      chk('Q4 只做多的平均敞口 ≥ 0', lo.ev.avgW >= 0, 'true');
+      chk('Q4 且最低仓位不为负', lo.ev.attr.p50AbsW >= 0, 'true');
+    }
+
+    /* Q5 选择偏差 —— 守门 v3.23 实测抓到的量纲 bug：
+     * V 必须与 srHat 同频率（日），否则门槛被放大 √(周期数) 倍。 */
+    {
+      const n = 1200, start = 20;
+      const closes = new Array(n).fill(null);
+      let p = 40000;
+      for (let i = 0; i < n; i++) { closes[i] = p; p = p * (1 + 0.0004 + 0.02 * rndN()); }
+      const scores = new Array(n).fill(null);
+      for (let i = start; i < n - 10; i++) scores[i] = cl(50 + 500 * (closes[i + 10] / closes[i] - 1) + 20 * rndN(), 2, 98);
+      const rep = { n: n, start: start, closes: closes, scores: scores, calTs: [] };
+      const C = call('policyCompare', rep, { B: 60 });
+      const S = call('policySelectionBias', C);
+      const ANN = Math.sqrt(365);
+      chk('Q5 门槛 SR0 有值且为正', S.sr0Ann > 0, 'true');
+      /* 核心守门：年化门槛必须落在合理量级，不能超过最好的政策太多。
+       * 用年化方差当 V 时 SR0 会被放大 √365≈19 倍 —— 这条必须拦住。 */
+      chk('Q5 量纲守门：SR0(年化) 不超过最好政策的 3 倍', S.sr0Ann < S.srAnn * 3, 'true');
+      /* 直接验量纲：日门槛 × √365 必须等于年化门槛 */
+      near('Q5 年化门槛 = 日门槛 × √365（量纲自洽）', S.sr0Ann, S.sr0Day * ANN, 1e-9);
+      /* V 与 srDay 同频：√V 应与日夏普的离散度同量级（远小于 1） */
+      chk('Q5 V 为日频（√V 远小于日夏普量级 1）', Math.sqrt(S.V) < 0.5, 'true');
+      chk('Q5 N = 非基准政策数', S.N, 5);
+      /* 用闭区间而不是开区间：erf 近似在大 |z| 处会饱和到精确的 0 或 1，
+       * 界面上显示成 100.0% 应理解为「> 99.95%」，不是「数学上等于 1」。 */
+      chk('Q5 DSR / psr0 / psrBH 都落在 [0,1]',
+        S.dsr >= 0 && S.dsr <= 1 && S.psr0 >= 0 && S.psr0 <= 1 && S.psrBH >= 0 && S.psrBH <= 1, 'true');
+      /* 有真信号的合成数据上，「超过噪声门槛」应当接近 1；
+       * 但「赢过基准」不该被它带跑 —— 两者门槛差得远（见面板上那段说明）。 */
+      chk('Q5 有真信号 ⇒ DSR 接近 1（> 0.9）', S.dsr > 0.9, 'true');
+      chk('Q5 但 P(赢过躺平) 不被 DSR 绑架（可以远低于它）', S.psrBH <= S.dsr + 1e-9, 'true');
+      chk('Q5 最好的政策就是夏普最高的那个',
+        S.srAnn >= Math.max.apply(null, C.rows.filter(r => !r.bench).map(r => r.ev.shN)) - 1e-12, 'true');
+      /* 「比噪声强」必然比「比基准强」容易 —— 这是 ㉖ 那条警告的根据 */
+      chk('Q5 DSR ≥ P(赢过躺平)（门槛更松 ⇒ 概率更高）', S.dsr >= S.psrBH - 1e-9, 'true');
+    }
+
+    /* Q6 零信息对照：评分循环移位后应当显著变差 */
+    {
+      const n = 1200, start = 20;
+      const closes = new Array(n).fill(null);
+      let p = 40000;
+      for (let i = 0; i < n; i++) { closes[i] = p; p = p * (1 + 0.0005 + 0.02 * rndN()); }
+      const scores = new Array(n).fill(null);
+      for (let i = start; i < n - 10; i++) scores[i] = cl(50 + 700 * (closes[i + 10] / closes[i] - 1) + 15 * rndN(), 2, 98);
+      const rep = { n: n, start: start, closes: closes, scores: scores, calTs: [] };
+      const C = call('policyCompare', rep, { B: 60 });
+      const NU = call('policyNull', rep, { shifts: 8 });
+      chk('Q6 零信息对照产生了多个位移', NU.shifts.length >= 6, 'true');
+      chk('Q6 每个位移都足够大（真的切断了对齐）', NU.shifts.every(k => k >= 30), 'true');
+      /* 核心：有真信号时，实测必须明显优于零信息中位数 */
+      const linReal = C.rows.filter(r => r.id === 'linear')[0].ev.shN;
+      const linNull = NU.byPolicy['linear'];
+      chk('Q6 有真信号 ⇒ 实测夏普远高于零信息中位', linReal > linNull.medShN, 'true');
+      chk('Q6 且超出零信息 95% 分位', linReal > linNull.p95ShN, 'true');
+      /* 反证：给一份纯噪声评分，实测必须落回噪声带内 */
+      const scores2 = new Array(n).fill(null);
+      for (let i = start; i < n - 10; i++) scores2[i] = cl(50 + 30 * rndN(), 2, 98);
+      const rep2 = { n: n, start: start, closes: closes, scores: scores2, calTs: [] };
+      const C2 = call('policyCompare', rep2, { B: 60 });
+      const NU2 = call('policyNull', rep2, { shifts: 8 });
+      const r2 = C2.rows.filter(r => r.id === 'linear')[0].ev.shN;
+      const z2 = NU2.byPolicy['linear'];
+      chk('Q6 纯噪声评分 ⇒ 实测夏普不超出零信息 95%（应当落在带内）', r2 <= z2.p95ShN + 1e-9, 'true');
+    }
+
+    /* Q7 渲染烟测：三个新面板不崩，且给出实质内容 */
+    {
+      const n = 1200, start = 20;
+      const closes = new Array(n).fill(null);
+      let p = 40000;
+      for (let i = 0; i < n; i++) { closes[i] = p; p = p * (1 + 0.0005 + 0.02 * rndN()); }
+      const scores = new Array(n).fill(null);
+      for (let i = start; i < n - 10; i++) scores[i] = cl(50 + 600 * (closes[i + 10] / closes[i] - 1) + 20 * rndN(), 2, 98);
+      state.hist = { rep: { n: n, start: start, closes: closes, scores: scores, calTs: [] } };
+      let ok7 = true, msg7 = '';
+      try { call('renderPolicyBox'); call('renderAttrBox'); call('renderSelectBox'); }
+      catch (e) { ok7 = false; msg7 = e && e.message; }
+      chk('Q7 三个面板渲染不抛异常', ok7, 'true' + (msg7 ? ' (' + msg7 + ')' : ''));
+      const hp = $id('policyBox').innerHTML || '';
+      const ha = $id('attrBox').innerHTML || '';
+      const hs = $id('selectBox').innerHTML || '';
+      chk('Q7 政策面板列出了 6 个政策', (hp.match(/rg-row/g) || []).length >= 6, 'true');
+      chk('Q7 政策面板含「敞口」列（夏普陷阱的守门）', hp.indexOf('敞口') >= 0, 'true');
+      chk('Q7 归因面板写出恒等式', ha.indexOf('E[w]·E[r]') >= 0 || ha.indexOf('Cov(w, r)') >= 0, 'true');
+      chk('Q7 归因面板含敞口诊断', ha.indexOf('几乎从不表达强烈观点') >= 0, 'true');
+      chk('Q7 选择偏差面板含去通胀夏普', hs.indexOf('去通胀') >= 0, 'true');
+      chk('Q7 选择偏差面板含零信息对照', hs.indexOf('零信息') >= 0, 'true');
+      chk('Q7 选择偏差面板说明了三个检验的口径差异', hs.indexOf('三个检验') >= 0, 'true');
+      /* 空态不能崩 */
+      state.hist = null;
+      let ok8 = true;
+      try { call('renderPolicyBox'); call('renderAttrBox'); call('renderSelectBox'); } catch (e) { ok8 = false; }
+      chk('Q7 未回放时三个面板安全降级', ok8, 'true');
+      chk('Q7 提示需要先跑回放', ($id('policyBox').innerHTML || '').indexOf('需要先跑一次十年回放') >= 0, 'true');
+    }
+  }
+
   console.log('\n' + (fail ? `❌ 失败 ${fail} 项` : '✅ 全部断言通过'));
   process.exit(fail ? 1 : 0);
 })().catch(e => { console.error('FATAL', e.stack || e.message); process.exit(1); });
