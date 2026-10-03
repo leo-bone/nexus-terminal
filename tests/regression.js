@@ -184,12 +184,12 @@ const near = (label, actual, expect, tol) => {
 
   console.log('\n===== D. 因子方向一致性（v3.6 核心修复）=====');
   const F = run('FACTORS');
-  chk('因子总数（含 5 个回放专用）', F.length, 33);
+  chk('因子总数（含 5 个回放专用 + 4 个估值标尺）', F.length, 37);
   chk('回放专用因子 5 个且实时不参与', F.filter(f => f.replayOnly).map(f => f.id).join(','), 'mrv,adr,fee,prem,oih');
   chk('每个因子都有合法 dir', F.every(f => [1, -1, 0].includes(f.dir)), 'true');
   chk('仅 1 项为「仅展示」(dir=0)', F.filter(f => f.dir === 0).length, 1);
   chk('参与评分的因子数', run('computeNexusScore().nScored'), 27);
-  const expectDir = { fng: -1, fund: -1, ls: -1, oi: -1, dom: -1, stable: 1, hr: 1, tx: 1, mrv: -1, adr: 1, fee: 1, prem: -1, oih: -1, dxy: -1, us10y: -1, spx: 1, vix: -1, gold: -1, oil: -1, agri: 0, geo: -1, fed: -1, bei: -1, curve: 1, jpy: 1, jgb: -1, nfp: -1, urate: 1, claims: 1, pce: -1, cpi: -1, tech: 1, mom: 1 };
+  const expectDir = { fng: -1, fund: -1, ls: -1, oi: -1, dom: -1, stable: 1, hr: 1, tx: 1, mrv: -1, adr: 1, fee: 1, prem: -1, oih: -1, dxy: -1, us10y: -1, spx: 1, vix: -1, gold: -1, oil: -1, agri: 0, geo: -1, fed: -1, bei: -1, curve: 1, jpy: 1, jgb: -1, nfp: -1, urate: 1, claims: 1, pce: -1, cpi: -1, tech: 1, mom: 1, erp: 1, rgold: -1, fedbs: 1, nvt: -1 };
   const bad = Object.entries(expectDir).filter(([k, v]) => (F.find(f => f.id === k) || {}).dir !== v).map(([k]) => k);
   chk('方向表与设计一致', bad.length ? bad.join(',') : 'ok', 'ok');
   chk('因子 id 无遗漏', F.filter(f => !(f.id in expectDir)).length, 0);
@@ -617,7 +617,7 @@ const near = (label, actual, expect, tol) => {
   const liveAfter = call('computeNexusScore');
   chk('回放后游标已复位', run('state.asof'), null);
   chk('回放不污染实时评分', liveAfter.score, liveBefore.score);
-  chk('回放后实时评分仍为 28 维', Object.keys(liveAfter.out).length, 28);
+  chk('回放后实时评分仍为 32 维（+4 估值标尺，只显示不评分）', Object.keys(liveAfter.out).length, 32);
   run('state.histBundle = null;');
 
   /* —— 渲染兜底：renderReview 必须不抛错且 ⑦ 极端子评分块渲染出来（防「reg 未定义」类 bug 被 catch 静默吞掉）—— */
@@ -861,8 +861,8 @@ const near = (label, actual, expect, tol) => {
   /* ① 已过时辰 —— 正是用户实际撞到的场景：非农已发布 3 小时仍无实际值 */
   let _o = nfpOut([nfpEv(-180, '89K', '162K', null)]);
   chk('已过时辰 3 小时 → stale=true', _o.stale, true);
-  chk('文案标明「已过时辰」而非冒充「未发布」', /已过时辰/.test(_o.note), true);
-  chk('且注明数据未到（让使用者知道不是事实）', /数据未到/.test(_o.note), true);
+  chk('文案标明「FF未回填」而非冒充「未发布」', /FF未回填/.test(_o.note) && !/未发布/.test(_o.note), true);
+  chk('且注明 FF未回填+最近已知实际（让使用者知道是代理值）', /FF未回填/.test(_o.note) && /最近已知实际/.test(_o.note), true);
   chk('代理值仍按 (89-162)/60×0.5', Math.abs(_o.z - (-0.608)) < 0.01, true);
   chk('evTime 带着发布时刻供 hover 自查', typeof _o.evTime === 'string' && _o.evTime.length > 8, true);
 
@@ -906,7 +906,7 @@ const near = (label, actual, expect, tol) => {
   /* ⑨ 渲染层：源码里必须真的有 stale 分支（灰标 + 「数据未到」） */
   const APPJS = require('fs').readFileSync(__dirname + '/../app.js', 'utf8');
   chk('渲染有 stale 灰度分支', /stl \? '#8a93a6'/.test(APPJS), true);
-  chk('渲染把 stale 标为「数据未到」', /stl \? '数据未到'/.test(APPJS), true);
+  chk('渲染把 stale 标为「未回填」', /stl \? '未回填'/.test(APPJS), true);
   chk('econOverdue 只认带钟点的 ISO', /indexOf\('T'\) < 0/.test(APPJS), true);
 
   /* ⑩ Worker 热点窗口 —— 跑的是从 worker.js 原样抽出来的代码 */
@@ -3259,6 +3259,113 @@ const near = (label, actual, expect, tol) => {
 
     /* 恢复 fetch（X 之后无更多 fetch 依赖，但保持卫生） */
     if (realFetch) vmSet('fetch', realFetch);
+  }
+
+  /* ============ Y. v3.31 情景推演引擎 + 事件因子止血 ============ */
+  console.log('\n===== Y. v3.31 情景推演引擎 + 事件因子止血 =====');
+  {
+    const A = {
+      keys: ['BTC', 'DXY', 'GOLD', 'VIX'],
+      R: [
+        [1,    0.2,  0.1, -0.5],
+        [0.2,  1,   -0.3,  0.0],
+        [0.1, -0.3,  1,    0.0],
+        [-0.5, 0.0,  0.0,  1  ],
+      ],
+    };
+    const res = run('scenarioPropagate')(A, { id: 't', name: 't', desc: '', shocks: [{ k: 'BTC', toZ: -2.0 }] });
+    const byK = {}; res.rows.forEach(r => byK[r.k] = r.dz);
+    near('Y1 VIX 传导 = ρ(-0.5)×(-2)=1.0', byK['VIX'], 1.0, 1e-6);
+    near('Y1 DXY 传导 = 0.2×(-2)=-0.4', byK['DXY'], -0.4, 1e-6);
+    near('Y1 GOLD 传导 = 0.1×(-2)=-0.2', byK['GOLD'], -0.2, 1e-6);
+    near('Y1 护栏驱动净项 = 1.0+(-0.4)+0.2=0.8', res.guard, 0.8, 1e-6);
+    chk('Y1 BTC 自身不在传导结果', res.rows.some(r => r.k === 'BTC'), 'false');
+  }
+  {
+    const past = new Date(Date.now() - 3 * 86400000).toISOString();
+    run('state').econ = [{ title: 'Core PCE Price Index m/m', t: past, f: '0.3%', p: '0.2%', a: '' }];
+    const r1 = run('econFactor')({ key: 'core_pce_mm', re: /^Core PCE Price Index m\/m$/i, std: 0.08 });
+    chk('Y2 FF未回填时标注「FF未回填」', r1.note.indexOf('FF未回填') >= 0, 'true');
+    chk('Y2 FF未回填时 stale=true', r1.stale === true, 'true');
+    run('RECENT_ACTUALS')['core_pce_mm'] = { v: 0.4, asof: '2026-09' };
+    const r2 = run('econFactor')({ key: 'core_pce_mm', re: /^Core PCE Price Index m\/m$/i, std: 0.08 });
+    chk('Y2 锚定后标注含「锚定」', r2.note.indexOf('锚定') >= 0, 'true');
+    chk('Y2 锚定后 stale=false', r2.stale === false, 'true');
+    near('Y2 锚定后 surprise z=(0.4-0.3)/0.08=1.25', r2.z, 1.25, 1e-6);
+    delete run('RECENT_ACTUALS')['core_pce_mm'];
+    const future = new Date(Date.now() + 2 * 86400000).toISOString();
+    run('state').econ = [{ title: 'Core PCE Price Index m/m', t: future, f: '0.3%', p: '0.2%', a: '' }];
+    const r3 = run('econFactor')({ key: 'core_pce_mm', re: /^Core PCE Price Index m\/m$/i, std: 0.08 });
+    chk('Y3 未到点标注「未发布」', r3.note.indexOf('未发布') >= 0, 'true');
+    chk('Y3 未到点 stale=false', r3.stale === false, 'true');
+  }
+
+
+  console.log('\n===== Z. v3.31 估值因子（价值维度）=====');
+  {
+    /* 慢变量锚定 + 快变量实时：先喂实时序列，再验证估值读数与「锚定」标注 */
+    run('state').macroSeries = run('state').macroSeries || {};
+    run('state').macroSeries.US10Y = [4.5];
+    const VA = run('VALUE_ANCHORS');
+
+    /* —— Z1 ERP：EY = 1/FPE，ERP = EY − 10Y；z 对着锚定正常带 3% ± 1.5% —— */
+    const fErp = run("FACTORS.filter(f => f.id === 'erp')[0]");
+    const e1 = fErp.calc();
+    chk('Z1 ERP 备注含 ERP', e1.note.indexOf('ERP ') >= 0, 'true');
+    chk('Z1 未锚定时如实标「默认21」', e1.note.indexOf('默认21') >= 0, 'true');
+    near('Z1 ERP z = (1/21−4.5%−3%)/1.5% = −1.8254', e1.z, -1.8254, 1e-3);
+    VA['spx_fpe'] = { v: 20, asof: '2026-09' };
+    const e2 = fErp.calc();
+    near('Z1 锚定 FPE=20 → z = (5%−4.5%−3%)/1.5% = −1.6667', e2.z, -1.6667, 1e-3);
+    chk('Z1 锚定后备注标「锚定2026-09」', e2.note.indexOf('锚定2026-09') >= 0, 'true');
+    delete VA['spx_fpe'];
+
+    /* —— Z2 黄金实际价格：快变量 GOLD 实时，慢变量 CPI 锚定 —— */
+    run('state').macroSeries.GOLD = Array.from({ length: 120 }, (_, i) => 4000 + i);
+    const fRg = run("FACTORS.filter(f => f.id === 'rgold')[0]");
+    const g1 = fRg.calc();
+    chk('Z2 备注含「实际金价」', g1.note.indexOf('实际金价') >= 0, 'true');
+    chk('Z2 未锚定时如实标「默认320」', g1.note.indexOf('默认320') >= 0, 'true');
+    chk('Z2 动能 z 有限（CPI 慢变量，实际金价动能≈名义动能）', isFinite(g1.z), 'true');
+    VA['cpi_idx'] = { v: 300, asof: '2026-09' };
+    chk('Z2 锚定后备注标「锚定2026-09」', fRg.calc().note.indexOf('锚定2026-09') >= 0, 'true');
+    delete VA['cpi_idx'];
+
+    /* —— Z3 美联储资产负债表：慢变量锚定，z 对「缩表前 ~8 万亿」正常带 —— */
+    const fFed = run("FACTORS.filter(f => f.id === 'fedbs')[0]");
+    const b1 = fFed.calc();
+    chk('Z3 未锚定时如实标「待接入WALCL」', b1.note.indexOf('待接入WALCL') >= 0, 'true');
+    near('Z3 默认 6.7 万亿 → z = (6.7−8)/1 = −1.3', b1.z, -1.3, 1e-6);
+    VA['fed_total'] = { v: 7.5e12, asof: '2026-09' };
+    const b2 = fFed.calc();
+    near('Z3 锚定 7.5 万亿 → z = (7.5−8)/1 = −0.5', b2.z, -0.5, 1e-6);
+    chk('Z3 锚定后备注标「锚定2026-09·非实时」', b2.note.indexOf('锚定2026-09·非实时') >= 0, 'true');
+    delete VA['fed_total'];
+
+    /* —— Z4 BTC 链上估值 NVT：市值/笔数实时，单笔美元额锚定 —— */
+    run('state').global = { total_market_cap: { usd: 3.0e12 }, market_cap_percentage: { btc: 55 } };
+    run('state').chainSeries = run('state').chainSeries || {};
+    run('state').chainSeries.n_tx = [400000];
+    const fNvt = run("FACTORS.filter(f => f.id === 'nvt')[0]");
+    const n1 = fNvt.calc();
+    chk('Z4 备注含 NVT', n1.note.indexOf('NVT') >= 0, 'true');
+    chk('Z4 未锚定时如实标「默认」', n1.note.indexOf('默认') >= 0, 'true');
+    near('Z4 NVT = 1.65e12/(4e5×4.5e4) = 91.67 → z = (91.67−75)/30 = 0.5556', n1.z, 0.5556, 1e-3);
+    VA['avg_tx_usd'] = { v: 50000, asof: '2026-09' };
+    const n2 = fNvt.calc();
+    near('Z4 锚定 5e4 → NVT = 82.5 → z = 0.25', n2.z, 0.25, 1e-3);
+    chk('Z4 锚定后备注标「锚定2026-09」', n2.note.indexOf('锚定2026-09') >= 0, 'true');
+    delete VA['avg_tx_usd'];
+
+    /* —— Z5 关键：估值因子是「估值标尺」，不能混进实时评分（否则实时评分不再纯实时）—— */
+    const nA = run('computeNexusScore')().nScored;
+    run("globalThis.__anchSave = FACTORS.map(f => f.anchored); FACTORS.forEach(f => { if (f.anchored) f.anchored = false; });");
+    const nB = run('computeNexusScore')().nScored;
+    run("FACTORS.forEach((f, i) => { if (globalThis.__anchSave[i] != null) f.anchored = globalThis.__anchSave[i]; });");
+    chk('Z5 anchored 因子默认不进实时评分（放开后 nScored +4）', nB - nA, 4);
+    const vIds = run("FACTORS.filter(f => f.anchored).map(f => f.id)");
+    chk('Z5 4 个估值因子都带 anchored 标记', vIds.length, 4);
+    chk('Z5 估值因子仍在 out 里（要能显示）', run('computeNexusScore')().out.erp != null, 'true');
   }
 
   console.log('\n' + (fail ? `❌ 失败 ${fail} 项` : '✅ 全部断言通过'));

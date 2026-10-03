@@ -1,5 +1,5 @@
 /* =====================================================================
- * NEXUS TERMINAL v3.30 — 加密货币实时监测与因子关系终端
+ * NEXUS TERMINAL v3.31 — 加密货币实时监测与因子关系终端
  * 纯前端 / 无后端 / 无构建步骤。可直接 file:// 打开，也可部署到 Cloudflare。
  *
  * 数据源（全经 Cloudflare Worker 代理，解决中国大陆无法直连 + 浏览器 CORS）:
@@ -34,6 +34,17 @@
  *   3) 原油因子升级为 WTI + 布伦特 双源合成; 宏观卡片新增布伦特
  *   4) 数据源主备调换: Yahoo 升为主源 (Stooq 自 2026-10 起在 CF 边缘频繁 522/反爬)
  *   5) 快照新增 _src 数据源诊断字段
+ *
+ * v3.31 变更:
+ *   1) 事件因子止血：FF 免费周历长期不回填 actual（实测 PCE/NFP/失业率/初请 的 actual 全为空），
+ *      原「数据未到」是误导 —— 已改为诚实标注「FF未回填」，并加 RECENT_ACTUALS 手动锚定表，
+ *      发布后填真值即算真实 surprise，不再永久挂脏。
+ *   2) 情景推演引擎（借鉴 MiroFish「种子+因子互动→前瞻情景」的精髓，不搬 LLM 群体模拟）：
+ *      以当前中性状态为种子，用跨资产日收益相关性做冲击传播，输出前瞻 Δz + 护栏趋向。
+ *      确定性情景推演 ≠ 概率预测，假设相关性结构延续。
+ *   3) 新增 4 个估值因子（价值维度）：股债风险溢价 ERP / 黄金实际价格 / 美联储资产负债表 /
+ *      BTC 链上估值 NVT。慢变量走 VALUE_ANCHORS 锚定（真源被 Worker 白名单+WAF 挡），
+ *      快变量走实时；anchored 因子不进实时评分，保持实时评分「全实时」纯度。
  *
  * v3.3 变更:
  *   1) 新增因子: 美联储利率 / 通胀预期(市场隐含) / 期限利差 / 原油 / 农业 / 地缘风险(代理)
@@ -357,18 +368,51 @@ function econOverdue(e) {
   if (!isFinite(ms)) return false;
   return (Date.now() - ms) > ECON_GRACE_MS;
 }
+/* v3.31 事件因子「最近已知实际值」手动锚定表（止血用）。
+ * FF 免费周历不回填 actual（实测 PCE/NFP/失业率 actual 长期为空），根治走新增的实际值源；
+ * 在此之前，发布后把真值填进这里，因子即算真实 surprise，不再永久「未回填」。
+ * v 与 FF 同口径：PCE/CPI 用小数(0.3=0.3%)、NFP 用千(142=142K)、失业率用百分数(4.1=4.1%)。asof='YYYY-MM'。 */
+const RECENT_ACTUALS = {
+  // core_pce_mm: { v: 0.3, asof: '2026-09', src: '手动锚定' },
+  // cpi_mm:      { v: 0.3, asof: '2026-09', src: '手动锚定' },
+  // nfp:         { v: 142, asof: '2026-09', src: '手动锚定' },
+  // urate:       { v: 4.1, asof: '2026-09', src: '手动锚定' },
+};
+
+/* v3.31 估值因子「慢变量锚定表」。ERP / 实际金价 / 美联储表 / BTC 链上估值 需要
+ * 盈利(远期P/E)、CPI、WALCL、链上美元结算额 等系列 —— 这些源（FRED / CoinMetrics）
+ * 在数据 Worker 里被主机白名单 + CF WAF 挡住（实测：host not allowed / 403 / 520），
+ * 纯前端也拿不到。所以走与事件因子同一套诚实做法：
+ *   慢变量（月级）放这里锚定，快变量（金价 / 10Y / 市值 / 链上笔数）走实时，
+ *   两者合成出一个真实的估值读数，并在备注里标「锚定·非实时」，绝不冒充实时。 */
+const VALUE_ANCHORS = {
+  // spx_fpe:    { v: 21.0,   asof: '2026-09', src: '手动锚定·待接入盈利数据' },  // S&P500 远期 P/E
+  // cpi_idx:    { v: 320.0,  asof: '2026-09', src: '手动锚定·待接入CPI' },       // CPI 定基指数(1982-84=100)
+  // fed_total:  { v: 6.7e12, asof: '2026-09', src: '手动锚定·待接入WALCL' },    // 美联储总资产(USD)
+  // avg_tx_usd: { v: 45000,  asof: '2026-09', src: '手动锚定·链上均值' },        // 单笔链上交易均值(USD)
+};
+/* 读锚定值：没锚就用兜底默认值，但 anchored=false —— 调用方据此在备注里如实标明 */
+function vAnchor(k, dflt) {
+  const a = VALUE_ANCHORS[k];
+  const has = !!(a && a.v != null);
+  return { v: has ? a.v : dflt, asof: (a && a.asof) || null, src: (a && a.src) || '', anchored: has };
+}
 function econFactor(cfg) {
   const e = econFind(cfg.re);
   if (!e) return { z: 0, note: '本周无发布' };
-  const a = parseEconVal(e.a), f = parseEconVal(e.f), p = parseEconVal(e.p);
-  if (a != null && f != null) return { z: clampZ((a - f) / cfg.std), note: `实际 ${e.a} / 预期 ${e.f}`, ev: e.t };
+  let a = parseEconVal(e.a), f = parseEconVal(e.f), p = parseEconVal(e.p);
+  let ov = false;
+  if (a == null && cfg.key && RECENT_ACTUALS[cfg.key] && RECENT_ACTUALS[cfg.key].v != null) {
+    a = RECENT_ACTUALS[cfg.key].v; ov = true;
+  }
+  if (a != null && f != null) return { z: clampZ((a - f) / cfg.std), note: (ov ? `实际(锚定${RECENT_ACTUALS[cfg.key].asof}) ${a} / 预期 ${e.f}` : `实际 ${e.a} / 预期 ${e.f}`), stale: false, ev: e.t };
   const late = econOverdue(e);
   if (f != null && p != null) return {
     z: clampZ((f - p) / cfg.std * 0.5),
-    note: late ? `预期 ${e.f}（已过时辰·数据未到）` : `预期 ${e.f}（未发布·半权重）`,
-    stale: late, ev: e.t
+    note: late ? `FF未回填实际值·前值 ${e.p}（最近已知实际）` : `预期 ${e.f}（未发布·半权重）`,
+    stale: late && !ov, ev: e.t
   };
-  return { z: 0, note: late ? '已过时辰·无数据' : '待发布', stale: late, ev: e.t };
+  return { z: 0, note: late ? '已过时辰·FF未回填' : '待发布', stale: late && !ov, ev: e.t };
 }
 
 /* =====================================================================
@@ -589,15 +633,52 @@ const FACTORS = [
   { id: 'jpy', name: '💴 美元/日元', group: 'jpy', w: 1.1, dir: 1, calc: () => { const v = mV('USDJPY'); if (v == null) return { z: 0, note: '—' }; return { z: mChgZ('USDJPY', 60), note: v.toFixed(1) + ' · 套息' }; } },
   { id: 'jgb', name: '🇯🇵 日债10Y', group: 'jpy', w: 0.9, dir: -1, calc: () => { const v = mV('JGB10Y'); if (v == null) return { z: 0, note: '—' }; return { z: mChgZ('JGB10Y', 90), note: v.toFixed(2) + '% · 套息成本' }; } },
   /* —— 事件因子（美国经济日历 · 超预期方向）—— */
-  { id: 'nfp', name: '👷 非农就业', group: 'event', w: 0.6, dir: -1, calc: () => econFactor({ re: /^Non-Farm Employment Change$/i, std: 60 }) },
-  { id: 'urate', name: '🧑‍💼 失业率', group: 'event', w: 0.5, dir: 1, calc: () => econFactor({ re: /^Unemployment Rate$/i, std: 0.12 }) },
-  { id: 'claims', name: '📋 初请失业金', group: 'event', w: 0.4, dir: 1, calc: () => econFactor({ re: /^Unemployment Claims$/i, std: 8 }) },
-  { id: 'pce', name: '💵 核心PCE', group: 'event', w: 0.6, dir: -1, calc: () => econFactor({ re: /^Core PCE Price Index m\/m$/i, std: 0.08 }) },
-  { id: 'cpi', name: '🔥 CPI月率', group: 'event', w: 0.5, dir: -1, calc: () => econFactor({ re: /^CPI m\/m$/i, std: 0.12 }) },
+  { id: 'nfp', name: '👷 非农就业', group: 'event', w: 0.6, dir: -1, calc: () => econFactor({ key: 'nfp', re: /^Non-Farm Employment Change$/i, std: 60 }) },
+  { id: 'urate', name: '🧑‍💼 失业率', group: 'event', w: 0.5, dir: 1, calc: () => econFactor({ key: 'urate', re: /^Unemployment Rate$/i, std: 0.12 }) },
+  { id: 'claims', name: '📋 初请失业金', group: 'event', w: 0.4, dir: 1, calc: () => econFactor({ key: 'claims', re: /^Unemployment Claims$/i, std: 8 }) },
+  { id: 'pce', name: '💵 核心PCE', group: 'event', w: 0.6, dir: -1, calc: () => econFactor({ key: 'core_pce_mm', re: /^Core PCE Price Index m\/m$/i, std: 0.08 }) },
+  { id: 'cpi', name: '🔥 CPI月率', group: 'event', w: 0.5, dir: -1, calc: () => econFactor({ key: 'cpi_mm', re: /^CPI m\/m$/i, std: 0.12 }) },
   /* —— 技术面（BTC 自身）—— */
   /* tech / mom：回放期间走预计算表（state.btcZ），实时模式走 K 线原路径 */
-  { id: 'tech', name: '📐 技术面', group: 'tech', w: 1.0, dir: 1, calc: () => { const bz = state.btcZ; if (bz) { const i = state.klIdx == null ? bz.tech.length - 1 : state.klIdx; if (i < 100) return { z: 0, ok: false, note: '无数据' }; return { z: bz.tech[i], note: 'RSI ' + bz.rsi[i].toFixed(0) }; } const k = state.klines['BTC' + state.interval]; if (!k) return { z: 0, note: '—' }; const c = k.map(x => x.c); const e20 = ema(c, 20), e50 = ema(c, 50), r = rsi(c); const z = (e20[e20.length - 1] - e50[e50.length - 1]) / (e50[e50.length - 1] || 1) * 30 + (r[r.length - 1] - 50) / 12; return { z, note: 'RSI ' + r[r.length - 1].toFixed(0) }; } },
-  { id: 'mom', name: '🚀 动量', group: 'tech', w: 0.8, dir: 1, calc: () => { const bz = state.btcZ; if (bz) { const i = state.klIdx == null ? bz.mom.length - 1 : state.klIdx; if (i < 100) return { z: 0, ok: false, note: '无数据' }; const pc = bz.mom[i] * 8; return { z: bz.mom[i], note: pc.toFixed(1) + '%' }; } const k = state.klines['BTC' + state.interval]; if (!k) return { z: 0, note: '—' }; const c = k.map(x => x.c); const pc = pctChange(c.slice(-30)) || 0; return { z: pc / 8, note: pc.toFixed(1) + '%' }; } },
+  { id: 'tech', name: '📐 技术面', group: 'tech', w: 1.0, dir: 1, calc: () => { const bz = state.btcZ; if (bz) { const i = state.klIdx == null ? bz.tech.length - 1 : state.klIdx; if (i < 100) return { z: 0, ok: false, note: '无数据' }; return { z: bz.tech[i], note: 'RSI ' + bz.rsi[i].toFixed(0) }; } const k = state.klines && state.klines['BTC' + state.interval]; if (!k) return { z: 0, note: '—' }; const c = k.map(x => x.c); const e20 = ema(c, 20), e50 = ema(c, 50), r = rsi(c); const z = (e20[e20.length - 1] - e50[e50.length - 1]) / (e50[e50.length - 1] || 1) * 30 + (r[r.length - 1] - 50) / 12; return { z, note: 'RSI ' + r[r.length - 1].toFixed(0) }; } },
+  { id: 'mom', name: '🚀 动量', group: 'tech', w: 0.8, dir: 1, calc: () => { const bz = state.btcZ; if (bz) { const i = state.klIdx == null ? bz.mom.length - 1 : state.klIdx; if (i < 100) return { z: 0, ok: false, note: '无数据' }; const pc = bz.mom[i] * 8; return { z: bz.mom[i], note: pc.toFixed(1) + '%' }; } const k = state.klines && state.klines['BTC' + state.interval]; if (!k) return { z: 0, note: '—' }; const c = k.map(x => x.c); const pc = pctChange(c.slice(-30)) || 0; return { z: pc / 8, note: pc.toFixed(1) + '%' }; } },
+  /* —— v3.31 估值因子（价值维度）——
+   * 这 4 个是「估值标尺」而非实时价格序列：其 z 对着锚定的正常带，不进实时评分
+   * （anchored:true，computeNexusScore 会跳过），只在估值面板里给出贵/便宜读数。
+   * 之所以不塞进 META/相关性：它们是派生量、没有独立价格序列，塞进相关矩阵会污染跨资产统计。 */
+  { id: 'erp', name: '🧮 股债风险溢价', group: 'value', w: 0.6, dir: 1, anchored: true, calc: () => {
+      const y10 = mV('US10Y'); if (y10 == null) return { z: 0, note: '—' };
+      const A = vAnchor('spx_fpe', 21.0);
+      const ey = 1 / A.v;                              // 盈利收益率 = 1 / 远期 P/E
+      const erp = ey - y10 / 100;                      // 口径统一成小数
+      const z = clampZ((erp - 0.03) / 0.015);          // 锚定正常带：ERP≈3%，σ≈1.5%
+      return { z, note: 'ERP ' + (erp * 100).toFixed(2) + '% = EY ' + (ey * 100).toFixed(2) + '% − 10Y ' + y10.toFixed(2) + '% · FPE' + (A.anchored ? '锚定' + A.asof : '默认21') + ' · 10Y实时' };
+    } },
+  { id: 'rgold', name: '🥇 黄金(实际)', group: 'value', w: 0.5, dir: -1, anchored: true, calc: () => {
+      const g = mV('GOLD'); if (g == null) return { z: 0, note: '—' };
+      const A = vAnchor('cpi_idx', 320.0);
+      const real = g / (A.v / 100);                    // 定基 CPI 折算 → 实际金价
+      const z = mChgZ('GOLD', 60);                     // CPI 是慢变量，实际金价动能≈名义动能（实时）
+      return { z, note: '实际金价 $' + real.toFixed(0) + ' · 定基CPI ' + A.v + (A.anchored ? '锚定' + A.asof : '默认320') + ' · 60日动能实时' };
+    } },
+  { id: 'fedbs', name: '🏛 美联储表', group: 'value', w: 0.5, dir: 1, anchored: true, calc: () => {
+      const A = vAnchor('fed_total', 6.7e12);
+      const z = clampZ((A.v - 8.0e12) / 1.0e12);       // 锚定正常带：缩表前 ~8 万亿
+      return { z, note: '总资产 $' + (A.v / 1e12).toFixed(2) + '万亿 · ' + (A.anchored ? '锚定' + A.asof + '·非实时' : '默认6.7万亿·待接入WALCL') + ' · 缩表=流动性收紧' };
+    } },
+  { id: 'nvt', name: '⛓ BTC链上估值', group: 'value', w: 0.7, dir: -1, anchored: true, calc: () => {
+      const G = state.global;
+      const tot = G && G.total_market_cap && G.total_market_cap.usd;
+      const dom = G && G.market_cap_percentage && G.market_cap_percentage.btc;
+      const ntx = mV('TX');
+      if (!tot || !dom || !ntx) return { z: 0, note: '—' };
+      const A = vAnchor('avg_tx_usd', 45000);
+      const btcMcap = tot * dom / 100;                 // BTC 市值（实时）
+      const dailyUsd = ntx * A.v;                      // 链上日结算额（代理）
+      const nvt = btcMcap / dailyUsd;
+      const z = clampZ((nvt - 75) / 30);               // 锚定正常带：NVT≈75，σ≈30
+      return { z, note: 'NVT ' + nvt.toFixed(0) + ' · 市值实时 / 链上额(' + fmtBig(ntx) + '笔×$' + fmtBig(A.v) + (A.anchored ? '锚定' + A.asof : '默认') + ')' };
+    } },
 ];
 
 /* ---------- 因子级数据可用性（v3.11）----------
@@ -654,7 +735,7 @@ function computeNexusScore(ids) {
     let has = r.ok !== false;                       // 无数据的因子不进分母，避免把评分拉向 50
     const dep = FACTOR_DEP[f.id];
     if (has && dep) {
-      if (dep[0] === null) has = ((state.klines['BTC' + state.interval] || []).length >= dep[1]);
+      if (dep[0] === null) has = (((state.klines && state.klines['BTC' + state.interval]) || []).length >= dep[1]);
       else has = mLen(dep[0]) >= dep[1];
     }
     const z = clampZ(r.z);
@@ -662,7 +743,7 @@ function computeNexusScore(ids) {
     /* v3.24：zRaw = clamp 之前的原始 z。评分幅度诊断要分清「因子本身温和」与
      * 「被 ±2.5 截断」这两种完全不同的成因 —— 只看夹紧后的值永远分不开。 */
     out[f.id] = { z, contribution, zRaw: isFinite(r.z) ? r.z : null, dir: f.dir || 0, note: r.note, ok: has, stale: r.stale === true, evTime: r.ev };
-    if (f.dir && has) { sum += contribution * f.w; wsum += f.w; nScored++; }
+    if (f.dir && has && !f.anchored) { sum += contribution * f.w; wsum += f.w; nScored++; }
     else if (f.dir && !has) nDead++;
   });
   const cRaw = wsum ? sum / wsum : 0;
@@ -798,6 +879,65 @@ function corrAnalyzed(force) {
   corrAna = { stamp: A.stamp, A: A, LL: LL, RS: RS, CB: CB, target: target };
   return corrAna;
 }
+
+/* ============ v3.31 情景推演引擎（借鉴 MiroFish「种子+因子互动→前瞻情景」） ============
+ * 不搬 LLM 群体模拟（需 Docker/Zep/千 Agent，纯前端装不下）。
+ * 以「当前中性状态」为种子，用已算好的跨资产日收益相关性(corrAna.A.R)做冲击传播：
+ * 选定冲击节点 → 按历史相关线性传导到其余类别 → 输出前瞻情景(相对 Δz) + 护栏趋向。
+ * 诚实边界：基于历史联动的确定性情景推演，非概率预测；假设相关性结构延续。 */
+const SCENARIOS = [
+  { id: 'vol_spike',  name: '波动率冲击',   desc: 'VIX→极端 + 美债波动抬升',     shocks: [{ k: 'VIX', toZ: 2.2 }, { k: 'US10Y', toZ: 1.0 }] },
+  { id: 'btc_break',  name: 'BTC 破位',     desc: 'BTC 急跌至 −2σ',            shocks: [{ k: 'BTC', toZ: -2.0 }] },
+  { id: 'real_up',    name: '实际利率上行', desc: '实际利率 +1.5σ（偏鹰）',     shocks: [{ k: 'US10Y', toZ: 1.5 }, { k: 'DXY', toZ: 1.0 }] },
+  { id: 'risk_on',    name: '风险偏好回暖', desc: '标普 +1.5σ + 油价回升',      shocks: [{ k: 'SPX', toZ: 1.5 }, { k: 'OIL', toZ: 1.2 }] },
+  { id: 'safe_haven', name: '避险扩散',     desc: '美元走强 + 金价避险',        shocks: [{ k: 'DXY', toZ: 1.5 }, { k: 'GOLD', toZ: 1.0 }] },
+  { id: 'yen_carry',  name: '日元套息平仓', desc: '美元/日元急升（日元升值）',  shocks: [{ k: 'USDJPY', toZ: 1.8 }] },
+];
+/* 护栏风险-off 驱动键：被冲击/传导上行→护栏趋向 RED（值=+1 表示「上行=风险-off」） */
+const SCN_GUARD = { VIX: 1, US10Y: 1, DXY: 1, OIL: 1, USDJPY: 1, BEI10: 1, T10Y2Y: -1, GOLD: -1, SPX: -1 };
+function scenarioPropagate(A, scenario) {
+  const keys = A.keys, R = netRelMatrix(A);
+  const sh = scenario.shocks.filter(function (s) { return keys.indexOf(s.k) >= 0; });
+  if (!sh.length) return { rows: [], guard: 0, dom: null, missing: scenario.shocks.map(function (s) { return s.k; }) };
+  const rows = [];
+  for (let j = 0; j < keys.length; j++) {
+    const k = keys[j];
+    if (sh.some(function (s) { return s.k === k; })) continue;
+    let dz = 0, rhoDom = 0;
+    for (let si = 0; si < sh.length; si++) {
+      const i = keys.indexOf(sh[si].k);
+      const r = (i >= 0 && R[i] && isFinite(R[i][j])) ? R[i][j] : 0;
+      dz += r * sh[si].toZ;
+      if (Math.abs(r) > Math.abs(rhoDom)) rhoDom = r;
+    }
+    rows.push({ k: k, name: (META[k] && META[k].name) || k, group: (META[k] && META[k].group) || '', dz: dz, rho: rhoDom });
+  }
+  rows.sort(function (a, b) { return Math.abs(b.dz) - Math.abs(a.dz); });
+  let guard = 0;
+  sh.forEach(function (s) { const g = SCN_GUARD[s.k]; if (g != null) guard += g * s.toZ; });
+  rows.forEach(function (rw) { const g = SCN_GUARD[rw.k]; if (g != null) guard += g * rw.dz; });
+  return { rows: rows, guard: guard, dom: sh.map(function (s) { return s.k; }).join('+'), missing: [] };
+}
+function renderScenario(id) {
+  const box = $('scenarioBox'); if (!box) return;
+  const scn = SCENARIOS.filter(function (s) { return s.id === id; })[0] || SCENARIOS[0];
+  const A = corrAnalyzed();
+  if (!A || !A.keys || !A.keys.length) { box.innerHTML = '<div class="rg-sub">相关系数未就绪（需先加载宇宙数据）。</div>'; return; }
+  const res = scenarioPropagate(A, scn);
+  if (!res.rows.length) { box.innerHTML = '<div class="rg-sub">该情景的冲击键不在当前宇宙（' + (res.missing || []).join('/') + '），无法传导。</div>'; return; }
+  const top = res.rows.slice(0, 12);
+  let h = '<div class="rg-sub">情景「' + scn.name + '」：' + scn.desc + ' · 种子=当前中性，按历史日收益相关性(120d)线性传导 · <span style="opacity:.7">确定性情景推演 ≠ 概率预测</span></div>';
+  h += '<table style="width:100%;border-collapse:collapse;margin:6px 0;font-size:12px"><tr style="color:#8a93a6;text-align:left"><th style="padding:3px 6px">资产</th><th style="padding:3px 6px">预期Δz</th><th style="padding:3px 6px">与冲击相关ρ</th></tr>';
+  top.forEach(function (rw) {
+    const col = rw.dz > 0.1 ? 'var(--green)' : rw.dz < -0.1 ? 'var(--red)' : 'var(--gold)';
+    h += '<tr style="border-top:1px solid #1b2a3f"><td style="padding:3px 6px">' + rw.name + '</td><td style="padding:3px 6px;color:' + col + '">' + (rw.dz >= 0 ? '+' : '') + rw.dz.toFixed(2) + '</td><td style="padding:3px 6px;color:#8a93a6">' + rw.rho.toFixed(2) + '</td></tr>';
+  });
+  h += '</table>';
+  const gcol = res.guard > 0.5 ? 'var(--red)' : res.guard < -0.5 ? 'var(--green)' : 'var(--gold)';
+  h += '<div class="rg-sub" style="margin-top:6px">护栏驱动净项 <b style="color:' + gcol + '">' + (res.guard >= 0 ? '+' : '') + res.guard.toFixed(2) + '</b> · ' + (res.guard > 0.5 ? '趋向 RED（降杠杆参考）' : res.guard < -0.5 ? '趋向 GREEN' : '中性') + '</div>';
+  box.innerHTML = h;
+}
+function renderScenarioDefault() { renderScenario(SCENARIOS[0].id); }
 
 /* 偏相关的显著性：自由度为 n-2-(p-2)。控制住的变量越多，剩下的自由度越少，
  * 这是偏相关的固有代价 —— 30 个样本、控制 20 个变量之后算出来的「直接关系」
@@ -1653,6 +1793,26 @@ function renderDeriv() {
   set('dv_ls', d.ls != null ? d.ls.toFixed(1) + '% 多' : '—');
   const fb = $('dv_fund'); if (fb && d.funding != null) fb.style.color = d.funding > 0.03 ? '#ff3d6e' : d.funding < -0.02 ? '#00e5a0' : '#a8bfd6';
 }
+const VAL_FACTORS = FACTORS.filter(f => f.group === 'value');
+function renderValueFactors() {
+  const box = $('valueGrid'); if (!box) return;
+  const out = computeNexusScore().out;
+  box.innerHTML = '';
+  VAL_FACTORS.forEach(f => {
+    const r = out[f.id]; if (!r) return;
+    const c = r.contribution;                          // dir × z：正=偏贵/偏险，负=偏便宜
+    const col = c > 0.25 ? '#00e5a0' : c < -0.25 ? '#ff3d6e' : '#ffc107';
+    const tag = c > 0.25 ? '偏贵/偏险' : c < -0.25 ? '偏便宜' : '中性';
+    const d = document.createElement('div');
+    d.className = 'fcard';
+    d.title = f.name + '\n原始 z ' + r.z.toFixed(2) + ' · 贡献 ' + c.toFixed(2) + '\n' + r.note;
+    d.innerHTML = '<div class="fc-name">' + f.name + '</div><div class="fc-z" style="color:' + col + '">' + (c >= 0 ? '+' : '') + c.toFixed(1) + '</div>' +
+      '<div class="fc-str"><div class="fc-strbar" style="width:' + Math.min(100, Math.abs(c) / 2.5 * 100) + '%;background:' + col + '"></div></div>' +
+      '<div class="fc-sig" style="color:' + col + '">' + tag + ' · ' + r.note + '</div>';
+    box.appendChild(d);
+  });
+}
+
 function renderFactors() {
   const res = computeNexusScore();
   const { score, out, nScored, nDead } = res;
@@ -1675,14 +1835,14 @@ function renderFactors() {
   }
   const box = $('factorGrid'); if (!box) return; box.innerHTML = '';
   FACTORS.forEach(f => {
-    if (f.replayOnly) return;            // 回放专用因子不出现在实时面板
+    if (f.replayOnly || f.anchored) return;   // 回放专用 / 锚定估值因子不出现在实时评分网格
     const r = out[f.id];
     const c = r.contribution;                       // dir × z：正=利多、负=利空
     const show = f.dir === 0;
     const dead = r.ok === false;
     const stl = !dead && !show && r.stale === true;
     const col = dead || show ? '#3a5070' : stl ? '#8a93a6' : c > 0.25 ? '#00e5a0' : c < -0.25 ? '#ff3d6e' : '#ffc107';
-    const tag = dead ? '无数据' : show ? '仅展示' : stl ? '数据未到' : c > 0.25 ? '利多' : c < -0.25 ? '利空' : '中性';
+    const tag = dead ? '无数据' : show ? '仅展示' : stl ? '未回填' : c > 0.25 ? '利多' : c < -0.25 ? '利空' : '中性';
     const dirTxt = f.dir > 0 ? 'z↑=利多' : f.dir < 0 ? 'z↑=利空' : '不参与评分';
     const card = document.createElement('div');
     card.className = 'fcard';
@@ -1691,7 +1851,7 @@ function renderFactors() {
     card.innerHTML = `<div class="fc-name">${f.name}</div><div class="fc-z" style="color:${col}">${show || dead ? '—' : (c >= 0 ? '+' : '') + c.toFixed(1)}</div><div class="fc-str"><div class="fc-strbar" style="width:${Math.min(100, Math.abs(c) / 2.5 * 100)}%;background:${col}"></div></div><div class="fc-sig" style="color:${col}">${tag} · ${r.note}</div>`;
     box.appendChild(card);
   });
-  const cnt = $('fCount'); if (cnt) cnt.textContent = FACTORS.filter(f => !f.replayOnly).length + ' 维 · ' + nScored + ' 参与评分' + (nDead ? ' · ' + nDead + ' 无数据' : '');
+  const cnt = $('fCount'); if (cnt) cnt.textContent = FACTORS.filter(f => !f.replayOnly && !f.anchored).length + ' 维 · ' + nScored + ' 参与评分' + (nDead ? ' · ' + nDead + ' 无数据' : '');
 
   /* v3.11 实践延展：当前体制徽标 + 极端体制子评分卡 */
   const regime = currentRegime();
@@ -3189,6 +3349,7 @@ async function refreshAll() {
   if (!state.klines['BTC1d']) await fetchKlines('BTC', '1d');
   buildSeries();
   renderTicker(); renderChart(); renderTA(); renderFG(); renderMacro(); renderEcon(); renderOnChain(); renderDeriv(); renderFactors();
+  try { renderValueFactors(); } catch (e) { console.warn('value panel fail', e && e.message); }
   renderPaper();
   initNetwork(); renderHeatmap();
   try { renderNetStats(); renderCorrPanels(); renderSystemic(); } catch (e) { console.warn('net v2 fail', e && e.message); }
@@ -3197,6 +3358,7 @@ async function refreshAll() {
   refreshDvolAlarm();
   /* 回放刚跑完 → BTC 历史到位了，若因子宇宙已加载就补一次筛选渲染 */
   try { if (state.universe && Object.keys(state.universe.series).length && state.histBundle && state.histBundle.btc) renderUniverseBox(); } catch (e) { console.warn('uni after hist fail', e && e.message); }   // v3.14: 实时波动率恐慌警报（异步，不阻塞主渲染）
+  try { renderScenario(state.scenarioSel || SCENARIOS[0].id); } catch (e) { console.warn('scenario fail', e && e.message); }
 }
 
 /* =====================================================================
@@ -3277,6 +3439,13 @@ function bindUI() {
     });
     updateNotifyUI();
   }
+  /* v3.31 情景推演引擎：情景按钮 */
+  document.querySelectorAll('.scn-btn').forEach(b => b.addEventListener('click', () => {
+    document.querySelectorAll('.scn-btn').forEach(x => x.classList.remove('on'));
+    b.classList.add('on');
+    state.scenarioSel = b.getAttribute('data-scn');
+    try { renderScenario(state.scenarioSel); } catch (e) { console.warn('scn click fail', e && e.message); }
+  }));
 }
 
 /* =====================================================================

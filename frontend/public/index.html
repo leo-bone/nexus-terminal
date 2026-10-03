@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Nexus Terminal · 加密货币因子关系终端 v3.30</title>
+<title>Nexus Terminal · 加密货币因子关系终端 v3.31</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -308,7 +308,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
   <div class="header">
     <div class="logo">NEXUS <em>TERMINAL</em></div>
     <div class="tagline">CRYPTO FACTOR TERMINAL</div>
-    <div class="live-badge"><span class="live-dot"></span> LIVE · v3.30</div>
+    <div class="live-badge"><span class="live-dot"></span> LIVE · v3.31</div>
     <div class="hdr-right">
       <span class="net-lbl">数据源</span><span id="netDot" class="net-dot"></span>
       <span id="lastUpd" class="last-upd">—</span>
@@ -531,6 +531,26 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
   </div>
 
   <div class="panel">
+    <div class="phdr"><span class="icon">🎯</span><span class="lbl">情景推演引擎 · v3.31（种子+因子互动）</span><span class="hint">借鉴 MiroFish · 非 LLM 模拟</span></div>
+    <div class="netopts">
+      <span class="fttl">情景</span>
+      <button class="ttab scn-btn on" data-scn="vol_spike">波动率冲击</button>
+      <button class="ttab scn-btn" data-scn="btc_break">BTC 破位</button>
+      <button class="ttab scn-btn" data-scn="real_up">实际利率上行</button>
+      <button class="ttab scn-btn" data-scn="risk_on">风险偏好回暖</button>
+      <button class="ttab scn-btn" data-scn="safe_haven">避险扩散</button>
+      <button class="ttab scn-btn" data-scn="yen_carry">日元套息平仓</button>
+    </div>
+    <div id="scenarioBox" class="scn-box" style="padding:0 14px 12px"></div>
+  </div>
+
+  <div class="panel">
+    <div class="phdr"><span class="icon">💎</span><span class="lbl">估值因子 · 价值维度（v3.31）</span><span class="hint">慢变量锚定 + 快变量实时 · 不进实时评分</span></div>
+    <div id="valueGrid" class="fgrid"></div>
+    <div class="rg-sub" style="border-top:none;margin-top:2px;padding:0 14px 12px">ERP / 实际金价 / 美联储表 / BTC链上估值 —— 慢变量（远期P/E、定基CPI、WALCL、链上美元结算额）的权威源被数据 Worker 白名单 + WAF 挡住，因此走「锚定表」填真值；快变量（10Y、金价、市值、链上笔数）为实时。备注中标「锚定」者即非实时部分，不冒充实时。锚定值维护位置：app.js 的 <code>VALUE_ANCHORS</code>。</div>
+  </div>
+
+  <div class="panel">
     <div class="phdr"><span class="icon">🏦</span><span class="lbl">宏观 · 政策 · 通胀 · 大宗 · 日元</span><span class="hint">Yahoo Finance + NY Fed + 美财政部 + 日本财务省</span></div>
     <div id="macroGrid" class="mgrid"></div>
     <div id="macroHint" class="macro-hint">—</div>
@@ -636,7 +656,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
   </div>
 
   <div class="footer">
-    NEXUS TERMINAL v3.30 · 32 维实时评分 + 167 维因子宇宙（全球股指 / 板块 / 利率 / 信用 / 外汇 / 商品 / 波动率 / 加密概念股 / 山寨币 / 科技股，全部 Yahoo 真实日频）· 影响强度由 IC / ICIR / BH-FDR / 样本外漂移统一裁定 · ㉜ 分类合成（4 种挑选规则 × K 敏感性 × 留一法 × 剔除 BTC 自身的增量检验）· 风险监测全口径（10 类 + 变化率 σ）报状态不报方向 · v3.27 真正样本外追踪（walk-forward 多折，最后一折锚定最近两年）· ㉞ 风险护栏（三联警报：DVOL 体制 + 全分类极端分位联动 + 变化率联动 → GREEN/YELLOW/RED）· ㉟ 风险监测历史崩溃对照（vsCrash：相对 2020 COVID / 2022 熊市峰值的偏离比，给护栏分量②的「极端」阈值做历史锚点）· ㊱ 护栏 RED 通知（进入 RED 时经数据 Worker 转发到群机器人 Webhook，带外提醒，不必 24h 盯盘；默认关闭，需主动开启）· 数据源: Bybit / CoinLore / DefiLlama / blockchain.info / alternative.me / mempool.space / CoinMetrics / Yahoo Finance / NY Fed / U.S. Treasury / Japan MOF / Forex Factory<br>
+    NEXUS TERMINAL v3.31 · 32 维实时评分 + 167 维因子宇宙（全球股指 / 板块 / 利率 / 信用 / 外汇 / 商品 / 波动率 / 加密概念股 / 山寨币 / 科技股，全部 Yahoo 真实日频）· 影响强度由 IC / ICIR / BH-FDR / 样本外漂移统一裁定 · ㉜ 分类合成（4 种挑选规则 × K 敏感性 × 留一法 × 剔除 BTC 自身的增量检验）· 风险监测全口径（10 类 + 变化率 σ）报状态不报方向 · v3.27 真正样本外追踪（walk-forward 多折，最后一折锚定最近两年）· ㉞ 风险护栏（三联警报：DVOL 体制 + 全分类极端分位联动 + 变化率联动 → GREEN/YELLOW/RED）· ㉟ 风险监测历史崩溃对照（vsCrash：相对 2020 COVID / 2022 熊市峰值的偏离比，给护栏分量②的「极端」阈值做历史锚点）· ㊱ 护栏 RED 通知（进入 RED 时经数据 Worker 转发到群机器人 Webhook，带外提醒，不必 24h 盯盘；默认关闭，需主动开启）· 数据源: Bybit / CoinLore / DefiLlama / blockchain.info / alternative.me / mempool.space / CoinMetrics / Yahoo Finance / NY Fed / U.S. Treasury / Japan MOF / Forex Factory<br>
     仅供研究与教育，不构成投资建议。加密资产风险极高，请独立判断。
   </div>
 </div>
