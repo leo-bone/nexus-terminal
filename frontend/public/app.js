@@ -1684,8 +1684,14 @@ function renderFactors() {
         p.name.replace(/^[^ ]+ /, '') + ' ' + (p.z >= 0 ? '+' : '') + p.z.toFixed(1) + '</span>').join('') : '（因子数据缺失）';
     }
   }
+  /* v3.21 ⑲：把当前评分快照下来 —— ⑳ 的顺序正交化要用「今天最倚重谁」排序，
+   * 加分块的权重也读这里。先存后渲染，保证渲染函数拿到的永远是本次计算的结果。 */
+  state.lastScore = res.score;
+  state.lastScoreOut = res.out;
   /* v3.20 ⑫：分歧度 + 动态权重今日评级（失败不影响主面板） */
   try { renderScoreV2(res); } catch (e) { console.warn('score v2 fail', e && e.message); }
+  /* v3.21 ⑲：风险化仓位（同样失败不影响主面板） */
+  try { renderSizeBox(res); } catch (e) { console.warn('size box fail', e && e.message); }
 }
 /* v3.14: Deribit DVOL 实时波动率恐慌警报（风险护栏，不是预测）。
  * 从 /api/dvol 取当前 DVOL 的近1年百分位 + 60日 z，红/黄/绿三档提示。失败静默（增强项）。 */
@@ -1984,7 +1990,17 @@ async function runHistoryCheck() {
       rwS.full = ridgeWalkForward(rep);
       rwS.live = ridgeWalkForward(rep, { only: RW_LIVE_IDS });
     } catch (e) { console.warn('ridge walk-forward fail', e && e.message); }
+    /* v3.21 ⑰⑱⑳：分位数组合 / 评分校准 / 有效维度与分块。
+     * 这三块回答的是「拿到分之后怎么办」，跑在回放之后、渲染之前。 */
+    let qT = null, calM = null, dimM = null, qO = null;
+    try {
+      qT = quintileTest(rep, CALIB_H);
+      qO = quintileOOS(rep, CALIB_H);
+      calM = calibFit(rep, CALIB_H);
+      dimM = dimAnalyze(rep);
+    } catch (e) { console.warn('v3.21 sizing analysis fail', e && e.message); }
     state.hist = { rep: rep, ics: ics, facs: facs, oos: oos, roll: roll, ext: ext, reg: reg, per: per, aux: aux, rw: rwS,
+      quint: qT, qOos: qO, calib: calM, dim: dimM,
       mt: null, mtBusy: true,
       extreme: { series: exSeries, wildIC: exWildIC, mainWildIC: exMainWild, allIC: exAllIC } };
     renderHistory();
@@ -2682,6 +2698,9 @@ function renderHistory() {
 
   renderFacRank(S.facs);
   renderRwBox();
+  renderQuintBox();
+  renderCalibBox();
+  renderDimBox();
   renderOOS(S.oos);
   drawRollChart($('rollCanvas'), S.roll);
   drawHistChart($('histCanvas'), rep);
@@ -4150,16 +4169,9 @@ function netAnalyze(keys, opts) {
     c2.forEach(function (c, ci) { c.forEach(function (idx) { out[idx] = ci; }); });
     return out;
   };
-  /* 簇数取「合并高度跳跃最大」处，限定 2~5 簇 —— 不是随意切一刀 */
-  let kBest = Math.min(p, 4), gap = -1;
-  for (let k = 2; k <= Math.min(p, 6); k++) {
-    const idx0 = mergeHeights.length - k;
-    if (idx0 < 0 || idx0 >= mergeHeights.length) continue;
-    const g = mergeHeights[mergeHeights.length - 1] - mergeHeights[idx0];
-    if (g > gap) { gap = g; kBest = k; }
-  }
-  if (p < 4) kBest = Math.min(p, 2);
-  const cluster = clusterAt(Math.max(2, Math.min(5, kBest)));
+  /* 簇数由 pickKFromHeights 统一决定（含「无明确断层时回退默认值」的处理） */
+  const kPick = pickKFromHeights(mergeHeights, p);
+  const cluster = clusterAt(kPick.k);
 
   /* ---- 系统性指标 ---- */
   const tot = prep.eigen.reduce(function (a, b) { return a + Math.max(0, b); }, 0) || 1;
@@ -4196,6 +4208,7 @@ function netAnalyze(keys, opts) {
     minEig: prep.minEig, eigen: prep.eigen, absorption: ar, divRatio: divRatio,
     avgAbsCorr: avgAbsCorr, strength: strength, eigC: eigC,
     mst: mstEdges, cluster: cluster, nCluster: (function () { const s = new Set(cluster); return s.size; })(),
+    clusterClearGap: kPick.clearGap, clusterMaxJump: kPick.maxJump, clusterSpan: kPick.span,
     dist: mst.dist, minEigRaw: prep.minEigRaw, clusterDist: Dc,
   };
 }
@@ -4651,4 +4664,955 @@ function scoreDispersion(res) {
     jackLo: Math.max(2, Math.min(98, Math.round(lo))), jackHi: Math.max(2, Math.min(98, Math.round(hi))),
     jackRange: Math.round(hi - lo), driver: who, driverDelta: whoDelta, top: top, score: res.score,
   };
+}
+
+
+/* =====================================================================
+ *  v3.21 · 从「给分」到「给仓位」
+ *
+ *  前面十几个版本都在回答「现在几分」。但分数本身不可执行 —— 没人能拿
+ *  57 分去下单。真正的缺口是中间那一段：
+ *      分数 → 期望收益（校准） → 期望收益 → 仓位（风险化）
+ *  这一版补的就是这一段，外加一个前提检查：
+ *      这 22 个因子到底有几个是真正独立的？（有效维度）
+ *
+ *  ⑰ 分位数组合检验：按分位数切 5 档（不是固定阈值 —— 固定阈值会让某档
+ *     只剩几十个样本），检验期望收益是否随档位单调上升。单调性用
+ *     **5! = 120 种排列全枚举**的精确置换检验，不是蒙特卡洛近似；
+ *     并且再验一遍**样本外保序性**（切分点由前段定死，后段不许偷看）。
+ *  ⑱ 校准：一分的评分到底值多少期望收益？给 OLS 映射 + R²。
+ *     诚实披露：R² ≈ 2%，也就是评分只能解释 2% 的收益变异 —— 这个数字
+ *     直接决定仓位该多小。斜率的显著性按**非重叠样本**折算，不拿 3555 个
+ *     重叠窗口冒充 3555 个独立观测。
+ *  ⑲ 仓位：样本外闸门 / 成本门槛 / 波动率目标 / Kelly / 杠杆上限，
+ *     五个约束取最紧的那个，并显式指出**是哪个约束在起作用**。
+ *     Kelly 只用**超额部分**（去掉这段样本的无条件漂移），否则算出来的是
+ *     「牛市里满仓加杠杆」这种毫无信息量的答案。
+ *  ⑳ 有效维度：participation ratio 与熵有效维度；因子 z 相关矩阵聚类分块，
+ *     块内等权合成，与原 22 维模型比 IC；再给「顺序正交化」后的独有信息量。
+ * ===================================================================== */
+
+const Q_NBUCKET = 5;
+const SIZE_TARGET_VOL = 0.15;    // 波动率目标（年化）—— 散户风险护栏定位，不是追求收益最大化
+const SIZE_MAX_LEV = 1.0;        // 杠杆上限
+const SIZE_ROUNDTRIP = 0.002;    // 往返成本（0.1% × 2）：超额收益低过这个就不值得动手
+const CALIB_H = 10;              // 校准与分位数组合所用的前向 horizon
+
+/* ---------------------------------------------------------------
+ * ⑰ 分位数组合检验
+ * --------------------------------------------------------------- */
+/* 收集「评分 → 未来 h 日收益」样本。与 icCore 的区别：这里要保留下标与
+ * 顺序，因为多空组合要按时间先后重建净值曲线。 */
+function scoreFwdPairs(rep, h) {
+  const S = [], R = [], I = [];
+  for (let i = rep.start; i < rep.n; i++) {
+    const v = rep.scores[i];
+    if (v == null) continue;
+    const j = i + h;
+    if (j >= rep.n) break;
+    const p0 = rep.closes[i];
+    if (!p0) continue;
+    S.push(v); R.push(rep.closes[j] / p0 - 1); I.push(i);
+  }
+  return { S: S, R: R, I: I };
+}
+
+/* 一元 OLS：斜率 / 截距 / 斜率标准误 / R² / 残差标准差 / 均值响应标准误。
+ * minN 可调：分段校准只有 5 个「段」，不能套用普通回归的 n≥10 门槛。
+ * 校准的整条逻辑都建立在这上面，所以单独抽出来 —— 测试里对着解析解验。 */
+function olsFit(x, y, minN) {
+  const n = Math.min(x.length, y.length);
+  if (n < (minN || 10)) return null;
+  let mx = 0, my = 0;
+  for (let i = 0; i < n; i++) { mx += x[i]; my += y[i]; }
+  mx /= n; my /= n;
+  let sxx = 0, sxy = 0, syy = 0;
+  for (let i = 0; i < n; i++) {
+    const a = x[i] - mx, b = y[i] - my;
+    sxx += a * a; sxy += a * b; syy += b * b;
+  }
+  if (!sxx || !syy) return null;
+  const b = sxy / sxx, a = my - b * mx;
+  const sse = Math.max(0, syy - b * sxy);
+  const s2 = sse / Math.max(1, n - 2);
+  const seB = Math.sqrt(s2 / sxx);
+  return {
+    n: n, b: b, a: a, seB: seB, tB: seB ? b / seB : null,
+    r2: syy ? 1 - sse / syy : null, sdResid: Math.sqrt(s2), mx: mx, sxx: sxx, my: my, syy: syy,
+    /* 均值响应的标准误：离样本中心越远越宽 —— 极值评分的预测本来就最不可信，
+     * 这一点必须反映到仓位上，而不是给一个假精确的数字。 */
+    seAt: function (s) { return Math.sqrt(s2 * (1 / n + Math.pow(s - mx, 2) / sxx)); },
+    muAt: function (s) { return a + b * s; },
+  };
+}
+
+function permute5() {
+  const out = [], a = [0, 1, 2, 3, 4];
+  (function rec(k) {
+    if (k === 5) { out.push(a.slice()); return; }
+    for (let i = k; i < 5; i++) {
+      const t = a[k]; a[k] = a[i]; a[i] = t;
+      rec(k + 1);
+      const t2 = a[k]; a[k] = a[i]; a[i] = t2;
+    }
+  })(0);
+  return out;
+}
+
+/* 5 个数、5 个档位序号：枚举全部 120 种排列，得到**精确**置换 p 值。
+ * 只有 5 个点时正态近似完全无用，但全枚举反而比蒙特卡洛更快也更准。 */
+function monoPermP(means) {
+  if (means.some(function (m) { return m == null; })) return null;
+  /* 必须用**秩**而不是原始值：pearson(1..5, 原始值) 是「台阶形状有多线性」，
+   * pearson(1..5, 秩) 才是 Spearman —— 也就是我们要的「单调性」。
+   * 混用会让「严格递增但非线性」的台阶被误判成不单调。 */
+  const seq = [1, 2, 3, 4, 5];
+  const rk = rankAvg(means);
+  const rho = pearson(seq, rk);
+  if (rho == null) return null;
+  const perms = permute5();
+  let nGe = 0, nPerm = 0;
+  for (let k = 0; k < perms.length; k++) {
+    /* 排列原始值再取秩 == 直接排列秩，所以这里只排秩即可 */
+    const r = pearson(seq, perms[k].map(function (i) { return rk[i]; }));
+    if (r == null) continue;
+    nPerm++;
+    if (r >= rho - 1e-12) nGe++;
+  }
+  return { rho: rho, p: nPerm ? nGe / nPerm : null, nPerm: nPerm };
+}
+
+function quintileTest(rep, h) {
+  const P = scoreFwdPairs(rep, h);
+  const S = P.S, R = P.R;
+  if (S.length < 100) return null;
+  const srt = S.slice().sort(function (a, b) { return a - b; });
+  const cut = [];
+  for (let q = 1; q < Q_NBUCKET; q++) cut.push(srt[Math.floor(q * srt.length / Q_NBUCKET)]);
+  const bidx = S.map(function (v) {
+    let b = 0;
+    while (b < cut.length && v >= cut[b]) b++;
+    return b;
+  });
+  const bk = [];
+  for (let b = 0; b < Q_NBUCKET; b++) {
+    const rs = [];
+    for (let i = 0; i < S.length; i++) if (bidx[i] === b) rs.push(R[i]);
+    const n = rs.length;
+    if (!n) { bk.push({ b: b, n: 0, mean: null, win: null, sd: null, t: null, neff: 0 }); continue; }
+    const mean = rs.reduce(function (a, x) { return a + x; }, 0) / n;
+    let vv = 0;
+    for (let i = 0; i < n; i++) vv += (rs[i] - mean) * (rs[i] - mean);
+    const sd = Math.sqrt(vv / Math.max(1, n - 1));
+    const win = rs.filter(function (x) { return x > 0; }).length / n;
+    /* 重叠窗口 ⇒ n 不是有效样本量，按 n/h 折算（与 icCore 同一口径）。 */
+    const neff = Math.max(4, Math.floor(n / h));
+    bk.push({ b: b, n: n, mean: mean, win: win, sd: sd, neff: neff, t: sd ? mean / (sd / Math.sqrt(neff)) : null });
+  }
+  const base = R.reduce(function (a, x) { return a + x; }, 0) / R.length;
+  const mp = monoPermP(bk.map(function (x) { return x.mean; }));
+
+  /* 多空组合：最高档 +1、最低档 −1、其余 0。
+   * h 日重叠收益按 1/h 摊到每一天 —— 只为看净值形状与回撤。
+   * 重叠会低估波动、高估夏普，所以本表夏普**只作形状参考**，
+   * 显著性一律用上面按非重叠窗口折算的 t。 */
+  const d = [];
+  for (let i = 0; i < S.length; i++) {
+    const sgn = bidx[i] === Q_NBUCKET - 1 ? 1 : (bidx[i] === 0 ? -1 : 0);
+    d.push(sgn * R[i] / h);
+  }
+  let dm = 0;
+  for (let i = 0; i < d.length; i++) dm += d[i];
+  dm /= d.length;
+  let dv = 0;
+  for (let i = 0; i < d.length; i++) dv += (d[i] - dm) * (d[i] - dm);
+  const dsd = Math.sqrt(dv / Math.max(1, d.length - 1));
+  let eq = 1, peak = 1, mdd = 0;
+  for (let i = 0; i < d.length; i++) {
+    eq *= (1 + d[i]);
+    if (eq > peak) peak = eq;
+    const dd = 1 - eq / peak;
+    if (dd > mdd) mdd = dd;
+  }
+  const years = d.length / 365;
+  const ls = {
+    daily: dm, sd: dsd, n: d.length,
+    sharpe: dsd ? dm / dsd * Math.sqrt(365) : null,
+    total: eq - 1, mdd: mdd,
+    cagr: (years > 0 && eq > 0) ? Math.pow(eq, 1 / years) - 1 : null,
+  };
+  let mono = true;
+  for (let i = 1; i < bk.length; i++) {
+    if (bk[i].mean == null || bk[i - 1].mean == null) continue;
+    if (bk[i].mean < bk[i - 1].mean - 1e-9) mono = false;
+  }
+  return {
+    h: h, n: S.length, base: base, buckets: bk,
+    rho: mp ? mp.rho : null, pMono: mp ? mp.p : null, nPerm: mp ? mp.nPerm : 0,
+    monotonic: mono, ls: ls,
+    spread: (bk[Q_NBUCKET - 1].mean != null && bk[0].mean != null) ? bk[Q_NBUCKET - 1].mean - bk[0].mean : null,
+    cut: cut,
+  };
+}
+
+/* 分位数切分的**样本外保序性**：切分点只用前 frac 段定死，后段不许参与决定
+ * 切分点（否则就是偷看），然后看这五个数在没见过的时间段上还是不是这个顺序。
+ * 样本内单调太容易了 —— 切 5 档、看 5 个数，总能讲出一个故事。
+ * 真正值钱的是「搬到没见过的样本上还成不成立」。 */
+function quintileOOS(rep, h, frac) {
+  const P = scoreFwdPairs(rep, h);
+  const S = P.S, R = P.R;
+  if (S.length < 200) return null;
+  const cut2 = Math.floor(S.length * (frac || 0.6));
+  if (cut2 < 80 || S.length - cut2 < 80) return null;
+  const srt = S.slice(0, cut2).sort(function (a, b) { return a - b; });
+  const cut = [];
+  for (let q = 1; q < Q_NBUCKET; q++) cut.push(srt[Math.floor(q * srt.length / Q_NBUCKET)]);
+  const binOf = function (v) { let b = 0; while (b < cut.length && v >= cut[b]) b++; return b; };
+  const sum = new Array(Q_NBUCKET).fill(0), ns = new Array(Q_NBUCKET).fill(0), win = new Array(Q_NBUCKET).fill(0);
+  for (let i = cut2; i < S.length; i++) {
+    const b = binOf(S[i]);
+    sum[b] += R[i]; ns[b]++; if (R[i] > 0) win[b]++;
+  }
+  const means = [], wins = [];
+  for (let b = 0; b < Q_NBUCKET; b++) {
+    means.push(ns[b] ? sum[b] / ns[b] : null);
+    wins.push(ns[b] ? win[b] / ns[b] : null);
+  }
+  const mp = monoPermP(means);
+  let mono = true;
+  for (let i = 1; i < Q_NBUCKET; i++) {
+    if (means[i] == null || means[i - 1] == null) continue;
+    if (means[i] < means[i - 1] - 1e-9) mono = false;
+  }
+  /* 分档台阶塌掉只是表象，根本问题是信号本身：把 IC 在前后两段各算一次。
+   * 如果 IC 本身没衰减，那台阶塌掉就只是分档口径的偶然；
+   * 如果 IC 一起塌了，那说明是信号在这段时间里失效了 —— 两件事的含义完全不同。 */
+  const splitRepIdx = P.I[cut2] != null ? P.I[cut2] : rep.start + cut2;
+  const icA = icCore(rep.scores, rep, h, rep.start, splitRepIdx);
+  const icB = icCore(rep.scores, rep, h, splitRepIdx, rep.n);
+  return {
+    h: h, nIn: cut2, nOut: S.length - cut2,
+    means: means, ns: ns, wins: wins,
+    rho: mp ? mp.rho : null, pMono: mp ? mp.p : null, monotonic: mono,
+    spread: (means[Q_NBUCKET - 1] != null && means[0] != null) ? means[Q_NBUCKET - 1] - means[0] : null,
+    icIn: icA ? { ic: icA.spear, t: icA.t, n: icA.n } : null,
+    icOut: icB ? { ic: icB.spear, t: icB.t, n: icB.n } : null,
+  };
+}
+
+/* ---------------------------------------------------------------
+ * ⑱ 校准：评分 → 期望收益
+ * ---------------------------------------------------------------
+ * IC 只告诉你「排序对不对」，不告诉你「一分值多少钱」。而仓位需要的是后者。
+ * 这一块把评分换成期望收益，并且**连自己的不准确性一起报出来**。 */
+function calibFit(rep, h) {
+  const P = scoreFwdPairs(rep, h);
+  if (P.S.length < 100) return null;
+  const fit = olsFit(P.S, P.R);
+  if (!fit) return null;
+
+  /* 重叠窗口的代价：3555 个 10 日窗口不等于 3555 个独立观测。
+   * 标准误按 √(n/n_eff) 放大 —— 不这么做，t 会从 2.9 变成 9.2，
+   * 把一个「勉强显著」的斜率读成「极其显著」。
+   * 本仓库从头到尾都用这个折算口径（icCore / ridgeWalkForward），这里不能例外。 */
+  const nEff = Math.max(4, Math.floor(fit.n / h));
+  const infl = Math.sqrt(fit.n / nEff);
+
+  /* ---- 分段校准：把评分按分位数切 5 段，比「预测 vs 实际」 ---- */
+  const srt = P.S.slice().sort(function (a, b) { return a - b; });
+  const cut = [];
+  for (let q = 1; q < 5; q++) cut.push(srt[Math.floor(q * srt.length / 5)]);
+  const binOf = function (v) { let b = 0; while (b < cut.length && v >= cut[b]) b++; return b; };
+  const bp = [], ba = [];
+  for (let b = 0; b < 5; b++) { bp.push([]); ba.push([]); }
+  for (let i = 0; i < P.S.length; i++) {
+    const b = binOf(P.S[i]);
+    bp[b].push(fit.a + fit.b * P.S[i]); ba[b].push(P.R[i]);
+  }
+  const bins = [];
+  for (let b = 0; b < 5; b++) {
+    const mp = bp[b].length ? bp[b].reduce(function (x, y) { return x + y; }, 0) / bp[b].length : null;
+    const ma = ba[b].length ? ba[b].reduce(function (x, y) { return x + y; }, 0) / ba[b].length : null;
+    bins.push({ b: b, n: ba[b].length, pred: mp, actual: ma, err: (mp != null && ma != null) ? ma - mp : null,
+      lo: ba[b].length ? srt[0] : null, hi: null });
+  }
+  /* 校准斜率：把「实际」回归到「预测」上。=1 标定准确；<1 = 模型过度自信
+   *（它预测差 1 分，实际只差 0.5 分）。5 个点，所以 minN 传 3。 */
+  const px = [], py = [];
+  bins.forEach(function (x) { if (x.pred != null && x.actual != null) { px.push(x.pred); py.push(x.actual); } });
+  const slopeFit = olsFit(px, py, 3);
+
+  /* ---- 样本外：前 60% 拟合，后 40% 评估 ---- */
+  const cut2 = Math.floor(P.S.length * 0.6);
+  const isFit = olsFit(P.S.slice(0, cut2), P.R.slice(0, cut2));
+  let oos = null;
+  if (isFit && P.S.length - cut2 >= 60) {
+    const xs = P.S.slice(cut2), ys = P.R.slice(cut2);
+    let sse = 0, sst = 0, my = 0;
+    for (let i = 0; i < ys.length; i++) my += ys[i];
+    my /= ys.length;
+    for (let i = 0; i < ys.length; i++) {
+      const pr = isFit.a + isFit.b * xs[i];
+      sse += (ys[i] - pr) * (ys[i] - pr);
+      sst += (ys[i] - my) * (ys[i] - my);
+    }
+    oos = { n: ys.length, r2: sst ? 1 - sse / sst : null, slopeIS: isFit.b, slopeOOS: null, rmse: Math.sqrt(sse / ys.length) };
+    const ox = [], oy = [];
+    for (let i = 0; i < ys.length; i++) { ox.push(isFit.a + isFit.b * xs[i]); oy.push(ys[i]); }
+    const os = olsFit(ox, oy, 3);
+    if (os) oos.slopeOOS = os.b;
+  }
+
+  return {
+    h: h, n: fit.n, nEff: nEff, infl: infl,
+    a: fit.a, b: fit.b, seB: fit.seB, tB: fit.tB,
+    seBEff: fit.seB * infl, tBEff: fit.seB ? fit.b / (fit.seB * infl) : null,
+    r2: fit.r2, sdResid: fit.sdResid, mxScore: fit.mx, scoreSd: Math.sqrt(fit.sxx / fit.n),
+    perUnit: fit.b, per10: fit.b * 10,
+    /* 均值响应：含这段样本的无条件漂移（牛市里 10 日平均 +1.9%）。
+     * 看「未来大概涨多少」用这个。 */
+    muAtScore: function (s) { return fit.a + fit.b * s; },
+    seAtScore: function (s) { return fit.seAt(s) * infl; },
+    /* 超额部分：只取斜率带来的偏离，**截距（漂移）不算信号** ——
+     * 一直持有 BTC 就能拿到漂移，为它冒风险没有任何 alpha。
+     * 仓位只对这个量下注。 */
+    alphaAtScore: function (s) { return fit.b * (s - fit.mx); },
+    seAlphaAtScore: function (s) { return Math.abs(s - fit.mx) * fit.seB * infl; },
+    bins: bins, calibSlope: slopeFit ? slopeFit.b : null,
+    oos: oos,
+    base: P.R.reduce(function (a, x) { return a + x; }, 0) / P.R.length,
+  };
+}
+
+/* ---------------------------------------------------------------
+ * ⑲ 风险化仓位：从期望收益到「买多少」
+ * ---------------------------------------------------------------
+ * Kelly 的问题从来不是公式，而是输入：
+ *   f = μ/σ² 对 μ 的估计误差极其敏感，μ 高估一倍，仓位就翻倍。
+ * 所以这里不给一个数字，给**五个约束 + 哪个在起作用**：
+ *   ⓪ 样本外闸门：校准映射出了样本还成不成立？不成立就什么都别算 —— 这条最要紧
+ *   ① 成本门槛：超额收益覆盖不了往返手续费 → 0
+ *   ② 波动率目标：仓位 = 目标年化波动 / 当前年化波动
+ *   ③ Kelly（全额 / 保守 μ 取 1σ 下限 / 实务四分之一），且只用**超额部分**
+ *   ④ 杠杆上限
+ */
+function sizingAdvice(res) {
+  const H = state.hist;
+  const cal = H && H.calib ? H.calib : null;
+  const reg = currentRegime();
+  const sigma = reg ? reg.vol : null;      // BTC 20 日年化已实现波动率
+  const score = res ? res.score : null;
+  const out = { have: false, sigma: sigma, score: score, reg: reg ? reg.key : null };
+  if (!cal || sigma == null || !sigma || score == null) {
+    out.why = !cal ? '需要先跑一次历史回放，才能得到「一分值多少钱」的校准。'
+      : '需要 BTC 日线（算 20 日年化波动率）。';
+    return out;
+  }
+  const h = cal.h;
+  const muH = cal.muAtScore(score);
+  const seH = cal.seAtScore(score);
+  /* 只有超额部分才是信号：截距是这段样本的无条件漂移，不是模型贡献的。 */
+  const alphaH = cal.alphaAtScore(score);
+  const seA = cal.seAlphaAtScore(score);
+  const alphaAnn = alphaH * (365 / h);
+  const seAAnn = seA * (365 / h);
+  const varAnn = sigma * sigma;
+
+  const kellyFull = alphaAnn / varAnn;
+  const kellyCons = (alphaAnn - seAAnn) / varAnn;      // μ 取 1σ 下限
+  const volTarget = SIZE_TARGET_VOL / sigma;
+
+  /* ⓪ 样本外闸门：这是所有约束里最要紧的一条。
+   * 校准是样本内拟合出来的，如果它的映射出了样本就不成立（OOS R² ≤ 0，
+   * 或 OOS 校准斜率 < 0.5），那由它推出来的期望收益就不能拿来下注 ——
+   * 后面所有公式再精致也没用。 */
+  const oos = cal.oos;
+  const oosLinear = !!(oos && oos.r2 != null && oos.r2 > 0 && oos.slopeOOS != null && oos.slopeOOS >= 0.5);
+  const qo = H.qOos;
+  const oosOrder = !!(qo && qo.pMono != null && qo.pMono < 0.10 && qo.monotonic);
+
+  const costOk = Math.abs(alphaH) >= SIZE_ROUNDTRIP;
+  const cand = [
+    { k: 'quarterKelly', v: 0.25 * kellyFull, lbl: '四分之一 Kelly（超额 μ 全额）' },
+    { k: 'volTarget', v: volTarget, lbl: '波动率目标 ' + (SIZE_TARGET_VOL * 100).toFixed(0) + '%' },
+    { k: 'cap', v: SIZE_MAX_LEV, lbl: '杠杆上限 ' + SIZE_MAX_LEV.toFixed(1) + '×' },
+  ].filter(function (c) { return c.v != null && isFinite(c.v) && c.v > 0; });
+  let bind = null;
+  for (const c of cand) if (!bind || c.v < bind.v) bind = c;
+
+  out.have = true;
+  out.h = h;
+  out.muH = muH; out.seH = seH;
+  out.alphaH = alphaH; out.seA = seA; out.alphaAnn = alphaAnn; out.seAAnn = seAAnn;
+  out.muLo = muH - 1.645 * seH; out.muHi = muH + 1.645 * seH;
+  out.alphaLo = alphaH - 1.645 * seA; out.alphaHi = alphaH + 1.645 * seA;
+  out.kellyFull = kellyFull; out.kellyCons = kellyCons; out.volTarget = volTarget;
+  out.costOk = costOk;
+  out.oosLinear = oosLinear; out.oosOrder = oosOrder;
+  out.oosR2 = oos ? oos.r2 : null;
+  out.oosSlope = oos ? oos.slopeOOS : null;
+  out.suggest = (oosLinear && costOk && bind) ? Math.max(0, Math.min(SIZE_MAX_LEV, bind.v)) : 0;
+  out.bindKey = !oosLinear ? 'oos' : (!costOk ? 'cost' : (bind ? bind.k : 'none'));
+  out.bindLbl = !oosLinear ? '样本外闸门（校准映射出了样本不成立）'
+    : (!costOk ? '成本门槛（超额收益覆盖不了往返手续费）' : (bind ? bind.lbl : '—'));
+  out.cand = cand;
+  out.ciIncludes0 = (alphaH - 1.645 * seA) * (alphaH + 1.645 * seA) < 0;
+  out.r2 = cal.r2;
+  return out;
+}
+
+/* 从层次聚类的合并高度序列里挑簇数。
+ * ⑬ 网络（宏观序列）与 ⑳ 分块（因子 z）都用这一份 ——
+ * 免得同一个终端里出现两种「数据驱动的簇数」。
+ *
+ * 两个坑，都踩过：
+ *   ① 不能比「最近 k 次合并的**累计**高度差」—— 累计量随 k 单调增长，
+ *      于是必然命中 k 的上限。实测 22 个因子被切成 6 块（= 上限），
+ *      那不是数据说的，是上限说的。
+ *   ② 改成比**单次**跳跃之后，还要看这个跳跃相对整个高度跨度够不够大。
+ *      真实数据上树状图从 0.535 平滑升到 1.487，最大单次跳跃只占跨度 11% ——
+ *      这说明这批对象是**连续谱，不是离散块**，此时「分成几块」只是约定，
+ *      不能假装是数据给出的结论。这种情况落到事前定死的默认 k 并如实标注。 */
+const CLUSTER_DEFAULT_K = 4;
+const CLUSTER_MIN_GAP = 0.25;
+function pickKFromHeights(heights, p) {
+  if (p < 4) return Math.max(2, Math.min(p, 2));
+  let bi = -1, bd = -1;
+  for (let i = 0; i + 1 < heights.length; i++) {
+    const g = heights[i + 1] - heights[i];
+    if (g > bd) { bd = g; bi = i; }
+  }
+  if (bi < 0) return Math.max(2, Math.min(6, CLUSTER_DEFAULT_K));
+  const span = heights[heights.length - 1] - heights[0];
+  const clearGap = span > 1e-12 && bd / span >= CLUSTER_MIN_GAP;
+  const k = clearGap ? p - (bi + 1) : CLUSTER_DEFAULT_K;
+  return { k: Math.max(2, Math.min(6, k)), clearGap: clearGap, maxJump: bd, span: span };
+}
+
+/* ---------------------------------------------------------------
+ * ⑳ 有效维度与分块因子模型
+ * ---------------------------------------------------------------
+ * 「22 个因子」听起来比「5 个因子」信息量大。但如果这 22 个高度共线，
+ * 有效维度只有 4，那多出来的 18 个只是在重复同一句话 —— 加再多因子也不会
+ * 有新的 alpha。这一块把这件事量化。 */
+function effectiveDim(eigen) {
+  const lam = (eigen || []).filter(function (v) { return v > 1e-12; });
+  const tot = lam.reduce(function (a, b) { return a + b; }, 0);
+  if (!tot || !lam.length) return null;
+  let s2 = 0, H = 0;
+  for (let i = 0; i < lam.length; i++) {
+    s2 += lam[i] * lam[i];
+    const p = lam[i] / tot;
+    H -= p * Math.log(p);
+  }
+  const cum = [];
+  let acc = 0;
+  for (let i = 0; i < lam.length; i++) { acc += lam[i] / tot; cum.push(acc); }
+  return {
+    p: lam.length,
+    pr: tot * tot / s2,                 // participation ratio：(Σλ)²/Σλ²
+    entDim: Math.exp(H),                // 熵有效维度 exp(H)
+    top1: lam[0] / tot,
+    top3: cum[Math.min(2, cum.length - 1)],
+    nFor90: (function () { for (let i = 0; i < cum.length; i++) if (cum[i] >= 0.9) return i + 1; return cum.length; })(),
+    eigen: lam.slice(), cum: cum,
+  };
+}
+
+/* 因子 z 的相关矩阵（用回放里的逐日 z，不是收益率 —— 评分吃的是 z 的水平） */
+function facZCorr(rep) {
+  const ids = [];
+  REPLAY_IDS.forEach(function (id) { if (rep.fzs[id]) ids.push(id); });
+  const p = ids.length;
+  if (p < 3) return null;
+  const R = [], ovl = [];
+  for (let i = 0; i < p; i++) { R.push(new Array(p).fill(1)); ovl.push(new Array(p).fill(0)); }
+  for (let i = 0; i < p; i++) {
+    for (let j = i + 1; j < p; j++) {
+      const x = [], y = [];
+      for (let k = rep.start; k < rep.n; k++) {
+        const a = rep.fzs[ids[i]][k], b = rep.fzs[ids[j]][k];
+        if (a != null && b != null && isFinite(a) && isFinite(b)) { x.push(a); y.push(b); }
+      }
+      const r = pearson(x, y);
+      R[i][j] = R[j][i] = (r == null ? 0 : r);
+      ovl[i][j] = ovl[j][i] = x.length;
+    }
+  }
+  return { ids: ids, R: R, ovl: ovl, p: p };
+}
+
+/* 平均连接层次聚类（与 ⑬ 网络同一套距离：Mantegna √(2(1−ρ))），
+ * 簇数取合并高度跳跃最大处。单独实现一份是因为这里聚的是**因子 z**，
+ * 不是宏观序列收益率 —— 两者不是同一批对象。 */
+function avgLinkCluster(R, p) {
+  const D = [];
+  for (let i = 0; i < p; i++) { D.push(new Array(p).fill(0)); }
+  for (let i = 0; i < p; i++) for (let j = i + 1; j < p; j++) D[i][j] = D[j][i] = corrDist(R[i][j]);
+  let cur = [];
+  for (let i = 0; i < p; i++) cur.push([i]);
+  const heights = [];
+  while (cur.length > 1) {
+    let bi = 0, bj = 1, bd = Infinity;
+    for (let i = 0; i < cur.length; i++) for (let j = i + 1; j < cur.length; j++) {
+      let s = 0, n = 0;
+      for (const x of cur[i]) for (const y of cur[j]) { s += D[x][y]; n++; }
+      const d = s / n;
+      if (d < bd) { bd = d; bi = i; bj = j; }
+    }
+    heights.push(bd);
+    const merged = cur[bi].concat(cur[bj]);
+    const nx = [];
+    for (let i = 0; i < cur.length; i++) if (i !== bi && i !== bj) nx.push(cur[i]);
+    nx.push(merged);
+    cur = nx;
+  }
+  const clusterAt = function (k) {
+    let c2 = [];
+    for (let i = 0; i < p; i++) c2.push([i]);
+    while (c2.length > k) {
+      let bi = 0, bj = 1, bd = Infinity;
+      for (let i = 0; i < c2.length; i++) for (let j = i + 1; j < c2.length; j++) {
+        let s = 0, n = 0;
+        for (const x of c2[i]) for (const y of c2[j]) { s += D[x][y]; n++; }
+        const d = s / n;
+        if (d < bd) { bd = d; bi = i; bj = j; }
+      }
+      const merged = c2[bi].concat(c2[bj]);
+      const nx = [];
+      for (let i = 0; i < c2.length; i++) if (i !== bi && i !== bj) nx.push(c2[i]);
+      nx.push(merged);
+      c2 = nx;
+    }
+    const out = new Array(p).fill(-1);
+    c2.forEach(function (c, ci) { c.forEach(function (idx) { out[idx] = ci; }); });
+    return out;
+  };
+  const kPick = pickKFromHeights(heights, p);
+  const cl = clusterAt(kPick.k);
+  return { cluster: cl, k: (function () { const s = new Set(cl); return s.size; })(),
+    clearGap: kPick.clearGap, maxJump: kPick.maxJump, span: kPick.span, D: D, heights: heights };
+}
+
+/* 顺序正交化后的「独有信息量」：
+ * 第 k 个因子里，有多少是前 k−1 个已经说过的？（1 − R² 对前序列回归）
+ * 排序按权重×贡献从大到小 —— 也就是「这个模型实际最倚重的顺序」。
+ * 结果接近 0 的因子 = 在当前排序下几乎没有增量信息。 */
+function seqUnique(R, order) {
+  const p = order.length, out = [];
+  for (let k = 0; k < p; k++) {
+    const i = order[k];
+    if (k === 0) { out.push({ i: i, uniq: 1, r2: 0, m: 0 }); continue; }
+    const m = k, A = [], b = [];
+    for (let a = 0; a < m; a++) {
+      const row = [];
+      for (let c = 0; c < m; c++) row.push(R[order[a]][order[c]]);
+      A.push(row); b.push(R[order[a]][i]);
+    }
+    for (let a = 0; a < m; a++) A[a][a] += 1e-8;      // 数值保险：共线时仍可解
+    const x = cholSolve(A, b, m);
+    let r2 = 0;
+    if (x) for (let a = 0; a < m; a++) r2 += b[a] * x[a];
+    out.push({ i: i, uniq: Math.max(0, Math.min(1, 1 - r2)), r2: r2, m: m });
+  }
+  return out;
+}
+
+function dimAnalyze(rep) {
+  const FZ = facZCorr(rep);
+  if (!FZ) return null;
+  const prep = prepCorr(FZ.R, FZ.p, Math.max(60, Math.round((rep.n - rep.start) * 0.5)));
+  /* 谱必须取「处理完之后那个矩阵」的谱 —— prepCorr 内部已经重算过一次
+   * （v3.20 踩过的坑：报夹紧前的谱，会让「已半正定」这句话变成空话）。 */
+  const eff = effectiveDim(prep.eigen);
+  const cl = avgLinkCluster(prep.R, FZ.p);
+
+  /* 分块：簇内等权合成（用贡献值 contribution = dir×z，已对齐方向），
+   * 再对块等权合成总分。与原 22 维手写权重模型比 IC。 */
+  const nB = cl.k;
+  const blocks = [];
+  for (let b = 0; b < nB; b++) blocks.push([]);
+  FZ.ids.forEach(function (id, i) { blocks[cl.cluster[i]].push(id); });
+  const blockSeries = new Array(nB);
+  for (let b = 0; b < nB; b++) blockSeries[b] = new Array(rep.n).fill(null);
+  for (let i = rep.start; i < rep.n; i++) {
+    for (let b = 0; b < nB; b++) {
+      let s = 0, c = 0;
+      for (const id of blocks[b]) {
+        const v = rep.fvals[id] ? rep.fvals[id][i] : null;
+        if (v != null && isFinite(v)) { s += v; c++; }
+      }
+      blockSeries[b][i] = c ? s / c : null;
+    }
+  }
+  const comp = new Array(rep.n).fill(null);
+  for (let i = rep.start; i < rep.n; i++) {
+    let s = 0, c = 0;
+    for (let b = 0; b < nB; b++) { const v = blockSeries[b][i]; if (v != null) { s += v; c++; } }
+    comp[i] = c ? s / c : null;
+  }
+  const icOrig = icCore(rep.scores, rep, CALIB_H, rep.start, rep.n);
+  const icBlock = icCore(comp, rep, CALIB_H, rep.start, rep.n);
+
+  /* 块间的平均 |ρ|：分块是否真的让各块更正交？ */
+  let bs = 0, bn = 0;
+  for (let a = 0; a < nB; a++) for (let b = a + 1; b < nB; b++) {
+    const x = [], y = [];
+    for (let i = rep.start; i < rep.n; i++) {
+      const u = blockSeries[a][i], v = blockSeries[b][i];
+      if (u != null && v != null) { x.push(u); y.push(v); }
+    }
+    const r = pearson(x, y);
+    if (r != null) { bs += Math.abs(r); bn++; }
+  }
+
+  /* 当前实时状态下的顺序正交化（按 |w×贡献| 降序） */
+  const order = [], wmap = {};
+  FZ.ids.forEach(function (id, i) {
+    const f = FACTORS.find(function (x) { return x.id === id; });
+    const o = state.lastScoreOut && state.lastScoreOut[id];
+    const c = o && o.ok !== false ? (o.contribution || 0) : 0;
+    wmap[i] = Math.abs((f ? f.w : 1) * c);
+    order.push(i);
+  });
+  order.sort(function (a, b) { return wmap[b] - wmap[a]; });
+  const uniq = seqUnique(prep.R, order);
+
+  return {
+    p: FZ.p, ids: FZ.ids, R: prep.R, delta: prep.delta,
+    eff: eff, cluster: cl.cluster, k: nB, blocks: blocks,
+    clearGap: cl.clearGap, maxJump: cl.maxJump, span: cl.span,
+    icOrig: icOrig ? { ic: icOrig.spear, t: icOrig.t, n: icOrig.n } : null,
+    icBlock: icBlock ? { ic: icBlock.spear, t: icBlock.t, n: icBlock.n } : null,
+    blockAvgAbsCorr: bn ? bs / bn : null,
+    uniq: uniq.map(function (u) {
+      const id = FZ.ids[u.i];
+      const f = FACTORS.find(function (x) { return x.id === id; });
+      return { id: id, name: f ? f.name : id, uniq: u.uniq, r2: u.r2, rank: u.m };
+    }),
+  };
+}
+
+/* ---------------------------------------------------------------
+ * ⑰ 分位数组合检验 · 渲染
+ * --------------------------------------------------------------- */
+function renderQuintBox() {
+  const box = $('quintBox'); if (!box) return;
+  const H = state.hist;
+  const q = H && H.quint ? H.quint : null;
+  if (!q) {
+    box.innerHTML = '<div class="fttl" style="margin-bottom:7px">⑰ 分位数组合检验</div>' +
+      '<div class="rg-sub">' + (H ? '样本不足以做 5 分位切分（需要 ≥100 个评分-收益对）。' : '跑完历史回放后显示。') + '</div>';
+    return;
+  }
+  const pc = function (v, dp) { return v == null ? '—' : (v >= 0 ? '+' : '') + (v * 100).toFixed(dp == null ? 2 : dp) + '%'; };
+  const CDN = '1.05fr 1.15fr .6fr .95fr .7fr .7fr';
+  let html = '<div class="fttl" style="margin-bottom:7px">⑰ 分位数组合检验（按评分分位数切 5 档 · 前向 ' + q.h + ' 日）</div>';
+  html += '<div class="rg-tbl"><div class="rg-hd" style="grid-template-columns:' + CDN + '">' +
+    '<span>档位</span><span>评分区间</span><span>n</span><span>平均收益</span><span>胜率</span><span>t</span></div>';
+  const edges = [];
+  for (let b = 0; b < q.buckets.length; b++) {
+    const lo = b === 0 ? 2 : Math.round(q.cut[b - 1]);
+    const hi = b === q.buckets.length - 1 ? 98 : Math.round(q.cut[b]);
+    edges.push([lo, hi]);
+  }
+  q.buckets.forEach(function (bk, b) {
+    const rg = edges[b];
+    html += '<div class="rg-row" style="grid-template-columns:' + CDN + '">' +
+      '<span class="rg-nm">Q' + (b + 1) + (b === q.buckets.length - 1 ? '<i>最高分</i>' : b === 0 ? '<i>最低分</i>' : '') + '</span>' +
+      '<span class="rg-dim">' + rg[0] + ' ~ ' + rg[1] + '</span>' +
+      '<span class="rg-dim">' + bk.n + '</span>' +
+      '<span class="' + (bk.mean == null ? 'rg-dim' : bk.mean > q.base ? 'rg-g' : 'rg-r') + '">' + pc(bk.mean) + '</span>' +
+      '<span class="rg-dim">' + (bk.win == null ? '—' : (bk.win * 100).toFixed(0) + '%') + '</span>' +
+      '<span class="rg-dim">' + (bk.t == null ? '—' : bk.t.toFixed(2) + sigMark(bk.t)) + '</span></div>';
+  });
+  html += '</div>';
+
+  const monoP = q.pMono == null ? '—' : q.pMono.toFixed(4);
+  const rhoTxt = q.rho == null ? '—' : q.rho.toFixed(2);
+  html += '<div class="rg-sub"><b>单调性</b>：档位序号 vs 各档平均收益，Spearman ρ = <b>' + rhoTxt + '</b>' +
+    '（1 = 完全单调）。精确置换 p = <b>' + monoP + '</b>' +
+    ' —— 5 档只有 5!=120 种排列，<b>全部枚举</b>而非蒙特卡洛抽样，所以这是精确值不是近似值。' +
+    '基准（全样本 ' + q.h + ' 日收益）= ' + pc(q.base) + '，' +
+    '所以真正该看的不是「哪一档为正」，而是<b>哪一档跑赢了基准</b>。</div>';
+
+  /* 样本外保序 —— 这才是值钱的那一条 */
+  const qo = H.qOos;
+  if (qo) {
+    html += '<div class="rg-sub"><b>样本外保序性（更值钱的一条）</b>：切分点只用前 ' +
+      (Math.round(qo.nIn / (qo.nIn + qo.nOut) * 100)) + '% 样本定死，' +
+      '后段 ' + qo.nOut + ' 天不许参与决定切分点（否则就是偷看），然后看这五个数还是不是这个顺序。<br>' +
+      '样本外各档收益（含各档样本量）：' + qo.means.map(function (m, i) {
+        return 'Q' + (i + 1) + ' ' + pc(m, 2) + '<i>n=' + qo.ns[i] + '</i>';
+      }).join('　') +
+      '<br>样本外 Spearman ρ = <b>' + (qo.rho == null ? '—' : qo.rho.toFixed(2)) + '</b>，' +
+      '精确置换 p = <b>' + (qo.pMono == null ? '—' : qo.pMono.toFixed(4)) + '</b>，' +
+      '严格单调 = <b>' + (qo.monotonic ? '是' : '否') + '</b>，Q5−Q1 = <b>' + pc(qo.spread) + '</b> ' +
+      (qo.pMono != null && qo.pMono < 0.10
+        ? '<b style="color:var(--green)">—— 保序成立</b>：分档的<b>方向</b>在没见过的时间段上依然成立。'
+        : '<b style="color:var(--yellow)">—— 保序不成立</b>：样本内的漂亮台阶很可能是这段样本自己的形状。') +
+      (qo.icIn && qo.icOut
+        ? '<br><b>台阶塌掉只是表象，根本问题是信号本身：</b>把 IC 在前后两段各算一次 —— ' +
+          '前段 IC <b>' + (qo.icIn.ic == null ? '—' : qo.icIn.ic.toFixed(3)) + '</b>（t=' + (qo.icIn.t == null ? '—' : qo.icIn.t.toFixed(2)) + '，n=' + qo.icIn.n + '）' +
+          ' → 后段 IC <b>' + (qo.icOut.ic == null ? '—' : qo.icOut.ic.toFixed(3)) + '</b>（t=' + (qo.icOut.t == null ? '—' : qo.icOut.t.toFixed(2)) + '，n=' + qo.icOut.n + '）。' +
+          (Math.abs(qo.icOut.ic || 0) < 0.06
+            ? '后段的 IC 已经落进噪声区 —— <b>不是分档口径错了，是这段时间的信号本来就快没了</b>。' +
+              '这时候任何「换个分档方式就能修好」的尝试都是在拟合噪声。'
+            : 'IC 两段量级接近，说明台阶塌掉更可能是分档口径的偶然，而不是信号失效。') +
+          '<br><span class="rg-dim">另需留意：切分点由前段定死，若后段的评分分布整体变窄，' +
+          '两端档位会分到很少的样本（见上面的 n）—— 小样本档位的均值不可靠，这也是保序容易失败的一个机械原因，' +
+          '上面那条 IC 对比不受这个影响，因此更值得相信。</span>'
+        : '') +
+      '</div>';
+  }
+
+  const L = q.ls;
+  html += '<div class="rg-sub"><b>多空组合（Q5 做多 / Q1 做空 / 其余空仓）</b>：累计 ' + pc(L.total, 1) +
+    '，年化 ≈ ' + (L.cagr == null ? '—' : (L.cagr * 100).toFixed(1) + '%') +
+    '，夏普 ' + (L.sharpe == null ? '—' : L.sharpe.toFixed(2)) +
+    '，最大回撤 ' + pc(L.mdd, 1) + '。' +
+    '<br><span class="rg-dim">口径说明：h 日重叠收益按 1/h 摊到每一天，只为看净值形状与回撤；' +
+    '重叠会<b>低估波动、高估夏普</b>，所以这里的夏普只作形状参考，' +
+    '显著性一律以上表按非重叠窗口折算的 t 为准。' +
+    '另外：做空 BTC 在实务上并不容易（借券成本、强平风险），这个组合的可实现性要打折看。</span></div>';
+
+  html += '<div class="rg-sub"><b>为什么不用固定阈值（&gt;60 / &lt;40）</b>：本样本里最高档 ' +
+    q.buckets[q.buckets.length - 1].n + ' 天、最低档 ' + q.buckets[0].n + ' 天，' +
+    '是分位数切分保证的<b>每档样本量接近相等</b>；固定阈值会出现「低分档只有几十个样本」的情况，' +
+    '那几天的偶然走势就会把整档平均收益带跑。分档口径一变结论就变 —— 这种结论不结实。</div>';
+  box.innerHTML = html;
+}
+
+/* ---------------------------------------------------------------
+ * ⑱ 校准 · 渲染
+ * --------------------------------------------------------------- */
+function renderCalibBox() {
+  const box = $('calibBox'); if (!box) return;
+  const H = state.hist;
+  const c = H && H.calib ? H.calib : null;
+  if (!c) {
+    box.innerHTML = '<div class="fttl" style="margin-bottom:7px">⑱ 校准：一分到底值多少钱</div>' +
+      '<div class="rg-sub">' + (H ? '样本不足（需要 ≥100 个评分-收益对）。' : '跑完历史回放后显示。') + '</div>';
+    return;
+  }
+  const pc = function (v, dp) { return v == null ? '—' : (v >= 0 ? '+' : '') + (v * 100).toFixed(dp == null ? 2 : dp) + '%'; };
+  const cur = state.lastScore;
+  const mu = cur == null ? null : c.muAtScore(cur);
+  const se = cur == null ? null : c.seAtScore(cur);
+  const al = cur == null ? null : c.alphaAtScore(cur);
+
+  let html = '<div class="fttl" style="margin-bottom:7px">⑱ 校准：评分 → 期望收益（前向 ' + c.h + ' 日）</div>';
+  html += '<div class="rg-tbl"><div class="rg-hd" style="grid-template-columns:1fr .8fr .8fr .7fr .7fr">' +
+    '<span>每 10 分对应收益</span><span>斜率 t（重叠口径）</span><span>斜率 t（非重叠）</span><span>R²</span><span>样本</span></div>' +
+    '<div class="rg-row" style="grid-template-columns:1fr .8fr .8fr .7fr .7fr">' +
+    '<span class="' + (c.per10 > 0 ? 'rg-g' : 'rg-r') + '">' + pc(c.per10, 3) + '</span>' +
+    '<span class="rg-dim">' + (c.tB == null ? '—' : c.tB.toFixed(2)) + '</span>' +
+    '<span class="' + (c.tBEff != null && Math.abs(c.tBEff) > 2 ? 'rg-g' : 'rg-y') + '">' +
+    (c.tBEff == null ? '—' : c.tBEff.toFixed(2) + sigMark(c.tBEff)) + '</span>' +
+    '<span class="rg-y">' + (c.r2 == null ? '—' : (c.r2 * 100).toFixed(2) + '%') + '</span>' +
+    '<span class="rg-dim">' + c.n + '</span></div></div>';
+
+  html += '<div class="rg-sub"><b>两栏 t 值的差别就是这一版修掉的一个自欺</b>：' +
+    '3555 个 10 日窗口不等于 3555 个独立观测，按非重叠折算后有效样本只有 <b>' + c.nEff + '</b> 个，' +
+    't 从 <b>' + (c.tB == null ? '—' : c.tB.toFixed(1)) + '</b> 掉到 <b>' +
+    (c.tBEff == null ? '—' : c.tBEff.toFixed(2)) + '</b>。' +
+    '第一个数会让人以为「极其显著」，第二个才是真的。<br>' +
+    '<b>更要紧的是 R²</b>：评分能解释的收益变异只有 <b>' + (c.r2 == null ? '—' : (c.r2 * 100).toFixed(2) + '%') + '</b>，' +
+    '剩下 ' + (c.r2 == null ? '—' : (100 - c.r2 * 100).toFixed(1) + '%') + ' 是评分根本没看到的东西。' +
+    'IC 0.13 听起来「有信号」，换成 R² 就是 2% —— <b>这两个数字描述的是同一件事，' +
+    '但后者才决定仓位该多小</b>。</div>';
+
+  const CDN2 = '.8fr .9fr .9fr .9fr .6fr';
+  html += '<div class="rg-tbl" style="margin-top:6px"><div class="rg-hd" style="grid-template-columns:' + CDN2 + '">' +
+    '<span>评分段（分位）</span><span>模型预测</span><span>实际发生</span><span>校准误差</span><span>n</span></div>';
+  c.bins.forEach(function (bn, b) {
+    html += '<div class="rg-row" style="grid-template-columns:' + CDN2 + '">' +
+      '<span class="rg-dim">第 ' + (b + 1) + ' 段</span>' +
+      '<span class="rg-dim">' + pc(bn.pred, 3) + '</span>' +
+      '<span class="' + (bn.actual == null ? 'rg-dim' : bn.actual > 0 ? 'rg-g' : 'rg-r') + '">' + pc(bn.actual, 3) + '</span>' +
+      '<span class="rg-y">' + pc(bn.err, 3) + '</span>' +
+      '<span class="rg-dim">' + bn.n + '</span></div>';
+  });
+  html += '</div>';
+
+  const oos = c.oos;
+  html += '<div class="rg-sub"><b>校准斜率只能看样本外的那一个</b>：把「实际」回归到「预测」上，' +
+    '样本内这个值<b>按构造恒等于 1</b> —— 拟合值 ŷ 本来就是 y 在 x 张成的空间上的投影，' +
+    'Cov(y,ŷ)/Var(ŷ) ≡ 1。所以样本内报 1.00 <b>不代表标得准，它只是个恒等式</b>；' +
+    '初版把它当证据摆出来是错的，这里已改为只报样本外。<br>' +
+    '<b>样本外</b>（前 60% 拟合 / 后 ' + (oos ? oos.n : '—') + ' 天评估）：OOS R² = <b>' +
+    (oos && oos.r2 != null ? (oos.r2 * 100).toFixed(2) + '%' : '—') + '</b>' +
+    (oos && oos.r2 != null && c.r2 != null ?
+      '（样本内 ' + (c.r2 * 100).toFixed(2) + '% → 样本外 ' + (oos.r2 * 100).toFixed(2) + '%' +
+      (oos.r2 <= 0 ? '，<b style="color:var(--red)">掉到负值 —— 样本外的线性映射还不如「直接猜平均值」</b>。' : '。') : '.') +
+    ' OOS 校准斜率 = ' + (oos && oos.slopeOOS != null ? oos.slopeOOS.toFixed(3) : '—') +
+    '（≈0 意味着：<b>预测值在样本外几乎不携带关于实际收益的信息</b>）。' +
+    '<br><span class="rg-dim">这一条直接决定 ⑲ 的仓位能不能算 —— 见下面那块。</span></div>';
+
+  if (cur != null && mu != null) {
+    html += '<div class="rg-sub"><b>当前评分 ' + cur + '</b>：未来 ' + c.h + ' 日期望收益 <b>' + pc(mu, 3) + '</b>' +
+      '（90% 区间 [ ' + pc(mu - 1.645 * se, 3) + ' , ' + pc(mu + 1.645 * se, 3) + ' ]）。' +
+      '其中<b>超额部分</b>（去掉这段样本的无条件漂移 ' + pc(c.base, 3) + '）= <b>' + pc(al, 3) + '</b> —— ' +
+      '<b>只有这一项才是信号贡献的</b>，漂移那部分一直持有就能拿到，为它冒风险没有 alpha。' +
+      '<br><span class="rg-dim">口径注意：校准用的是<b>回放口径（22 维）</b>的评分，' +
+      '实时评分是 ' + (FACTORS.filter(function (f) { return !f.replayOnly; }).length) + ' 维，' +
+      '量纲接近但不完全可比 —— 这是已知近似，不是精确映射。</span></div>';
+  }
+  box.innerHTML = html;
+}
+
+/* ---------------------------------------------------------------
+ * ⑲ 风险化仓位 · 渲染
+ * --------------------------------------------------------------- */
+function renderSizeBox(res) {
+  const box = $('sizeBox'); if (!box) return;
+  const s = sizingAdvice(res);
+  const pc = function (v, dp) { return v == null ? '—' : (v >= 0 ? '+' : '') + (v * 100).toFixed(dp == null ? 1 : dp) + '%'; };
+  let html = '<div class="fttl" style="margin-bottom:7px">⑲ 风险化仓位建议（评分 → 期望收益 → 买多少）</div>';
+  if (!s.have) {
+    html += '<div class="rg-sub">' + (s.why || '数据不足。') + '</div>';
+    box.innerHTML = html;
+    return;
+  }
+  const CDN = '1fr 1.1fr .8fr .8fr';
+  html += '<div class="rg-tbl"><div class="rg-hd" style="grid-template-columns:' + CDN + '">' +
+    '<span>约束</span><span>含义</span><span>仓位</span><span>是否生效</span></div>';
+  const rows = [
+    { nm: '⓪ 样本外闸门', v: null, lbl: 'OOS R² &gt; 0 且 OOS 斜率 ≥ 0.5', bind: s.bindKey === 'oos', show: s.oosLinear ? '通过' : '否决' },
+    { nm: '① 成本门槛', v: s.costOk ? null : 0, lbl: '超额需 ≥ 往返 ' + (SIZE_ROUNDTRIP * 100).toFixed(1) + '%', bind: s.bindKey === 'cost', show: s.costOk ? '通过' : '否决' },
+    { nm: '② 波动率目标', v: s.volTarget, lbl: '目标年化 ' + (SIZE_TARGET_VOL * 100).toFixed(0) + '% ÷ 当前 ' + (s.sigma * 100).toFixed(0) + '%', bind: s.bindKey === 'volTarget', show: pc(s.volTarget) },
+    { nm: '③ Kelly 全额', v: s.kellyFull, lbl: '超额 μ/σ²（不建议你照这个下）', bind: false, show: pc(s.kellyFull) },
+    { nm: '③b 保守 Kelly', v: s.kellyCons, lbl: '超额 μ 取 1σ 下限', bind: false, show: pc(s.kellyCons) },
+    { nm: '④ 杠杆上限', v: SIZE_MAX_LEV, lbl: '硬上限', bind: s.bindKey === 'cap', show: pc(SIZE_MAX_LEV) },
+  ];
+  rows.forEach(function (r) {
+    html += '<div class="rg-row" style="grid-template-columns:' + CDN + '">' +
+      '<span class="rg-nm">' + r.nm + '</span>' +
+      '<span class="rg-dim">' + r.lbl + '</span>' +
+      '<span class="rg-dim">' + r.show + '</span>' +
+      '<span class="' + (r.bind ? 'rg-y' : 'rg-dim') + '">' + (r.bind ? '★ 起作用' : '') + '</span></div>';
+  });
+  html += '</div>';
+
+  const sug = s.suggest;
+  const col = sug <= 0 ? 'rg-dim' : sug < 0.15 ? 'rg-y' : 'rg-g';
+  html += '<div class="rg-sub">当前评分 <b>' + s.score + '</b> · ' +
+    'BTC 20 日年化波动率 <b>' + (s.sigma * 100).toFixed(0) + '%</b> · ' +
+    '未来 ' + s.h + ' 日<b>超额</b>期望 <b>' + pc(s.alphaH, 3) + '</b>（90% 区间 ' + pc(s.alphaLo, 3) + ' ~ ' + pc(s.alphaHi, 3) + '）。' +
+    '<br><b>建议仓位（占净值）</b>：<span class="' + col + '" style="font-size:15px"><b>' +
+    (sug <= 0 ? '0% —— 别照这个下注' : (sug * 100).toFixed(1) + '%') + '</b></span>' +
+    '，起作用的约束是 <b>' + s.bindLbl + '</b>。</div>';
+
+  if (s.bindKey === 'oos') {
+    html += '<div class="rg-sub" style="border-left:2px solid var(--red);padding-left:8px">' +
+      '<b style="color:var(--red)">为什么建议 0：不是信号没用，是「量级」没用。</b><br>' +
+      '样本外 R² = ' + (s.oosR2 == null ? '—' : (s.oosR2 * 100).toFixed(2) + '%') +
+      '、OOS 校准斜率 = ' + (s.oosSlope == null ? '—' : s.oosSlope.toFixed(3)) +
+      ' —— 样本内拟合出来的「评分 → 期望收益」这条直线，' +
+      '搬到没见过的时间段上<b>连猜平均值都不如</b>。' +
+      'Kelly 的输入是 μ，μ 不可信时 Kelly 的输出就是垃圾 —— 这一步比后面所有公式都重要。<br>' +
+      (s.oosOrder
+        ? '<b style="color:var(--green)">但 ⑰ 的样本外<b>保序性</b>是成立的</b>：' +
+          '分档的<b>方向</b>（高分档 vs 低分档谁更好）在样本外站得住，' +
+          '只有<b>幅度</b>站不住。所以诚实的用法是：<b>可以拿它判断方向，不要拿它算仓位。</b>'
+        : '⑰ 的样本外保序性同样不成立 —— 那就连方向也别依赖它。') +
+      '</div>';
+  }
+
+  html += '<div class="rg-sub"><b>为什么超额 μ 而不是总 μ</b>：这段样本 10 日平均收益是 ' +
+    pc(s.muH == null ? null : s.muH - s.alphaH, 3) + '（牛市漂移），一直持有就能拿到。' +
+    '如果把这个数喂进 Kelly，算出来的是「牛市里满仓加杠杆」—— 结论恒为杠杆，' +
+    '与信号强弱无关，这是毫无信息量的答案。所以仓位只对<b>超额部分</b>下注。<br>' +
+    '<b>为什么是四分之一 Kelly</b>：f=μ/σ² 对 μ 的估计误差极其敏感，μ 高估一倍仓位就翻倍，' +
+    '而这里的 μ 是从 R² ≈ ' + (s.r2 == null ? '—' : (s.r2 * 100).toFixed(1) + '%') + ' 的回归里估出来的。' +
+    '实务上普遍取 1/4 ~ 1/2，就是给估计误差留余量。' +
+    (s.ciIncludes0 ? ' <b style="color:var(--red)">本例超额收益的 90% 区间跨 0 —— 严格说此刻连方向都没定下来。</b>' : '') +
+    '<br><b>三条局限</b>：① Kelly 假设收益 iid 且正态，BTC 两条都不满足（肥尾、体制切换）；' +
+    '② 用的是已实现波动率，而波动率本身会突变（见体制徽标与 ⑮）；' +
+    '③ 只给单资产 BTC 的仓位，没有组合层面的相关性折让。</div>';
+  box.innerHTML = html;
+}
+
+/* ---------------------------------------------------------------
+ * ⑳ 有效维度与分块因子 · 渲染
+ * --------------------------------------------------------------- */
+function renderDimBox() {
+  const box = $('dimBox'); if (!box) return;
+  const H = state.hist;
+  const D = H && H.dim ? H.dim : null;
+  if (!D) {
+    box.innerHTML = '<div class="fttl" style="margin-bottom:7px">⑳ 有效维度与分块因子模型</div>' +
+      '<div class="rg-sub">' + (H ? '因子 z 序列不足以构造相关矩阵。' : '跑完历史回放后显示。') + '</div>';
+    return;
+  }
+  const E = D.eff;
+  const f2 = function (v) { return v == null ? '—' : v.toFixed(2); };
+  let html = '<div class="fttl" style="margin-bottom:7px">⑳ 有效维度与分块因子模型（' + D.p + ' 个因子）</div>';
+  html += '<div class="rg-tbl"><div class="rg-hd" style="grid-template-columns:1fr 1fr 1fr 1fr">' +
+    '<span>参与率 PR</span><span>熵有效维度</span><span>PC1 占比</span><span>解释 90% 需</span></div>' +
+    '<div class="rg-row" style="grid-template-columns:1fr 1fr 1fr 1fr">' +
+    '<span class="rg-y">' + f2(E.pr) + '</span>' +
+    '<span class="rg-y">' + f2(E.entDim) + '</span>' +
+    '<span class="rg-dim">' + (E.top1 * 100).toFixed(1) + '%</span>' +
+    '<span class="rg-dim">' + E.nFor90 + ' / ' + E.p + '</span></div></div>';
+
+  html += '<div class="rg-sub"><b>这一行是整套因子模型的前提检查</b>：' + D.p + ' 个因子里，' +
+    '按相关矩阵的谱来算，真正独立的方向只有 <b>' + f2(E.pr) + '</b> 个（参与率 PR = (Σλ)²/Σλ²）' +
+    '，熵有效维度 ' + f2(E.entDim) + '，解释 90% 的方差要 <b>' + E.nFor90 + '</b> 个方向。<br>' +
+    (E.pr < D.p * 0.5
+      ? '也就是说，多出来的那 ' + (D.p - Math.round(E.pr)) + ' 个因子大部分在<b>重复同一句话</b>。' +
+        '这直接解释了 v3.20 的一个结果：<b>为什么换成岭回归动态权重并没有变好</b> —— ' +
+        '如果信息本来就集中在少数几个方向上，换更精细的组合方法不会凭空产生 alpha。' +
+        '想改善模型，方向是<b>找新的独立维度</b>，不是在现有维度里重新配权。'
+      : '有效维度接近因子总数，说明这批因子<b>没有严重冗余</b> —— 这比「分块能不能提分」更值得高兴，' +
+        '因为它是可以继续加因子的前提。') + '</div>';
+
+  html += '<div class="rg-sub"><b>分块</b>（平均连接层次聚类 · Mantegna 距离 · ' + D.k + ' 块' +
+    (D.clearGap ? '' : '，<b>树状图无明确断层 → 这是默认值不是数据给的</b>') + '）：' +
+    D.blocks.map(function (b, i) {
+      return '<span class="rg-dim">块' + (i + 1) + '：' + b.map(function (id) {
+        const f = FACTORS.find(function (x) { return x.id === id; });
+        return f ? f.name.replace(/^[^ ]+ /, '') : id;
+      }).join('·') + '</span>';
+    }).join('　') + '</div>' +
+    (D.clearGap
+      ? '<div class="rg-sub">树状图在合并高度 <b>' + (D.maxJump == null ? '—' : D.maxJump.toFixed(3)) + '</b> 处' +
+        '有一次占跨度 ' + (D.span ? (D.maxJump / D.span * 100).toFixed(0) : '—') + '% 的明确跳跃 —— ' +
+        '这个块数是<b>数据给出的</b>。</div>'
+      : '<div class="rg-sub">树状图的最大单次跳跃只有 <b>' + (D.maxJump == null ? '—' : D.maxJump.toFixed(3)) + '</b>，' +
+        '占整个高度跨度（' + (D.span == null ? '—' : D.span.toFixed(3)) + '）的 ' +
+        (D.span ? (D.maxJump / D.span * 100).toFixed(0) : '—') + '% —— ' +
+        '<b>远不到「断层」的程度</b>。这本身就是结论：这批因子构成的是<b>连续谱，不是几个离散的块</b>。' +
+        '所以这里的 ' + D.k + ' 块是<b>事前定死的默认值（' + CLUSTER_DEFAULT_K + '）</b>，不是数据挑出来的；' +
+        '下面的分块对比只能当结构诊断看，不能当「发现了几个因子簇」。</div>');
+
+  const io = D.icOrig, ib = D.icBlock;
+  const dIC = (io && ib && io.ic != null && ib.ic != null) ? ib.ic - io.ic : null;
+  html += '<div class="rg-sub"><b>分块等权 vs 原 ' + D.p + ' 维手写权重</b>：IC ' +
+    '<b>' + (ib ? ib.ic.toFixed(3) : '—') + '</b> vs <b>' + (io ? io.ic.toFixed(3) : '—') + '</b>' +
+    '（差 ' + (dIC == null ? '—' : (dIC >= 0 ? '+' : '') + dIC.toFixed(3)) + '），' +
+    '块间平均 |ρ| = ' + (D.blockAvgAbsCorr == null ? '—' : D.blockAvgAbsCorr.toFixed(3)) + '。' +
+    (dIC != null && Math.abs(dIC) < 0.01
+      ? ' <b>差别在 ±0.01 以内 —— 分块没有带来增益，也没有损失</b>。' +
+        '这说明真正决定结果的是那几个独立方向本身，而不是「怎么把它们加起来」。'
+      : dIC != null && dIC > 0 ? ' 分块略优：先把块内噪声平均掉，确实有一点好处 —— 但差距不大，不足以当作改进。'
+        : dIC != null ? ' 分块略差：块内等权丢掉了手写权重里的先验判断。' : '') +
+    '<br><span class="rg-dim">注意这是<b>同样本</b>比较，且分块的簇数由数据自己决定 —— ' +
+    '要当作结论还需要样本外验证，这里只作结构诊断。</span></div>';
+
+  const uq = D.uniq.slice().sort(function (a, b) { return b.uniq - a.uniq; });
+  html += '<div class="rg-sub"><b>顺序正交化后的独有信息量</b>（按当前 |权重×贡献| 从大到小依次正交化，' +
+    '数值 = 该因子里前序因子没说过的部分）：<br>' +
+    uq.slice(0, 6).map(function (u) {
+      return '<span class="rg-dim">' + u.name.replace(/^[^ ]+ /, '') + ' ' + (u.uniq * 100).toFixed(0) + '%</span>';
+    }).join('　') + '<br>' +
+    '<span class="rg-dim">几乎全被前面说完了的：</span>' +
+    uq.slice(-4).map(function (u) {
+      return '<span class="rg-dim">' + u.name.replace(/^[^ ]+ /, '') + ' ' + (u.uniq * 100).toFixed(0) + '%</span>';
+    }).join('　') +
+    '<br><span class="rg-dim">读法：接近 0% 的因子在这个排序下没有增量信息 —— 不是它没用，' +
+    '是<b>它说的已经被排在前面的因子说过了</b>。这比「逐个删掉看分数摆动」（jackknife）更严谨：' +
+    'jackknife 只看删除效应，正交化直接衡量冗余。</span></div>';
+  box.innerHTML = html;
 }

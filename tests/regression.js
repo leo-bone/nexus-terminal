@@ -1372,6 +1372,291 @@ const near = (label, actual, expect, tol) => {
     call('netAnalyzed', true);
   }
 
+
+  /* =================================================================
+   * O. v3.21 · 分位数组合 / 校准 / 风险化仓位 / 有效维度
+   *
+   * 这一段与 N 段同源：验的是**数学与口径**，不是「功能没崩」。
+   * 四组独立交叉验证：
+   *   ① olsFit / effectiveDim / permute5 对着**解析解**验
+   *   ② 单调性用 5!=120 全枚举，对「完美递增 / 完美递减 / 随机」三种输入
+   *      分别给出 1/120、1、中间值 —— 端点值可以手算，所以能当基准
+   *   ③ 校准的三件真事：斜率能恢复、非重叠 t 必然比重叠 t 小、
+   *      过度自信的模型校准斜率必须 < 1
+   *   ④ 仓位：五道闸门各自能单独把仓位打到 0，且「起作用的是哪个」不能错
+   * ================================================================= */
+  console.log('\n===== O. v3.21 · 校准 / 分位数 / 仓位 / 有效维度 =====');
+  {
+    /* 确定性随机源（本段所有合成数据都用它，保证可复现） */
+    let seed = 20261003;
+    const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+    const rndN = () => { let u = 0, v = 0; while (u === 0) u = rnd(); while (v === 0) v = rnd(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+
+    /* ---------- ① olsFit 对着解析解验 ---------- */
+    const xs = [], ys = [];
+    for (let i = 0; i < 200; i++) { const x = i * 0.37 - 20; xs.push(x); ys.push(3 + 2 * x); }
+    const fitExact = call('olsFit', xs, ys);
+    near('olsFit 斜率恢复（无噪声 y=3+2x）', fitExact.b, 2, 1e-9);
+    near('olsFit 截距恢复', fitExact.a, 3, 1e-8);
+    near('olsFit 无噪声时 R²=1', fitExact.r2, 1, 1e-12);
+    chk('  无噪声时残差标准差为 0', fitExact.sdResid < 1e-9, 'true');
+    /* 均值响应标准误：中心处最窄、离中心越远越宽 —— 这是「极值评分不可信」的数学根据 */
+    /* 注意：无噪声时 s2=0，标准误处处为 0 —— 必须换一个有噪声的拟合才能验「越远越宽」 */
+    const xs2 = [], ys2 = [];
+    for (let i = 0; i < 200; i++) { const x = i * 0.37 - 20; xs2.push(x); ys2.push(3 + 2 * x + rndN() * 3); }
+    const fitNoisy = call('olsFit', xs2, ys2);
+    chk('  有噪声时斜率仍能恢复（±0.15）', Math.abs(fitNoisy.b - 2) < 0.15, 'true');
+    const seMid = fitNoisy.seAt(fitNoisy.mx), seFar = fitNoisy.seAt(fitNoisy.mx + 30);
+    chk('  均值响应标准误随偏离中心而变宽', seFar > seMid, 'true');
+    near('  中心处标准误 = sdResid/√n', seMid, fitNoisy.sdResid / Math.sqrt(fitNoisy.n), 1e-12);
+    near('  muAt 与解析一致', fitExact.muAt(10), 23, 1e-8);
+    /* minN 门槛：分段校准只有 5 个点，默认 n≥10 会把它整个拒掉 */
+    const five = [1, 2, 3, 4, 5], fiveY = [2, 4, 6, 8, 10];
+    chk('  olsFit 默认拒绝 5 个点（n<10）', call('olsFit', five, fiveY) === null, 'true');
+    const fit5 = call('olsFit', five, fiveY, 3);
+    near('  minN=3 时 5 个点能算且斜率正确', fit5.b, 2, 1e-9);
+
+    /* ---------- ② 置换检验的端点值可手算 ---------- */
+    chk('permute5 恰好 120 种排列', call('permute5').length, 120);
+    chk('  120 种排列互不重复', new Set(call('permute5').map(p => p.join(''))).size, 120);
+    const mpUp = call('monoPermP', [1, 2, 3, 4, 5]);
+    near('完美递增 ρ=1', mpUp.rho, 1, 1e-9);
+    near('  完美递增 p=1/120（只有一种排列不差于它）', mpUp.p, 1 / 120, 1e-9);
+    const mpDn = call('monoPermP', [5, 4, 3, 2, 1]);
+    near('完美递减 ρ=-1', mpDn.rho, -1, 1e-9);
+    near('  完美递减 p=1（所有排列都不差于它）', mpDn.p, 1, 1e-9);
+    const mpMid = call('monoPermP', [1, 3, 2, 4, 5]);
+    chk('  轻微打乱的 p 落在两端之间', mpMid.p > 1 / 120 && mpMid.p < 1, 'true');
+    chk('  含 null 时返回 null', call('monoPermP', [1, null, 3, 4, 5]) === null, 'true');
+
+    /* ---------- 合成 rep：评分与未来 10 日收益强正相关 ---------- */
+    const mkRep = function (n, start, corrSign, noise) {
+      const closes = new Array(n).fill(null);
+      const zs = new Array(n).fill(null);
+      for (let i = 0; i < n; i++) { zs[i] = rndN(); }
+      let p = 60000;
+      for (let i = 0; i < n; i++) { closes[i] = p; p = p * (1 + 0.0008 + 0.02 * rndN()); }
+      /* 评分由「未来 10 日收益」反推 —— 这样相关方向一定是我们指定的方向 */
+      const fwd = new Array(n).fill(null);
+      for (let i = 0; i < n - 10; i++) fwd[i] = closes[i + 10] / closes[i] - 1;
+      const scores = new Array(n).fill(null);
+      for (let i = start; i < n - 10; i++) {
+        scores[i] = Math.max(2, Math.min(98, 50 + corrSign * 600 * fwd[i] + (noise || 0) * rndN()));
+      }
+      /* 因子 z：造两块，块内高度相关、块间独立 —— 用来验聚类与有效维度 */
+      const ids = ['dxy', 'us10y', 'spx', 'vix', 'gold', 'oil', 'fng', 'hr'];
+      const fzs = {}, fvals = {};
+      const b1 = [], b2 = [];
+      for (let i = 0; i < n; i++) { b1.push(rndN()); b2.push(rndN()); }
+      ids.forEach(function (id, k) {
+        const arr = new Array(n).fill(null);
+        const src = k < 4 ? b1 : b2;
+        for (let i = start; i < n; i++) arr[i] = src[i] * 0.95 + rndN() * 0.3;
+        fzs[id] = arr;
+        const fav = new Array(n).fill(null);
+        for (let i = start; i < n; i++) fav[i] = Math.max(-2.5, Math.min(2.5, arr[i]));
+        fvals[id] = fav;
+      });
+      return { n: n, start: start, closes: closes, scores: scores, fzs: fzs, fvals: fvals, calTs: [], nAct: [] };
+    };
+
+    const rep = mkRep(700, 20, 1, 0);
+    const q = call('quintileTest', rep, 10);
+    chk('quintileTest 产出结果', !!q, 'true');
+    chk('  5 档齐全', q.buckets.length, 5);
+    chk('  每档都有样本', q.buckets.every(b => b.n > 0), 'true');
+    chk('  强正相关下分档均值严格单调', q.monotonic, 'true');
+    near('  强正相关下 ρ=1', q.rho, 1, 1e-9);
+    near('  p=1/120', q.pMono, 1 / 120, 1e-9);
+    chk('  Q5 收益 > Q1', q.buckets[4].mean > q.buckets[0].mean, 'true');
+    chk('  多空价差为正', q.spread > 0, 'true');
+    chk('  t 用非重叠口径（Q5 的 neff 远小于 n）', q.buckets[4].neff < q.buckets[4].n, 'true');
+    chk('  多空组合有净值与回撤', isFinite(q.ls.total) && q.ls.mdd >= 0, 'true');
+    chk('样本不足（<100 对）返回 null', call('quintileTest', mkRep(60, 5, 1, 0), 10) === null, 'true');
+
+    /* 反相关：分档必须反向单调 —— 否则说明符号处理反了 */
+    const qn = call('quintileTest', mkRep(700, 20, -1, 0), 10);
+    chk('反相关下 Q1 收益 > Q5', qn.buckets[0].mean > qn.buckets[4].mean, 'true');
+    chk('  反相关下不报「严格递增」', qn.monotonic === false, 'true');
+
+    /* ---------- 样本外保序：稳定关系 vs 反转关系 ---------- */
+    const qoStable = call('quintileOOS', mkRep(900, 20, 1, 0), 10);
+    chk('quintileOOS 产出结果', !!qoStable, 'true');
+    chk('  稳定关系下样本外保序成立', qoStable.monotonic && qoStable.rho > 0.5, 'true');
+    chk('  切分点只由前段决定（前段样本量 > 0）', qoStable.nIn > 0 && qoStable.nOut > 0, 'true');
+    chk('  各档样本量合计 = 后段总量', qoStable.ns.reduce((a, b) => a + b, 0), qoStable.nOut);
+    chk('  后段 IC 为正（信号没衰减）', qoStable.icOut.ic > 0, 'true');
+    chk('样本太短时返回 null', call('quintileOOS', mkRep(120, 5, 1, 0), 10) === null, 'true');
+
+    /* ---------- ③ 校准 ---------- */
+    const cal = call('calibFit', rep, 10);
+    chk('calibFit 产出结果', !!cal, 'true');
+    chk('  斜率方向正确（评分越高收益越高）', cal.b > 0, 'true');
+    chk('  R² 落在 (0,1]', cal.r2 > 0 && cal.r2 <= 1, 'true');
+    chk('  非重叠 t 必然比重叠 t 保守', Math.abs(cal.tBEff) < Math.abs(cal.tB), 'true');
+    near('  tBEff ≈ tB/√h（h=10）', Math.abs(cal.tBEff), Math.abs(cal.tB) / Math.sqrt(10), Math.abs(cal.tB) * 0.05);
+    chk('  nEff = n/h 量级', cal.nEff === Math.floor(cal.n / 10), 'true');
+    near('alphaAtScore(样本均值) = 0（漂移被剔除）', cal.alphaAtScore(cal.mxScore), 0, 1e-12);
+    near('  seAlphaAtScore(样本均值) = 0', cal.seAlphaAtScore(cal.mxScore), 0, 1e-12);
+    chk('  偏离越远，超额的标准误越大', cal.seAlphaAtScore(cal.mxScore + 25) > cal.seAlphaAtScore(cal.mxScore + 5), 'true');
+    chk('  muAt - alpha = 样本基准漂移', Math.abs((cal.muAtScore(70) - cal.alphaAtScore(70)) - cal.base) < 1e-9
+      || Math.abs(cal.muAtScore(70) - cal.alphaAtScore(70) - (cal.a + cal.b * cal.mxScore)) < 1e-9, 'true');
+    chk('  分段校准 5 段齐全', cal.bins.length === 5 && cal.bins.every(b => b.n > 0), 'true');
+    chk('  校准斜率算得出来（minN 已放开）', cal.calibSlope != null, 'true');
+    chk('样本外块存在', !!cal.oos && cal.oos.n > 0, 'true');
+
+    /* 样本内的校准斜率按构造恒为 1（ŷ 是 y 的投影 ⇒ Cov(y,ŷ)/Var(ŷ) ≡ 1），
+     * 所以它不能用来判断「标得准不准」—— 这里直接断言它的数值，
+     * 是为了把这个恒等式钉死：以后谁把它当证据，测试会立刻响。 */
+    near('样本内校准斜率恒为 1（恒等式，不含信息）', cal.calibSlope, 1, 0.05);
+    chk('  样本外校准斜率才是可判读的那个', typeof cal.oos.slopeOOS, 'number');
+
+    /* 真正有意义的检验：让信号只存在于前 60%、后 40% 变成纯噪声。
+     * 那么样本内（全样本拟合）R² 仍为正，而样本外必须塌掉。 */
+    const repDecay = mkRep(900, 20, 1, 0);
+    const cutD = repDecay.start + Math.floor((repDecay.n - repDecay.start) * 0.6);
+    for (let i = cutD; i < repDecay.n; i++) {
+      repDecay.scores[i] = Math.max(2, Math.min(98, 50 + 25 * rndN()));
+    }
+    const calDecay = call('calibFit', repDecay, 10);
+    chk('信号在后段消失 → 样本内 R² 仍为正（同一样本会骗人）', calDecay.r2 > 0.02, 'true');
+    chk('  但样本外 R² ≤ 0（映射搬不出样本）', calDecay.oos.r2 <= 0.02, 'true');
+    chk('  样本外校准斜率 ≈ 0（预测几乎不携带信息）', Math.abs(calDecay.oos.slopeOOS) < 0.35, 'true');
+    chk('  两栏 t：非重叠必然更保守', Math.abs(calDecay.tBEff) < Math.abs(calDecay.tB), 'true');
+
+    /* ---------- ④ effectiveDim 的解析解 ---------- */
+    /* effectiveDim 收的是**特征值数组**，不是矩阵 —— 传矩阵会静默返回 null */
+    const eI = call('effectiveDim', [1, 1, 1, 1, 1, 1]);
+    near('单位矩阵 PR = 维数', eI.pr, 6, 1e-9);
+    near('  单位矩阵熵有效维度 = 维数', eI.entDim, 6, 1e-9);
+    near('  PC1 占比 = 1/p', eI.top1, 1 / 6, 1e-9);
+    chk('  需要全部 6 个才能解释 90%', eI.nFor90, 6);
+    const eO = call('effectiveDim', [6, 0, 0, 0, 0, 0]);
+    near('完全共线（全 1）PR = 1', eO.pr, 1, 1e-6);
+    near('  完全共线熵有效维度 = 1', eO.entDim, 1, 1e-6);
+    chk('  完全共线时一个方向就够了', eO.nFor90, 1);
+    chk('  空输入返回 null', call('effectiveDim', []) === null, 'true');
+
+    /* ---------- facZCorr / avgLinkCluster / seqUnique ---------- */
+    const FZ = call('facZCorr', rep);
+    chk('facZCorr 产出结果', !!FZ, 'true');
+    chk('  对角为 1', FZ.R.every((r, i) => Math.abs(r[i] - 1) < 1e-12), 'true');
+    chk('  对称', FZ.R.every((r, i) => r.every((v, j) => Math.abs(v - FZ.R[j][i]) < 1e-12)), 'true');
+    chk('  元素都在 [-1,1]', FZ.R.every(r => r.every(v => v >= -1.0001 && v <= 1.0001)), 'true');
+    /* 注意：FZ.ids 的顺序是 REPLAY_IDS 的顺序，不是 mkRep 里 ids 的顺序 ——
+     * 必须按名字找下标，不能按位置猜（这里踩过一次）。 */
+    const ix = id => FZ.ids.indexOf(id);
+    chk('  块内相关 > 0.5（同块：dxy-us10y）', FZ.R[ix('dxy')][ix('us10y')] > 0.5, 'true');
+    chk('  块内相关 > 0.5（同块：fng-hr）', FZ.R[ix('fng')][ix('hr')] > 0.5, 'true');
+    chk('  块间相关 ≈ 0（跨块：dxy-gold）', Math.abs(FZ.R[ix('dxy')][ix('gold')]) < 0.35, 'true');
+    const CL = call('avgLinkCluster', FZ.R, FZ.p);
+    chk('avgLinkCluster 分出 2 块（合成数据就是两块）', CL.k, 2);
+    chk('  每个因子都归属了某一块', CL.cluster.every(c => c >= 0), 'true');
+    chk('  两块各 4 个成员', CL.cluster.filter(c => c === CL.cluster[ix('dxy')]).length, 4);
+    /* 同块必须真的落在同一簇：这条比「簇数=2」更能证明聚类是对的 */
+    chk('  dxy 与 us10y 同簇', CL.cluster[ix('dxy')] === CL.cluster[ix('us10y')], 'true');
+    chk('  fng 与 hr 同簇', CL.cluster[ix('fng')] === CL.cluster[ix('hr')], 'true');
+    chk('  dxy 与 gold 不同簇', CL.cluster[ix('dxy')] !== CL.cluster[ix('gold')], 'true');
+
+    /* seqUnique：完全共线的第二个因子，独有信息量应 ≈ 0 */
+    const rr = [[1, 1, 0], [1, 1, 0], [0, 0, 1]];
+    const sq = call('seqUnique', rr, [0, 1, 2]);
+    near('第一个因子独有 100%', sq[0].uniq, 1, 1e-12);
+    chk('  完全重复的第二个因子独有 ≈ 0%', sq[1].uniq < 0.02, 'true');
+    chk('  独立的第三个因子独有 ≈ 100%', sq[2].uniq > 0.95, 'true');
+
+    /* ---------- dimAnalyze ---------- */
+    const D = call('dimAnalyze', rep);
+    chk('dimAnalyze 产出结果', !!D, 'true');
+    chk('  分块覆盖全部因子（无遗漏无重复）',
+      D.blocks.reduce((a, b) => a + b.length, 0), D.p);
+    chk('  有效维度在 [1, p]', D.eff.pr >= 1 && D.eff.pr <= D.p + 1e-9, 'true');
+    chk('  原模型 IC 算得出来', D.icOrig != null && isFinite(D.icOrig.ic), 'true');
+    chk('  分块模型 IC 算得出来', D.icBlock != null && isFinite(D.icBlock.ic), 'true');
+    chk('  块间平均 |ρ| 在 [0,1]', D.blockAvgAbsCorr >= 0 && D.blockAvgAbsCorr <= 1, 'true');
+    chk('  独有信息量条目数 = 因子数', D.uniq.length, D.p);
+    chk('  首个（最倚重的）因子独有 = 100%', Math.abs(D.uniq.find(u => u.rank === 0).uniq - 1) < 1e-9, 'true');
+    chk('  独有信息量都在 [0,1]', D.uniq.every(u => u.uniq >= 0 && u.uniq <= 1), 'true');
+
+    /* ---------- ⑤ 仓位：五道闸门 ---------- */
+    /* 先把波动率固定下来：造一条日波动 sd≈2.6% 的日线 → 年化 ≈ 50% */
+    state.klines['BTC1d'] = (function () {
+      const out = []; let p = 60000;
+      for (let i = 0; i < 60; i++) { const o = p; p = p * (1 + 0.026 * rndN()); out.push({ t: Date.now() + i * 86400000, o, h: Math.max(o, p), l: Math.min(o, p), c: p, v: 1 }); }
+      return out;
+    })();
+    const rg = call('currentRegime');
+    chk('currentRegime 算出体制（仓位需要波动率）', !!rg && rg.vol > 0, 'true');
+
+    chk('无校准时不下结论', call('sizingAdvice', { score: 70, out: {} }).have, 'false');
+    chk('  并说明为什么', typeof call('sizingAdvice', { score: 70, out: {} }).why, 'string');
+
+    /* 造一个「样本外成立」的假校准，用来验闸门逻辑本身 */
+    const mkCal = function (over) {
+      const base = { h: 10, mxScore: 50, base: 0.01, r2: 0.02, nEff: 300, infl: 2,
+        muAtScore: s => 0.01 + 0.002 * (s - 50),
+        seAtScore: s => 0.001 + Math.abs(s - 50) * 0.0002,
+        alphaAtScore: s => 0.002 * (s - 50),
+        seAlphaAtScore: s => Math.abs(s - 50) * 0.0002,
+        oos: { r2: 0.02, slopeOOS: 1.0, n: 500 } };
+      return Object.assign({}, base, over || {});
+    };
+    state.hist = { calib: mkCal() };
+    const s70 = call('sizingAdvice', { score: 70, out: {} });
+    chk('有校准时给出结果', s70.have, 'true');
+    chk('  样本外闸门通过时仓位 > 0', s70.suggest > 0, 'true');
+    chk('  仓位不超过杠杆上限', s70.suggest <= 1.0 + 1e-12, 'true');
+    chk('  超额在均值处为 0 → Kelly 为 0', Math.abs(call('sizingAdvice', { score: 50, out: {} }).kellyFull) < 1e-12, 'true');
+    chk('  Kelly 随评分单调上升', call('sizingAdvice', { score: 90, out: {} }).kellyFull > s70.kellyFull, 'true');
+    chk('  保守 Kelly ≤ 全额 Kelly', s70.kellyCons <= s70.kellyFull + 1e-12, 'true');
+    chk('  波动率目标 = 0.15/σ', Math.abs(s70.volTarget - 0.15 / s70.sigma) < 1e-12, 'true');
+    chk('  起作用的约束在候选清单里', s70.bindKey === 'oos' || s70.cand.some(c => c.k === s70.bindKey), 'true');
+
+    /* 闸门逐一隔离：每一道都必须能单独把仓位打到 0 */
+    state.hist = { calib: mkCal({ oos: { r2: -0.05, slopeOOS: 0.02, n: 500 } }) };
+    const sOOS = call('sizingAdvice', { score: 80, out: {} });
+    chk('样本外不成立 → 建议 0', sOOS.suggest, 0);
+    chk('  且报出是样本外闸门在起作用', sOOS.bindKey, 'oos');
+    chk('  但数字仍然全部列出（不藏起来）', isFinite(sOOS.kellyFull) && isFinite(sOOS.volTarget), 'true');
+    chk('  并记录了 OOS R² 与斜率', sOOS.oosR2 === -0.05 && sOOS.oosSlope === 0.02, 'true');
+
+    state.hist = { calib: mkCal({ alphaAtScore: () => 0.0005, oos: { r2: 0.02, slopeOOS: 1.0, n: 500 } }) };
+    const sCost = call('sizingAdvice', { score: 60, out: {} });
+    chk('超额覆盖不了往返成本 → 建议 0', sCost.suggest, 0);
+    chk('  且报出是成本门槛在起作用', sCost.bindKey, 'cost');
+
+    state.hist = { calib: mkCal() };
+    const sCap = call('sizingAdvice', { score: 98, out: {} });
+    chk('极端评分下也不超过杠杆上限', sCap.suggest <= 1.0 + 1e-12, 'true');
+    chk('  区间跨 0 时会被标记出来', typeof sCap.ciIncludes0, 'boolean');
+
+    /* ---------- 渲染冒烟 ---------- */
+    state.hist = { rep: rep, quint: q, qOos: qoStable, calib: cal, dim: D };
+    state.lastScore = 65; state.lastScoreOut = {};
+    let threwO = null;
+    try { call('renderQuintBox'); call('renderCalibBox'); call('renderDimBox'); call('renderSizeBox', { score: 65, out: {} }); }
+    catch (e) { threwO = (e && e.message) || String(e); }
+    chk('v3.21 四个渲染函数不抛错', threwO, 'null');
+    chk('分位数组合面板有内容', ($id('quintBox').innerHTML || '').length > 400, 'true');
+    chk('  写着精确置换口径', ($id('quintBox').innerHTML || '').indexOf('120') >= 0, 'true');
+    chk('  写着样本外保序', ($id('quintBox').innerHTML || '').indexOf('样本外') >= 0, 'true');
+    chk('校准面板有内容', ($id('calibBox').innerHTML || '').length > 400, 'true');
+    chk('  写着 R²', ($id('calibBox').innerHTML || '').indexOf('R²') >= 0, 'true');
+    chk('  两栏 t 值都在（重叠 vs 非重叠）', ($id('calibBox').innerHTML || '').indexOf('非重叠') >= 0, 'true');
+    chk('有效维度面板有内容', ($id('dimBox').innerHTML || '').indexOf('参与率') >= 0, 'true');
+    chk('仓位面板有内容', ($id('sizeBox').innerHTML || '').length > 300, 'true');
+    chk('  写着哪个约束在起作用', ($id('sizeBox').innerHTML || '').indexOf('起作用') >= 0, 'true');
+    /* 空态：没跑过回放（state.hist === null）时不能崩，要有说明 */
+    state.hist = null;
+    call('renderQuintBox'); call('renderCalibBox'); call('renderDimBox');
+    chk('无回放时三块给出提示而不是空白',
+      ($id('quintBox').innerHTML || '').indexOf('回放') >= 0 &&
+      ($id('calibBox').innerHTML || '').indexOf('回放') >= 0 &&
+      ($id('dimBox').innerHTML || '').indexOf('回放') >= 0, 'true');
+    /* 复位，避免污染后续段落 */
+    state.hist = null;
+  }
+
   console.log('\n' + (fail ? `❌ 失败 ${fail} 项` : '✅ 全部断言通过'));
   process.exit(fail ? 1 : 0);
 })().catch(e => { console.error('FATAL', e.stack || e.message); process.exit(1); });
