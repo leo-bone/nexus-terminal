@@ -1657,6 +1657,218 @@ const near = (label, actual, expect, tol) => {
     state.hist = null;
   }
 
+  /* =====================================================================
+   * P 段：v3.22 ㉑ 预测台账 / ㉒ 换手与成本 / ㉓ 信号健康度
+   * 定位与前面不同：这里守的是「不能把数值 bug 和功效不足包装成结论」。
+   * ===================================================================== */
+  console.log('\n===== P. v3.22 预测台账 / 换手与成本 / 信号健康度 =====');
+  {
+    const rnd = () => { sd = (sd * 1103515245 + 12345) & 0x7fffffff; return sd / 0x7fffffff; };
+    const rndN = () => { let u = 0, v = 0; while (u === 0) u = rnd(); while (v === 0) v = rnd(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+    const cl = (v, a, b) => Math.max(a, Math.min(b, v));
+
+    /* ---- P1. 精确二项检验：下溢守门 ---- */
+    /* v3.22 实测抓到的 bug：out[0]=exp(n·ln(1−p)) 在 n=3564 时下溢成 0，
+     * 乘法递推把 0 传遍全数组 ⇒ 双侧 p 恒为 0 ⇒ 界面谎称「显著」。
+     * 这两条断言就是为它设的：小 n 测不出，必须测大 n 的「总和=1」与「p≠0」。 */
+    const pmfSmall = call('binomPmf', 10, 0.5);
+    const pmfBig = call('binomPmf', 3564, 0.5);
+    near('P1 binomPmf(n=10) 总和 = 1', pmfSmall.reduce((a, b) => a + b, 0), 1, 1e-12);
+    near('P1 binomPmf(n=3564) 总和 = 1（下溢守门）', pmfBig.reduce((a, b) => a + b, 0), 1, 1e-9);
+    chk('P1 大 n 下 pmf 不全为 0', pmfBig.some(v => v > 0), 'true');
+    near('P1 binomPmf(n=10,k=3) = C(10,3)/2^10', pmfSmall[3], 120 / 1024, 1e-12);
+    near('P1 双侧 p(n=10,k=10) = 2/2^10', call('binomTwoSided', 10, 10, 0.5), 2 / 1024, 1e-12);
+    near('P1 双侧 p(n=10,k=5) = 1（众数自身）', call('binomTwoSided', 5, 10, 0.5), 1, 1e-12);
+    /* 真实场景：3564 天里 1850 天押对（≈51.9%）—— p 必须既非 0 也不显著到离谱 */
+    const pBig = call('binomTwoSided', 1850, 3564, 0.5);
+    chk('P1 大 n 双侧 p 不因下溢变成 0', pBig > 1e-6, 'true');
+    chk('P1 大 n 双侧 p 落在 (0,1) 内', pBig > 0 && pBig < 1, 'true');
+    near('P1 双侧 p 关于 k↔n−k 对称', call('binomTwoSided', 3, 10, 0.5), call('binomTwoSided', 7, 10, 0.5), 1e-12);
+
+    /* ---- P2. 预测台账 ---- */
+    /* 换一个真的内存 localStorage：脚手架里那个是 no-op stub，存不进去 */
+    const memLS = (() => { const m = new Map(); return { getItem: k => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)), removeItem: k => m.delete(k) }; })();
+    sandbox.localStorage = memLS;
+
+    const DAY = 86400000;
+    const base = Date.UTC(2024, 0, 1);
+    const bars = [];
+    let px = 40000;
+    for (let i = 0; i < 300; i++) {
+      px = px * (1 + 0.001 + 0.02 * rndN());
+      bars.push({ t: base + i * DAY, c: px, o: px, h: px, l: px, v: 1 });
+    }
+    const stt = state;
+    stt.klIdx = null;
+    stt.klines['BTC1d'] = bars;
+
+    /* 逐日推进地记：把 klines 截到前 k 根再记，就等价于「那天记了一笔」 */
+    for (let k = 11; k <= 120; k++) {
+      stt.klines['BTC1d'] = bars.slice(0, k);
+      const fwd = bars[k + 9].c / bars[k - 1].c - 1;
+      call('ledgerRecord', cl(50 + 300 * fwd, 2, 98));
+    }
+    stt.klines['BTC1d'] = bars;
+    const Lg = call('ledgerResolve');
+    chk('P2 台账记到 110 条', Lg.n, 110);
+    chk('P2 全部已结算（都有 10 日后数据）', Lg.nRes, 110);
+    /* 幂等性：同一天反复记不该变多条 */
+    const nBefore = call('ledgerResolve').n;
+    stt.klines['BTC1d'] = bars.slice(0, 60);
+    call('ledgerRecord', 77);
+    stt.klines['BTC1d'] = bars;
+    chk('P2 同一天重复记录不新增条目（幂等）', call('ledgerResolve').n, nBefore);
+
+    const Sg = call('ledgerStats', Lg);
+    chk('P2 样本足够时 enough = true', Sg.enough, 'true');
+    chk('P2 完美前瞻信号 → 命中率 > 0.8', Sg.hitRate > 0.8, 'true');
+    chk('P2 完美前瞻信号 → IC > 0.8', Sg.ic > 0.8, 'true');
+    chk('P2 分段 IC 也算得出来', Sg.icFirst != null && Sg.icLast != null, 'true');
+    /* 样本不足必须拒绝给结论 —— 这是这块面板的纪律 */
+    const Lsmall = { rows: Lg.rows.slice(0, 10).map(r => ({ d: r.d, s: r.s, p: r.p, r: r.r })), n: 10, nRes: 10 };
+    chk('P2 样本不足时 enough = false（拒绝给结论）', call('ledgerStats', Lsmall).enough, 'false');
+    chk('P2 全未结算时 hitRate 为 null 而非 0', call('ledgerStats', { rows: Lg.rows.map(r => ({ d: r.d, s: r.s, p: r.p, r: null })), n: 110, nRes: 0 }).hitRate == null, 'true');
+
+    /* ---- P3. 换手率与可执行性 ---- */
+    const mkRep2 = function (n, start, scoreAt, drift) {
+      const closes = new Array(n).fill(null);
+      let p = 40000;
+      for (let i = 0; i < n; i++) { closes[i] = p; p = p * (1 + (drift || 0) + 0.02 * rndN()); }
+      const scores = new Array(n).fill(null);
+      for (let i = start; i < n; i++) scores[i] = scoreAt(i, closes);
+      return { n: n, start: start, closes: closes, scores: scores, calTs: [] };
+    };
+    /* ③a 恒定评分 ⇒ 仓位不动 ⇒ 换手与成本必须为 0 */
+    const eConst = call('execAnalysis', mkRep2(600, 20, () => 70, 0));
+    chk('P3 恒定评分 → 有结果', eConst != null, 'true');
+    near('P3 恒定评分 → 换手 = 0', eConst.turnD, 0, 1e-12);
+    near('P3 恒定评分 → 成本 = 0', eConst.costD, 0, 1e-12);
+    near('P3 恒定评分 → 净 = 毛', eConst.netD, eConst.grossD, 1e-15);
+    /* ③b 逐日 ± 反翻转 ⇒ 换手达到上界 */
+    const eAlt = call('execAnalysis', mkRep2(600, 20, i => (i % 2 ? 90 : 10), 0));
+    near('P3 逐日翻转 → 日均换手 = 1.6（±0.8 来回）', eAlt.turnD, 1.6, 1e-9);
+    chk('P3 翻转的成本远高于恒定', eAlt.costD > eConst.costD, 'true');
+    chk('P3 翻转的净收益低于恒定', eAlt.netD < eConst.netD, 'true');
+    /* ③c 完美日度前瞻 ⇒ 命中率应接近 1，且跑赢躺平的命中率 */
+    const ePerfect = call('execAnalysis', mkRep2(900, 20, (i, c) => cl(50 + 400 * (c[i + 1] / c[i] - 1), 2, 98), 0));
+    chk('P3 完美日度信号 → 命中率 > 0.9', ePerfect.hitRate > 0.9, 'true');
+    chk('P3 完美日度信号 → 边际命中为正', ePerfect.hitEdge > 0, 'true');
+    chk('P3 完美日度信号 → 毛收益为正', ePerfect.grossD > 0, 'true');
+    chk('P3 盈亏平衡换手率为正', ePerfect.beTurn > 0, 'true');
+    chk('P3 实际换手低于盈亏平衡（信号够强）', ePerfect.turnD < ePerfect.beTurn, 'true');
+    /* ③d 慢变量特征：恒定偏多 ⇒ 自相关＝NaN 还是 1？恒定序列方差为 0，
+     *     pearson 会返回 null —— 这里断言它不会崩且翻转率为 0 */
+    chk('P3 恒定序列的翻转率 = 0', eConst.flipRate, 0);
+    chk('P3 恒定序列不崩（meanRun 有值）', eConst.meanRun != null, 'true');
+    chk('P3 逐日翻转的翻转率 ≈ 1', Math.abs(eAlt.flipRate - 1) < 1e-9, 'true');
+    chk('P3 数据太少时返回 null', call('execAnalysis', mkRep2(50, 5, () => 60, 0)), null);
+    /* ③e 换手与成本的恒等关系：net = gross − cost */
+    near('P3 netD = grossD − costD（恒等式）', eAlt.netD, eAlt.grossD - eAlt.costD, 1e-15);
+    near('P3 costD = turnD × 往返/2（口径恒等式）', eAlt.costD, eAlt.turnD * eAlt.roundtrip / 2, 1e-15);
+
+    /* ---- P4. 信号健康度 ---- */
+    /* 造一个「前段强正、后段明确反向」的样本 —— 必须判成 flip，不能判成没变化 */
+    const repFlip = (() => {
+      const n = 1200, start = 20;
+      const closes = new Array(n).fill(null);
+      let p = 40000;
+      for (let i = 0; i < n; i++) { closes[i] = p; p = p * (1 + 0.0006 + 0.02 * rndN()); }
+      const fwd = new Array(n).fill(null);
+      for (let i = 0; i < n - 10; i++) fwd[i] = closes[i + 10] / closes[i] - 1;
+      const scores = new Array(n).fill(null);
+      for (let i = start; i < n - 10; i++) {
+        const sgn = (i >= n - 260 && i < n - 60) ? -1 : 1;   // 末段反向
+        scores[i] = cl(50 + sgn * 700 * fwd[i], 2, 98);
+      }
+      return { n: n, start: start, closes: closes, scores: scores, calTs: [] };
+    })();
+    const hFlip = call('signalHealth', repFlip, 10);
+    chk('P4 末段反向 → 不判成「与历史无显著差异」', hFlip.key !== 'same', 'true');
+    chk('P4 末段反向 → 判成 flip / flipwarn 之一', hFlip.key === 'flip' || hFlip.key === 'flipwarn', 'true');
+    chk('P4 末段反向 → 最近段 IC 为负', hFlip.icRecent < 0, 'true');
+    chk('P4 末段反向 → 对照段 IC 为正', hFlip.icComp > 0, 'true');
+
+    /* 关键守门：v3.22 真实数据上出的错 —— 最近半年 IC=−0.314（已反向）、
+     * 滚动 IC 为正比例 0%，只因 z=−1.79 差一点没过 −1.96，
+     * 初版就把它标成「健康」。这里用**短窗口**确定性地复现
+     * 「方向已经反了、但样本量不足以判显著」这一档：窗口越短 se 越大，
+     * 检测带越宽，于是「反向但不显著」必然出现。 */
+    const repWarn = (() => {
+      const n = 1400, start = 20, revDays = 70;
+      const closes = new Array(n).fill(null);
+      let p = 40000;
+      for (let i = 0; i < n; i++) { closes[i] = p; p = p * (1 + 0.0006 + 0.02 * rndN()); }
+      const fwd = new Array(n).fill(null);
+      for (let i = 0; i < n - 10; i++) fwd[i] = closes[i + 10] / closes[i] - 1;
+      const scores = new Array(n).fill(null);
+      for (let i = start; i < n - 10; i++) {
+        const rev = i >= n - revDays;
+        /* 基础段：弱信号（IC≈0.15）+ 大噪声；末段：中等强度反向。
+         * ampRev 取 400 是扫出来的：太大（900）会让最近段 IC 极端到 −0.8，
+         * 短窗口下 se 再大也照样显著；太小（200）则最近段 IC 常常翻不了负，
+         * 8 个随机种子里只有 7 个构造成立。400 是 8/8 成立且 z 全部落
+         * 在 (−1.54, −0.69) 的那一档 —— 稳健，不靠运气。 */
+        scores[i] = cl(50 + (rev ? -400 : 100) * fwd[i] + 41 * rndN(), 2, 98);
+      }
+      return { n: n, start: start, closes: closes, scores: scores, calTs: [] };
+    })();
+    const hWarn = call('signalHealth', repWarn, 10, 60);
+    chk('P4 构造成立：最近段 IC 已翻负', hWarn.icRecent < 0, 'true');
+    chk('P4 构造成立：对照段 IC 为正', hWarn.icComp > 0, 'true');
+    chk('P4 构造成立：z 未过 −1.96（功效不足）', hWarn.z > -1.96, 'true');
+    chk('P4 方向已反但 z 未过门槛 → 必须标 flipwarn，不能标 same', hWarn.key, 'flipwarn');
+    chk('P4 实测值落在 MDE 检测带之内（所以才不显著）',
+      hWarn.icRecent > hWarn.mde.rLo && hWarn.icRecent < hWarn.mde.rHi, 'true');
+    /* 不存在 'ok' 这个键了 —— 「没检出变化」不许叫「健康」 */
+    chk('P4 判定集合里没有 ok/健康 这个档位', ['same', 'hot', 'cool', 'weak', 'flipwarn', 'flip', 'dead', 'flat'].indexOf(hWarn.key) >= 0, 'true');
+    /* 对照：把反向区拉长、窗口也拉长 —— 同一强度的信号就该被检出。
+     * 这一条是为了证明上面那句「不显著」是**窗口/样本量的事**，不是信号没变。 */
+    const repWarnLong = (() => {
+      const n = 1400, start = 20, revDays = 500;
+      const closes = new Array(n).fill(null);
+      let p = 40000;
+      for (let i = 0; i < n; i++) { closes[i] = p; p = p * (1 + 0.0006 + 0.02 * rndN()); }
+      const fwd = new Array(n).fill(null);
+      for (let i = 0; i < n - 10; i++) fwd[i] = closes[i + 10] / closes[i] - 1;
+      const scores = new Array(n).fill(null);
+      for (let i = start; i < n - 10; i++) {
+        const rev = i >= n - revDays;
+        scores[i] = cl(50 + (rev ? -400 : 100) * fwd[i] + 41 * rndN(), 2, 98);
+      }
+      return { n: n, start: start, closes: closes, scores: scores, calTs: [] };
+    })();
+    const hWarnLong = call('signalHealth', repWarnLong, 10, 400);
+    chk('P4 反向区拉长 + 长窗口 → 被判为显著反转（flip）', hWarnLong.key, 'flip');
+    chk('P4  且 z 确实越过 −1.96', hWarnLong.z < -1.96, 'true');
+
+    /* 无变化的样本：全段同向信号 → 最近段与对照段都应同号 */
+    const repSame = mkRep2(1200, 20, (i, c) => cl(50 + 700 * ((c[i + 10] || c[i]) / c[i] - 1), 2, 98), 0.0006);
+    const hSame = call('signalHealth', repSame, 10);
+    chk('P4 全段同向 → 最近段 IC 为正', hSame.icRecent > 0, 'true');
+    chk('P4 全段同向 → 不判成 flip/dead', hSame.key !== 'flip' && hSame.key !== 'flipwarn' && hSame.key !== 'dead', 'true');
+    /* MDE 必须夹住对照值，且「检测带」的语义正确 */
+    chk('P4 MDE 下界 < 对照 IC < 上界', hSame.mde.rLo < hSame.icComp && hSame.icComp < hSame.mde.rHi, 'true');
+    chk('P4 MDE 半宽 = 1.96 × SE', Math.abs(hSame.mde.dz - 1.96 * hSame.mde.zSe) < 1e-12, 'true');
+    chk('P4 有效样本量已折算（n_eff < n）', hSame.neffRecent < hSame.nRecent, 'true');
+
+    /* ---- P5. 三个新面板能渲染且不崩 ---- */
+    stt.hist = { rep: repSame };
+    call('renderExecBox');
+    chk('P5 execBox 渲染出内容', $id('execBox').innerHTML.length > 100, 'true');
+    call('renderHealthBox');
+    chk('P5 healthBox 渲染出内容', $id('healthBox').innerHTML.length > 100, 'true');
+    call('renderLedgerBox', { score: 63 });
+    chk('P5 ledgerBox 渲染出内容', $id('ledgerBox').innerHTML.indexOf('预测台账') >= 0, 'true');
+    /* 空态不能崩 */
+    stt.hist = null;
+    call('renderExecBox');
+    call('renderHealthBox');
+    chk('P5 无回放时 execBox 给提示不崩', $id('execBox').innerHTML.indexOf('回放') >= 0, 'true');
+    stt.klines['BTC1d'] = null;
+    call('renderLedgerBox', { score: 63 });
+    chk('P5 无日线时 ledgerBox 不崩', typeof $id('ledgerBox').innerHTML, 'string');
+  }
+
   console.log('\n' + (fail ? `❌ 失败 ${fail} 项` : '✅ 全部断言通过'));
   process.exit(fail ? 1 : 0);
 })().catch(e => { console.error('FATAL', e.stack || e.message); process.exit(1); });

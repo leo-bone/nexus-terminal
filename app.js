@@ -1690,6 +1690,8 @@ function renderFactors() {
   state.lastScoreOut = res.out;
   /* v3.20 ⑫：分歧度 + 动态权重今日评级（失败不影响主面板） */
   try { renderScoreV2(res); } catch (e) { console.warn('score v2 fail', e && e.message); }
+  /* v3.22 ㉑：预测台账（自我记分）—— 每天记一笔，10 天后结算 */
+  try { renderLedgerBox(res); } catch (e) { console.warn('ledger fail', e && e.message); }
   /* v3.21 ⑲：风险化仓位（同样失败不影响主面板） */
   try { renderSizeBox(res); } catch (e) { console.warn('size box fail', e && e.message); }
 }
@@ -2701,6 +2703,9 @@ function renderHistory() {
   renderQuintBox();
   renderCalibBox();
   renderDimBox();
+  /* v3.22 ㉒㉓：换手率与可执行性 + 信号健康度 */
+  try { renderExecBox(); } catch (e) { console.warn('exec fail', e && e.message); }
+  try { renderHealthBox(); } catch (e) { console.warn('health fail', e && e.message); }
   renderOOS(S.oos);
   drawRollChart($('rollCanvas'), S.roll);
   drawHistChart($('histCanvas'), rep);
@@ -5615,4 +5620,582 @@ function renderDimBox() {
     '是<b>它说的已经被排在前面的因子说过了</b>。这比「逐个删掉看分数摆动」（jackknife）更严谨：' +
     'jackknife 只看删除效应，正交化直接衡量冗余。</span></div>';
   box.innerHTML = html;
+}
+
+/* =====================================================================
+ * v3.22 ㉑-㉓：让这台终端对自己负责
+ *
+ *   v3.21 的结论是回顾性的、而且不好听：样本外保序反转、信号本身在衰减
+ *   （IC 0.185 → 0.041）、建议仓位 = 0。这些数字如果只是躺在回放面板里，
+ *   那它只是一份「体检报告」；真正的机构做法是把它变成 **开着的监控**。
+ *
+ *   本轮三块：
+ *
+ *    ㉑ 预测台账（自我记分）—— 这台终端每天都在出分，但从来没有人给它
+ *       改过卷。这里把每天的「评分 + 当时价格」记进 localStorage，等
+ *       h 天过去了再把真实收益填回去，于是得到一份 **前视的、真实的**
+ *       样本外记录。它最值钱的地方：这是全套系统里唯一一份真正的前向
+ *       测试 —— 十年回放再怎么说也是事后。代价是样本要靠时间攒，
+ *       所以样本不够时**拒绝给结论**（这是本块的纪律，不是缺陷）。
+ *
+ *    ㉒ 换手率与可执行性 —— v3.21 说「建议仓位 0」，但没说清为什么。
+ *       真正的原因是：评分每天在动，动就要交成本。这里把评分落成仓位
+ *       序列，量出换手率、算出成本吃掉多少毛收益、给出盈亏平衡换手率。
+ *       同时给出评分的自相关与符号翻转频率 —— 一个每 3 天翻一次的信号，
+ *       就算 IC 好看也是不可交易的。
+ *
+ *    ㉓ 信号健康度 —— 把 v3.21 的「信号在衰减」变成实时监控：最近 W 天
+ *       的 IC 与**其余全部样本**的 IC 做 Fisher-z 两独立样本检验。
+ *       注意必须是「其余」而不是「全样本」—— 全样本包含最近段，两者不独立，
+ *       那样算出来的 z 是错的。
+ * ===================================================================== */
+
+const LEDGER_KEY = 'nexus_ledger_v1';
+const LEDGER_H = 10;        // 与 CALIB_H 一致：评分给的是 10 日前瞻
+const LEDGER_MIN = 30;      // 低于这个已结算样本量，拒绝给结论
+const LEDGER_MAX = 500;     // 最多保留多少条
+
+/* ---------- 精确二项检验（用于胜率是否优于抛硬币）---------- */
+/* 必须整段走**对数空间**，最后再归一化 —— v3.22 实测抓到一个下溢 bug：
+ * 初版写 out[0] = exp(n·ln(1−p))，n=3564、p=0.5 时是 exp(−2470)，
+ * 直接下溢成 0；后面的递推是乘法，**0 会传播到整个数组**，
+ * 于是所有概率全是 0 ⇒ 双侧 p 恒等于 0。后果很坏：日度命中率 49.4%
+ * （正确 p≈0.19，完全不显著）被算成 p=0.0000，界面会据此宣称
+ * 「显著差于抛硬币」—— 一个纯数值 bug 被包装成了统计结论。
+ * 修法：先算全部 log-pmf，减去最大值再取指数（最大项归一为 1，不会下溢），
+ * 最后整体除以总和还原成真正的概率。
+ *
+ * n≤745 时旧写法碰巧不出错 —— 这正是它危险的地方：小样本测试全过，
+ * 一上真实数据量就翻车。所以下面必须有「总和=1」和「大 n」两条断言。 */
+function binomPmf(n, p) {
+  if (n < 0) return null;
+  const lp = Math.log(p), lq = Math.log(1 - p);
+  const lg = new Array(n + 1);
+  lg[0] = n * lq;
+  for (let i = 1; i <= n; i++) {
+    lg[i] = lg[i - 1] + Math.log(n - i + 1) - Math.log(i) + lp - lq;
+  }
+  let mx = -Infinity;
+  for (let i = 0; i <= n; i++) if (lg[i] > mx) mx = lg[i];
+  const out = new Array(n + 1);
+  let sum = 0;
+  for (let i = 0; i <= n; i++) { out[i] = Math.exp(lg[i] - mx); sum += out[i]; }
+  for (let i = 0; i <= n; i++) out[i] /= sum;
+  return out;
+}
+/* 双侧精确二项 p：把所有「概率不超过观测值」的结果加起来。
+ * 这是 Fisher 精确检验在单样本情形下的标准做法，不是正态近似。 */
+function binomTwoSided(k, n, p) {
+  if (n <= 0 || k < 0 || k > n) return null;
+  const pp = p == null ? 0.5 : p;
+  const pmf = binomPmf(n, pp);
+  if (!pmf) return null;
+  const pk = pmf[k];
+  let s = 0;
+  for (let i = 0; i <= n; i++) if (pmf[i] <= pk * (1 + 1e-12)) s += pmf[i];
+  return Math.min(1, s);
+}
+
+/* ---------- ㉑ 预测台账 ---------- */
+function ledgerLoad() {
+  try {
+    const s = localStorage.getItem(LEDGER_KEY);
+    if (!s) return [];
+    const a = JSON.parse(s);
+    return Array.isArray(a) ? a : [];
+  } catch (e) { return []; }
+}
+function ledgerSave(a) {
+  try { localStorage.setItem(LEDGER_KEY, JSON.stringify(a)); } catch (e) { /* 隐私模式下不可写，静默 */ }
+}
+
+/* 记今天的预测。同一天只留最后一次 —— 页面每 60s 刷新，一天会触发很多次。
+ * 回放游标模式下（state.klIdx 非 null）不记，否则会把历史日期混进台账。 */
+function ledgerRecord(score) {
+  if (score == null || !isFinite(score)) return false;
+  if (state.klIdx != null) return false;
+  const k = state.klines['BTC1d'];
+  if (!k || !k.length) return false;
+  const last = k[k.length - 1];
+  if (!last || !last.c) return false;
+  const day = fDate(last.t);
+  const a = ledgerLoad();
+  let i = -1;
+  for (let j = 0; j < a.length; j++) if (a[j].d === day) { i = j; break; }
+  const rec = { d: day, s: Math.round(score * 10) / 10, p: last.c };
+  if (i >= 0) a[i] = rec; else a.push(rec);
+  if (a.length > LEDGER_MAX) a.splice(0, a.length - LEDGER_MAX);
+  ledgerSave(a);
+  return true;
+}
+
+/* 结算：把每条记录配上 h 日后的真实收益。还没到期的留空 —— 不给假数。 */
+function ledgerResolve() {
+  const k = state.klines['BTC1d'];
+  if (!k || k.length < LEDGER_H + 2) return null;
+  const idxOf = new Map();
+  for (let i = 0; i < k.length; i++) idxOf.set(fDate(k[i].t), i);
+  const a = ledgerLoad();
+  const rows = [];
+  for (let j = 0; j < a.length; j++) {
+    const e = a[j];
+    const i = idxOf.get(e.d);
+    let r = null;
+    if (i != null && i + LEDGER_H < k.length && e.p) {
+      const pc = k[i + LEDGER_H].c;
+      if (pc) r = pc / e.p - 1;
+    }
+    rows.push({ d: e.d, s: e.s, p: e.p, r: r });
+  }
+  return { rows: rows, n: rows.length, nRes: rows.filter(function (x) { return x.r != null; }).length };
+}
+
+function ledgerStats(L) {
+  if (!L || !L.n) return null;
+  const res = L.rows.filter(function (x) { return x.r != null; });
+  const out = { n: L.n, nRes: res.length, pending: L.n - res.length, enough: res.length >= LEDGER_MIN };
+  if (!res.length) return out;
+  const S = res.map(function (x) { return x.s; }), R = res.map(function (x) { return x.r; });
+
+  /* 命中：评分方向（相对 50）与真实收益方向一致 */
+  let hit = 0, nDir = 0;
+  for (let i = 0; i < res.length; i++) {
+    const tilt = res[i].s - 50;
+    if (Math.abs(tilt) < 0.5) continue;   //  practically 中性，不计入方向判断
+    nDir++;
+    if (tilt * res[i].r > 0) hit++;
+  }
+  out.hit = hit; out.nDir = nDir;
+  out.hitRate = nDir ? hit / nDir : null;
+  out.hitP = nDir ? binomTwoSided(hit, nDir, 0.5) : null;
+
+  out.ic = pearson(rankAvg(S), rankAvg(R));
+  const neff = Math.max(4, Math.floor(res.length / LEDGER_H));
+  out.neff = neff;
+  out.t = out.ic == null ? null : out.ic / (1 / Math.sqrt(neff));
+
+  const base = R.reduce(function (a, b) { return a + b; }, 0) / R.length;
+  out.base = base;
+  const bk = [[-1e9, 40], [40, 60], [60, 1e9]].map(function (rg) {
+    const sel = [];
+    for (let i = 0; i < res.length; i++) if (S[i] >= rg[0] && S[i] < rg[1]) sel.push(R[i]);
+    return {
+      n: sel.length,
+      mean: sel.length ? sel.reduce(function (a, b) { return a + b; }, 0) / sel.length : null,
+      win: sel.length ? sel.filter(function (v) { return v > 0; }).length / sel.length : null,
+    };
+  });
+  out.buckets = bk;
+
+  /* 分段：前半 vs 后半 —— 台账也要能回答「是不是在衰减」 */
+  if (res.length >= 20) {
+    const c = Math.floor(res.length / 2);
+    const A = res.slice(0, c), B = res.slice(c);
+    const icA = pearson(rankAvg(A.map(function (x) { return x.s; })), rankAvg(A.map(function (x) { return x.r; })));
+    const icB = pearson(rankAvg(B.map(function (x) { return x.s; })), rankAvg(B.map(function (x) { return x.r; })));
+    out.icFirst = icA; out.icLast = icB;
+  }
+  out.first = res[0].d; out.last = res[res.length - 1].d;
+  return out;
+}
+
+/* ---------- ㉒ 换手率与可执行性 ---------- */
+/* 把评分落成仓位：w = (score−50)/50，钳到 ±1。
+ * 这是最朴素也最难为情的映射 —— 它不含任何仓位优化，正因为如此，
+ * 用它量出来的换手率是「上界」：真实策略可以做得更平滑，但做不到无限平滑。 */
+function execAnalysis(rep) {
+  if (!rep || !rep.scores) return null;
+  const n = rep.n, start = rep.start;
+  const w = new Array(n).fill(null);
+  /* 必须是 !isFinite 而不是 == null：NaN == null 为 false，守不住。
+   * v3.22 实测踩到 —— 评分序列里只要混进一个 NaN（比如末尾越界算出 c[i+1] 未定义），
+   * Math.min(1, NaN) 会返回 NaN 并一路传播：|Δw| 变 NaN ⇒ 换手率 NaN ⇒
+   * 整块面板静默失效。缺数据该跳过，不该把全表毒成 NaN。 */
+  for (let i = start; i < n; i++) {
+    const v = rep.scores[i];
+    if (v == null || !isFinite(v)) continue;
+    const t = (v - 50) / 50;
+    w[i] = Math.max(-1, Math.min(1, t));
+  }
+
+  /* 换手与收益只在「相邻两天都有仓位」的区间上算 —— 缺数据的地方不硬凑 */
+  let turn = 0, nT = 0;
+  const daily = [];
+  const bh = [];
+  for (let i = start; i + 1 < n; i++) {
+    const a = w[i], b = w[i + 1];
+    if (a == null || b == null) continue;
+    turn += Math.abs(b - a); nT++;
+    const r = (rep.closes[i + 1] && rep.closes[i]) ? rep.closes[i + 1] / rep.closes[i] - 1 : null;
+    if (r == null || !isFinite(r)) continue;
+    daily.push(a * r);      // 持有 a 过 i→i+1
+    bh.push(r);
+  }
+  if (nT < 100 || daily.length < 100) return null;
+
+  const mean = function (x) { let s = 0; for (let i = 0; i < x.length; i++) s += x[i]; return s / x.length; };
+  const sd = function (x) { const m = mean(x); let s = 0; for (let i = 0; i < x.length; i++) s += (x[i] - m) * (x[i] - m); return Math.sqrt(s / (x.length - 1)); };
+
+  const grossD = mean(daily);
+  const turnD = turn / nT;
+  /* 成本口径：SIZE_ROUNDTRIP 是「0→1→0」一整趟的往返成本，
+   * 所以每变动 |Δw| 单位，付出的成本是 |Δw| × 往返成本/2。口径必须写明。 */
+  const costD = turnD * SIZE_ROUNDTRIP / 2;
+  const netD = grossD - costD;
+
+  const sdG = sd(daily), sdB = sd(bh);
+  const shG = sdG ? grossD / sdG * Math.sqrt(365) : null;
+  const shN = sdG ? netD / sdG * Math.sqrt(365) : null;
+  const bhD = mean(bh);
+  const shB = sdB ? bhD / sdB * Math.sqrt(365) : null;
+
+  /* 盈亏平衡换手率：毛收益刚好被成本吃光的那个换手率。
+   * 实际换手率高于它 ⇒ 这个频率下不该交易。 */
+  const beTurn = Math.abs(grossD) > 1e-12 ? Math.abs(grossD) / (SIZE_ROUNDTRIP / 2) : null;
+
+  /* 命中率：每天的方向是否押对（同样用精确二项检验对照抛硬币）。
+   * 只统计**真有仓位**的日子 —— w≈0（评分≈50）那天既没押多也没押空，
+   * 把它算成「没押对」会把命中率人为压低。台账里用的是同一个口径。 */
+  let hit = 0, nH = 0;
+  for (let i = 0; i < daily.length; i++) {
+    if (Math.abs(daily[i]) < 1e-12) continue;   // 当日收益恰为 0（多半是没仓位），不计
+    nH++;
+    if (daily[i] > 0) hit++;
+  }
+  const hitP = binomTwoSided(hit, nH, 0.5);
+
+  /* 关键对照：一直持有多（躺平）的日度命中率。
+   * 为什么必须有它 —— 评分大部分时间是偏多的（BTC 十年年化 +69%），
+   * 于是「w×r>0」里绝大多数日子其实是「多头仓 + 上涨日」，
+   * 那测的是**市场的上涨频率**，不是本终端的技能。
+   * 实测：策略 51.9% / 躺平约 52~53% —— 一对照，「命中率显著优于抛硬币」
+   * 这个看似漂亮的结论就消失了。拿抛硬币当基准在牛市里是自欺。 */
+  let bhHit = 0;
+  for (let i = 0; i < bh.length; i++) if (bh[i] > 0) bhHit++;
+  const bhHitRate = bhHit / bh.length;
+
+  /* 评分的自相关与符号翻转 —— 「信号稳不稳」的直接度量 */
+  const wSeq = [];
+  for (let i = start; i < n; i++) if (w[i] != null) wSeq.push(w[i]);
+  const ac = {};
+  [1, 5, 10, 20].forEach(function (L) {
+    if (wSeq.length <= L + 30) { ac[L] = null; return; }
+    ac[L] = pearson(wSeq.slice(0, wSeq.length - L), wSeq.slice(L));
+  });
+  let flips = 0, nF = 0;
+  let run = 1; const runs = [];
+  for (let i = 1; i < wSeq.length; i++) {
+    const a = Math.sign(wSeq[i - 1]), b = Math.sign(wSeq[i]);
+    if (a === 0 || b === 0) continue;
+    nF++;
+    if (a !== b) { flips++; runs.push(run); run = 1; } else run++;
+  }
+  runs.push(run);
+
+  return {
+    days: daily.length, grossD: grossD, costD: costD, netD: netD, turnD: turnD,
+    grossY: grossD * 365, costY: costD * 365, netY: netD * 365, bhY: bhD * 365,
+    shG: shG, shN: shN, shB: shB,
+    beTurn: beTurn, costShare: Math.abs(grossD) > 1e-12 ? costD / Math.abs(grossD) : null,
+    hitRate: nH ? hit / nH : null, hitP: hitP, nHit: nH,
+    bhHitRate: bhHitRate, hitEdge: (nH ? hit / nH : null) == null ? null : (hit / nH - bhHitRate),
+    ac: ac, flipRate: nF ? flips / nF : null, meanRun: runs.length ? mean(runs) : null,
+    roundtrip: SIZE_ROUNDTRIP,
+  };
+}
+
+/* ---------- ㉓ 信号健康度 ---------- */
+const HEALTH_WIN = 180;   // 「最近」取半年
+/* win 可覆盖：默认半年。做成参数是为了可检验 —— 「方向已反但样本量不足以判显著」
+ * 这一档（真实数据上正好撞见）必须能被确定性地构造出来，否则它没回归测试守着。 */
+function signalHealth(rep, h, win) {
+  if (!rep || !rep.scores) return null;
+  const hh = h == null ? CALIB_H : h;
+  const W = win == null ? HEALTH_WIN : win;
+  const full = icCore(rep.scores, rep, hh, rep.start, rep.n);
+  if (!full) return null;
+  const lo = Math.max(rep.start, rep.n - W - hh);
+  const recent = icCore(rep.scores, rep, hh, lo, rep.n);
+  /* 对照组必须是「除最近段以外的全部」—— 用全样本当对照是错的，
+   * 因为全样本包含最近段，两者不独立，Fisher-z 的方差公式会不成立。 */
+  const comp = icCore(rep.scores, rep, hh, rep.start, lo);
+  if (!recent || !comp) return null;
+
+  const nR = Math.max(6, recent.neff), nC = Math.max(6, comp.neff);
+  const se = Math.sqrt(1 / (nR - 3) + 1 / (nC - 3));
+  const z = se > 0 ? (fisherZ(recent.spear) - fisherZ(comp.spear)) / se : null;
+  const p = z == null ? null : 2 * (1 - normCdf(Math.abs(z)));
+
+  /* 最近段里滚动 IC 为正的比例 —— 比单点 IC 稳定 */
+  const roll = rollingIC(rep, 60, hh);
+  const tail = roll.slice(-Math.max(6, Math.floor(HEALTH_WIN / 10)));
+  const posShare = tail.length ? tail.filter(function (x) { return x.ic != null && x.ic > 0; }).length / tail.length : null;
+
+  /* 判定顺序有讲究，v3.22 实测后重写过一版。
+   * 初版只要 z 没过 −1.96 就落到「健康」。真实数据上这出了个危险的结果：
+   * 最近半年 IC = −0.314（已反向）、滚动 IC 为正比例 0%，只因 z=−1.79
+   * 差一点点没过门槛，就被贴上「健康」的标签 —— **标签比证据强**，
+   * 这是在拿「没检出」冒充「没问题」。两条修正：
+   *   ① 符号相反 / 滚动 IC 长期为负，即使不显著也要单独标出来（功效不足 ≠ 没变化）
+   *   ② 「与历史无显著差异」是中性表述，**不用「健康」这个词**（它是忌讳的错觉来源）
+   *
+   * 另外补 MDE（最小可检测效应）：把「这个检验到底能检出多大的衰减」算出来。
+   * 检测不到不等于没衰减 —— 不说清这一点，z 不显著就会被误读成安全。 */
+  let key = 'flat', label = '数据不足';
+  const rR = recent.spear, rC = comp.spear;
+  const decay = z != null && z < -1.96;
+  const gain = z != null && z > 1.96;
+  const flip = rR != null && rC != null && rR < 0 && rC > 0;
+  const weak = posShare != null && posShare < 0.3;
+  if (rR != null && rC != null) {
+    if (flip && decay) { key = 'flip'; label = '方向反转（显著）'; }
+    else if (decay) { key = 'cool'; label = '显著降温'; }
+    else if (flip) { key = 'flipwarn'; label = '方向相反，但未达显著'; }
+    else if (weak) { key = 'weak'; label = '持续走弱（滚动 IC 长期为负）'; }
+    else if (Math.abs(rR) < 0.03) { key = 'dead'; label = '进噪声区'; }
+    else if (gain) { key = 'hot'; label = '较此前增强'; }
+    else { key = 'same'; label = '与历史无显著差异'; }
+  }
+  /* 最小可检测效应：在 Fisher-z 空间，|Δ| 要多大才能被判显著？换算回相关系数。 */
+  let mde = null;
+  if (se > 0 && rC != null) {
+    const d = 1.96 * se;
+    mde = { zSe: se, dz: d, rLo: fisherZInv(fisherZ(rC) - d), rHi: fisherZInv(fisherZ(rC) + d) };
+  }
+  return {
+    h: hh, win: W,
+    icFull: full.spear, tFull: full.t, nFull: full.n,
+    icRecent: recent.spear, tRecent: recent.t, nRecent: recent.n,
+    icComp: comp.spear, nComp: comp.n,
+    neffRecent: recent.neff, neffComp: comp.neff,
+    z: z, p: p, posShare: posShare, key: key, label: label, mde: mde,
+  };
+}
+
+/* ---------- ㉑ 预测台账的渲染 ---------- */
+function renderLedgerBox(res) {
+  const box = $('ledgerBox');
+  if (!box) return;
+  const sc = res && res.score != null ? res.score : null;
+  /* 先记一笔今天的（幂等：同一天反复刷新只覆盖，不追加） */
+  if (sc != null) ledgerRecord(sc);
+  const L = ledgerResolve();
+  if (!L || !L.n) {
+    box.innerHTML = '<div class="rg-sub"><b>㉑ 预测台账</b>（空）：本机会记录每天的评分与当时价格，' +
+      '等 ' + LEDGER_H + ' 天后把真实收益填回去 —— 这是全套系统里<b>唯一真正的前向测试</b>' +
+      '（十年回放再怎么说也是事后）。需要日线数据后才会开始记。</div>';
+    return;
+  }
+  const S = ledgerStats(L);
+  let h = '<div class="rg-sub"><b>㉑ 预测台账 · 自我记分</b>：已记 <b>' + L.n + '</b> 条，' +
+    '已结算 <b>' + L.nRes + '</b> 条，待到期 <b>' + S.pending + '</b> 条' +
+    (S.first ? '（' + S.first + ' → ' + S.last + '）' : '') + '。</div>';
+
+  if (!S.enough) {
+    /* 样本不够就明说还不够 —— 这块面板的纪律就是不用小样本编故事 */
+    const pct = Math.min(100, Math.round(L.nRes / LEDGER_MIN * 100));
+    h += '<div class="rg-sub"><b>样本累积中，暂不给结论</b>：已结算 ' + L.nRes + ' / ' + LEDGER_MIN +
+      '（' + pct + '%）。<br>' +
+      '<span style="display:inline-block;width:200px;height:6px;background:var(--line);border-radius:3px;overflow:hidden;vertical-align:middle">' +
+      '<span style="display:inline-block;width:' + pct + '%;height:6px;background:var(--accent)"></span></span>' +
+      '<br><span class="rg-dim">为什么立这条规矩：' + LEDGER_H + ' 日 horizon 下，30 条已结算记录' +
+      '折算有效样本只有 ~' + Math.max(3, Math.floor(LEDGER_MIN / LEDGER_H)) + ' 个非重叠窗口。' +
+      '低于这个量级，任何「胜率 70%」都只是两三次巧合，把它摆出来只会误导人。</span></div>';
+    const tail = L.rows.slice(-6).reverse();
+    if (tail.length) {
+      h += '<div class="rg-sub">最近记录：' + tail.map(function (x) {
+        return '<span class="rg-dim">' + x.d + '</span> 评分 <b>' + x.s.toFixed(1) + '</b> ' +
+          (x.r == null ? '<i>待到期</i>' : '→ ' + pctS(x.r, 2));
+      }).join('　') + '</div>';
+    }
+    box.innerHTML = h;
+    return;
+  }
+
+  const hp = S.hitP == null ? '—' : S.hitP.toFixed(4);
+  const sig = S.hitP != null && S.hitP < 0.05;
+  h += '<div class="rg-sub"><b>方向命中率</b> = <b>' + (S.hitRate == null ? '—' : (S.hitRate * 100).toFixed(1) + '%') +
+    '</b>（' + S.hit + '/' + S.nDir + '）。对照抛硬币的<b>精确二项检验</b> p = <b>' + hp + '</b>' +
+    ' —— 不是正态近似，是把所有「概率不超过观测值」的结果全加起来。<br>' +
+    (sig
+      ? '<b style="color:var(--green)">这个胜率不太像纯运气。</b>但注意：胜率高不等于赚钱，还要看对错时候的幅度（下面 IC 才是那个）。'
+      : '<b>与抛硬币 indistinguishable</b> —— 目前没有证据表明这台终端的前向预测优于随机。' +
+        '这是诚实的默认结果：一个 IC≈0.13 的信号，方向对的概率本来也就 53~55%。') + '</div>';
+
+  h += '<div class="rg-sub">台账 IC = <b>' + (S.ic == null ? '—' : S.ic.toFixed(3)) + '</b>' +
+    '（t=' + (S.t == null ? '—' : S.t.toFixed(2)) + '，n=' + L.nRes + '，有效 n_eff=' + S.neff + '）' +
+    '　分档：' + S.buckets.map(function (b, i) {
+      const nm = ['<40', '40~60', '>60'][i];
+      return nm + ' ' + (b.mean == null ? '—' : pctS(b.mean, 2)) + '<span class="rg-dim">n=' + b.n + '</span>';
+    }).join('　') + '　基准 ' + pctS(S.base, 2) + '</div>';
+
+  if (S.icFirst != null && S.icLast != null) {
+    h += '<div class="rg-sub">台账前半段 IC <b>' + S.icFirst.toFixed(3) + '</b> → 后半段 IC <b>' +
+      S.icLast.toFixed(3) + '</b>' +
+      (Math.abs(S.icLast) < Math.abs(S.icFirst) * 0.5
+        ? ' <span class="rg-dim">（后半段明显走弱，但样本量小，只能当观察不能当结论）</span>'
+        : '') + '</div>';
+  }
+  box.innerHTML = h;
+}
+
+/* ---------- ㉒ 换手率与可执行性的渲染 ---------- */
+function renderExecBox() {
+  const box = $('execBox');
+  if (!box) return;
+  const H = state.hist;
+  if (!H || !H.rep) { box.innerHTML = '<div class="rg-sub">需要先跑一次十年回放。</div>'; return; }
+  const E = H.exec || (H.exec = execAnalysis(H.rep));
+  if (!E) { box.innerHTML = '<div class="rg-sub">数据不足以计算换手（需要 ≥100 个连续交易日）。</div>'; return; }
+
+  const rt = (E.roundtrip * 100).toFixed(2);
+  let h = '<div class="rg-sub"><b>仓位映射</b>：w = clamp((评分−50)/50, −1, +1)。' +
+    '这是最朴素的映射 —— <b>正因为它不含任何平滑优化，量出来的换手率是上界</b>' +
+    '（真实策略可以调得更平滑，但做不到无限平滑）。<br>' +
+    '<b>成本口径</b>：往返成本 ' + rt + '%（0→1→0 一整趟），所以每变动 |Δw| 单位付出的成本是 ' +
+    '|Δw| × ' + (E.roundtrip / 2 * 100).toFixed(2) + '%。这个口径必须写明，否则所有数字都对不上。</div>';
+
+  const row = function (k, v, cls) {
+    return '<div class="rg-sub">' + k + '：<b class="' + (cls || '') + '">' + v + '</b></div>';
+  };
+  h += '<div class="rg-sub"><b>年化</b>（' + E.days + ' 个交易日）：' +
+    '毛收益 <b>' + pctS(E.grossY, 1) + '</b>　' +
+    '成本 <b style="color:var(--red)">−' + (E.costY * 100).toFixed(1) + '%</b>　' +
+    '净 <b class="' + (E.netY >= 0 ? 'rg-g' : 'rg-r') + '">' + pctS(E.netY, 1) + '</b>　' +
+    '（买入持有 <b>' + pctS(E.bhY, 1) + '</b>）</div>';
+  h += '<div class="rg-sub"><b>夏普</b>：毛 <b>' + (E.shG == null ? '—' : E.shG.toFixed(2)) + '</b>' +
+    ' → 净 <b class="' + (E.shN >= E.shB ? 'rg-g' : 'rg-r') + '">' + (E.shN == null ? '—' : E.shN.toFixed(2)) + '</b>' +
+    '　（躺平买入持有 <b>' + (E.shB == null ? '—' : E.shB.toFixed(2)) + '</b>）</div>';
+
+  const cs = E.costShare;
+  h += '<div class="rg-sub"><b>成本吃掉多少</b>：年化成本 ' + (E.costY * 100).toFixed(1) + '% ' +
+    'vs 毛收益 ' + pctS(E.grossY, 1) + ' → 成本相当于毛收益的 <b class="' + (cs != null && cs > 1 ? 'rg-r' : '') + '">' +
+    (cs == null ? '—' : (cs * 100).toFixed(0) + '%') + '</b>' +
+    (cs != null && cs > 1
+      ? ' —— <b style="color:var(--red)">超过 100%，即光是换手的成本就已经大于信号本身赚到的钱</b>。' +
+        '这就是 ⑲ 里「建议仓位 0」的真凭实据：不是信号没用，是<b>这个换手频率下它不值得动手</b>。'
+      : ' —— 成本尚未吞掉全部毛收益。' +
+        '<br><b>于是真正的问题浮出来了：这一档下成本根本不是瓶颈</b>（只占 ' +
+        (cs == null ? '—' : (cs * 100).toFixed(0)) + '%）。' +
+        '看上面那行年化：毛 ' + pctS(E.grossY, 1) + ' 对买入持有 ' + pctS(E.bhY, 1) +
+        '，夏普 ' + (E.shG == null ? '—' : E.shG.toFixed(2)) + ' 对 ' + (E.shB == null ? '—' : E.shB.toFixed(2)) +
+        ' —— <b>这个信号加的仓位跑不赢躺平</b>。' +
+        '⑲ 说「建议仓位 0」，原因在这里，不在手续费。' +
+        '<span class="rg-dim">在 BTC 这种十年年化 +69% 的资产上，任何降低敞口的择时' +
+        '都要先跨过「少赚的涨幅」这道坎；IC 0.13 的强度远远不够。</span>') + '</div>';
+
+  h += '<div class="rg-sub"><b>盈亏平衡换手率</b> = <b>' + (E.beTurn == null ? '—' : E.beTurn.toFixed(4)) +
+    '</b>（日均），实际换手率 = <b>' + E.turnD.toFixed(4) + '</b>。' +
+    (E.beTurn != null && E.turnD > E.beTurn
+      ? '实际<b class="rg-r">高于</b>盈亏平衡点 ' + (E.turnD / E.beTurn).toFixed(1) + ' 倍 ⇒ 交易太频繁。'
+      : '实际低于盈亏平衡点 ⇒ 这个频率下成本还能承受，问题在信号强度不在频率。') + '</div>';
+
+  /* 实测出现了一个反直觉结果，必须在界面上讲清楚，否则一定被误读：
+   * 日度方向命中率 49.4%，精确二项检验 **显著低于** 50%（p≈0），
+   * 而 10 日 IC 却是 +0.134（正）。两者并不矛盾 —— 说明这个评分是**慢变量**：
+   * 它的预测力在 10 日尺度上成立，在 1 日尺度上是零甚至略负。
+   * 证据链自洽：lag1 自相关 0.963、平均连续同向 20 天、符号翻转率仅 4.9%。
+   * 结论：**不要用它做日度择时**。 */
+  h += '<div class="rg-sub"><b>日度方向命中率</b> = <b>' + (E.hitRate == null ? '—' : (E.hitRate * 100).toFixed(1) + '%') +
+    '</b>（n=' + E.nHit + '，对照<b>抛硬币</b>的精确二项 p = ' + (E.hitP == null ? '—' : E.hitP.toFixed(4)) + '）' +
+    '　<b>躺平（一直持有多）命中率</b> = <b>' + (E.bhHitRate == null ? '—' : (E.bhHitRate * 100).toFixed(1) + '%') + '</b>' +
+    '<br><b>但真正该看的是差值，不是「是否 &gt; 50%」：</b>边际命中 = <b class="' +
+    ((E.hitEdge == null || E.hitEdge >= 0) ? 'rg-g' : 'rg-r') + '">' +
+    (E.hitEdge == null ? '—' : (E.hitEdge >= 0 ? '+' : '') + (E.hitEdge * 100).toFixed(1) + ' pp') + '</b>。' +
+    '<span class="rg-dim">理由：评分大部分时间是偏多的，所以「押对方向」里绝大多数日子' +
+    '其实是「多头仓 + 上涨日」—— 那测的是<b>这个市场的上涨频率</b>，不是本终端的技能。' +
+    '在十年年化 +69% 的资产上，拿抛硬币当基准必然得出「显著优于随机」的漂亮结论，' +
+    '而它只是 beta。对照躺平之后这个幻觉就消失了。</span>' +
+    '<br><b>配合上面的自相关看，结论是一致的</b>：lag1 自相关 ' +
+    (E.ac[1] == null ? '—' : E.ac[1].toFixed(3)) + '、平均连续同向 ' +
+    (E.meanRun == null ? '—' : E.meanRun.toFixed(1)) + ' 天、符号翻转率仅 ' +
+    (E.flipRate == null ? '—' : (E.flipRate * 100).toFixed(1) + '%') +
+    ' —— <b>这是个慢变量，别用它做日度择时</b>，那是把信号用在它不擅长的频率上。</div>';
+  h += '<div class="rg-sub">' +
+    '<br><b>评分自相关</b>：lag1 <b>' + (E.ac[1] == null ? '—' : E.ac[1].toFixed(3)) + '</b>　' +
+    'lag5 <b>' + (E.ac[5] == null ? '—' : E.ac[5].toFixed(3)) + '</b>　' +
+    'lag10 <b>' + (E.ac[10] == null ? '—' : E.ac[10].toFixed(3)) + '</b>　' +
+    'lag20 <b>' + (E.ac[20] == null ? '—' : E.ac[20].toFixed(3)) + '</b>' +
+    '<br><b>符号翻转率</b> = <b>' + (E.flipRate == null ? '—' : (E.flipRate * 100).toFixed(1) + '%') + '</b>，' +
+    '平均连续同向 <b>' + (E.meanRun == null ? '—' : E.meanRun.toFixed(1)) + '</b> 天。' +
+    '<span class="rg-dim">lag1 自相关若接近 1，说明评分几乎不变、换手天然低；' +
+    '若接近 0，说明评分每天都在抖 —— 那样的信号就算 IC 好看，实盘也会被成本和滑点磨光。</span></div>';
+
+  box.innerHTML = h;
+}
+
+/* ---------- ㉓ 信号健康度的渲染 ---------- */
+function renderHealthBox() {
+  const box = $('healthBox');
+  if (!box) return;
+  const H = state.hist;
+  if (!H || !H.rep) { box.innerHTML = '<div class="rg-sub">需要先跑一次十年回放。</div>'; return; }
+  const S = H.health || (H.health = signalHealth(H.rep, CALIB_H));
+  if (!S) { box.innerHTML = '<div class="rg-sub">数据不足以评估信号健康度。</div>'; return; }
+
+  /* 注意没有 'ok' 这一档了 —— v3.22 实测证明「没检出变化」不等于「健康」，
+   * 把那个词写进界面会让人以为一切正常。中性档改叫「与历史无显著差异」。 */
+  const col = { same: 'var(--dim)', hot: 'var(--green)', cool: 'var(--yellow)', weak: 'var(--yellow)',
+    flipwarn: 'var(--red)', flip: 'var(--red)', dead: 'var(--red)', flat: 'var(--dim)' }[S.key] || 'var(--dim)';
+  let h = '<div class="rg-sub"><b>㉓ 信号健康度</b>：<span style="color:' + col + '"><b>' + S.label + '</b></span>' +
+    '（最近 ' + S.win + ' 天 vs 之前全部，h=' + S.h + '）</div>';
+
+  h += '<div class="rg-sub">最近段 IC = <b>' + (S.icRecent == null ? '—' : S.icRecent.toFixed(3)) + '</b>' +
+    '（t=' + (S.tRecent == null ? '—' : S.tRecent.toFixed(2)) + '，n=' + S.nRecent + '）　' +
+    '对照段 IC = <b>' + (S.icComp == null ? '—' : S.icComp.toFixed(3)) + '</b>（n=' + S.nComp + '）　' +
+    '全样本 IC = <b>' + (S.icFull == null ? '—' : S.icFull.toFixed(3)) + '</b>（t=' +
+    (S.tFull == null ? '—' : S.tFull.toFixed(2)) + '）</div>';
+
+  h += '<div class="rg-sub"><b>Fisher-z 两独立样本检验</b>：z = <b>' + (S.z == null ? '—' : S.z.toFixed(2)) +
+    '</b>，p = <b>' + (S.p == null ? '—' : S.p.toFixed(4)) + '</b>。' +
+    '<span class="rg-dim">对照组取「除最近段以外的全部」而不是全样本 —— 全样本包含最近段，' +
+    '两者不独立，那样算出来的方差是错的。这是很容易做错的一步。</span></div>';
+
+  if (S.posShare != null) {
+    h += '<div class="rg-sub">最近段滚动 IC（60 日窗）为正的比例 = <b>' + (S.posShare * 100).toFixed(0) + '%</b>' +
+      '<span class="rg-dim"> —— 比单点 IC 稳，因为单点 IC 会被某一次极端行情带跑。</span></div>';
+  }
+
+  const verdict = {
+    flip: '<b style="color:var(--red)">信号方向反转（差异显著）</b>：最近段 IC 不仅变小，还翻了符号。' +
+      '这种情况下<b>基于全样本定出的权重不该继续用</b> —— 历史拟合出来的方向已经不成立。',
+    flipwarn: '<b style="color:var(--red)">方向相反，但未达统计显著</b>：最近段 IC 已经翻负，' +
+      '但样本量不足以把它判为「显著变化」。<br>' +
+      '<b>这里最要紧的一句话：功效不足 ≠ 没有问题。</b>点估计已经指反了，' +
+      '只是证据强度还不够 —— 这种状态下照常使用是拿「没检出」当「没问题」，' +
+      '是本终端最不愿意犯的错。保守做法是<b>先减仓</b>，等样本再攒一段。',
+    cool: '<b style="color:var(--yellow)">信号显著降温</b>：最近段 IC 明显低于此前，差异超出抽样噪声。' +
+      '这不代表永久失效（可能是阶段性），但意味着<b>现在该缩小仓位</b>，' +
+      '而不是照搬全样本算出来的建议。',
+    weak: '<b style="color:var(--yellow)">持续走弱</b>：最近段的滚动 IC 长期为负（为正的比例很低）。' +
+      '单点 IC 会被某一波极端行情带跑，滚动 IC 的符号分布更可信 —— ' +
+      '它持续为负说明这不是一次噪声，而是一段<b>持续的失效期</b>。',
+    hot: '<b style="color:var(--green)">信号较此前增强</b>。但这里要压一下兴奋：' +
+      '「近期变好」与「未来会好」是两件事，而且这种事后分段对比本身就是在做多次比较 —— ' +
+      '看得越多，越容易找到一段「变好」的区间。',
+    dead: '最近段的 IC 已经落进<b>噪声区</b>：量级小到与 0 无法区分。' +
+      '这时候正确的动作是<b>不用这个信号</b>，而不是换个参数再试 —— 后者是在拟合噪声。',
+    same: '<b>与历史无显著差异</b>：最近段 IC 与此前量级相当。' +
+      '注意这只说明「没有证据表明它变了」，<b>不等于证明它还在工作</b> —— ' +
+      '它是否仍然显著为正，请看上面最近段的 t 值（' + (S.tRecent == null ? '—' : S.tRecent.toFixed(2)) + '）。',
+    flat: '数据不足以判定。',
+  }[S.key] || '';
+  if (verdict) h += '<div class="rg-sub">' + verdict + '</div>';
+
+  /* 最小可检测效应 —— 没有它，z 不显著一定会被读成「安全」 */
+  if (S.mde) {
+    h += '<div class="rg-sub"><b>这个检验能检出多大的变化？</b>最近段有效样本 n_eff = <b>' +
+      S.neffRecent + '</b>（' + S.nRecent + ' 天 / h=' + S.h + '，重叠窗口折算），' +
+      '对照段 n_eff = <b>' + S.neffComp + '</b>。在这个样本量下，' +
+      '最近段 IC 要跌破 <b>' + S.mde.rLo.toFixed(3) + '</b>（或涨过 <b>' + S.mde.rHi.toFixed(3) + '</b>）' +
+      '才会被判为「显著变化」。实测 <b>' + (S.icRecent == null ? '—' : S.icRecent.toFixed(3)) + '</b>' +
+      (S.icRecent != null && S.icRecent > S.mde.rLo && S.icRecent < S.mde.rHi
+        ? ' —— <b>落在检测带之内，所以 p 不显著</b>。<br>' +
+          '<span class="rg-dim">这句话的含义必须说清楚：<b>是这根尺子不够细，不是说这段没问题</b>。' +
+          '半年窗口在 h=10 下只有 ~' + S.neffRecent + ' 个非重叠观测，' +
+          '想更快检出衰减只能缩短 horizon 或接受更低的置信度 —— 两者都是在拿可靠性换速度。</span>'
+        : ' —— 已越出检测带。') + '</div>';
+  }
+
+  box.innerHTML = h;
 }
