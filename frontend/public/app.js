@@ -842,8 +842,14 @@ function netEdges(A) {
 
 function initNetwork() {
   const cv = $('netCanvas'); if (!cv) return;
-  /* v3.25：径向影响星系图 —— 有筛选结果就默认走它（外生围外围、节点大小=影响强度） */
-  if (NET_OPTS.layout === 'radial') { if (initRadial(cv)) return; }
+  /* v3.25：径向影响星系图 —— 有筛选结果就默认走它（外生围外围、节点大小=影响强度）。
+   * 【必须先把力导向的 rAF 循环停掉】否则上一次力导向留下的循环还在跑，
+   * 而径向节点没有 vx/vy/fixed 字段 —— animateNetwork 会算出 NaN，节点直接飞出画布。
+   * 这是「只换了数据结构、没换掉消费它的循环」的典型后果。 */
+  if (NET_OPTS.layout === 'radial') {
+    netRunning = false; net = null;
+    if (initRadial(cv)) return;
+  }
   const A = netAnalyzed();
   if (!A) {
     if ($('netCount')) $('netCount').textContent = '—';
