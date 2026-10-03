@@ -2095,6 +2095,223 @@ const near = (label, actual, expect, tol) => {
     }
   }
 
+
+  console.log('===== R. 评分幅度分解 / 标尺重标定 / 夹紧代价（v3.24 ㉗㉘㉙）=====');
+  {
+    let s3 = 20261004;
+    const rnd = () => { s3 = (s3 * 1103515245 + 12345) & 0x7fffffff; return s3 / 0x7fffffff; };
+    const rndN = () => { let u = 0, v = 0; while (u === 0) u = rnd(); while (v === 0) v = rnd(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+    const cl = (v, a, b) => Math.max(a, Math.min(b, v));
+
+    /* 造最小 rep。ids 故意用 FACTORS 里不存在的名字 —— fWeight 找不到就回退 w=1
+     * （等权），这样收缩比/一致性才有解析解（1/√k），不会被人写死的权重污染。 */
+    const mkRepS = function (n, start, k, mode, opt) {
+      const o = opt || {};
+      const ids = []; for (let q = 0; q < k; q++) ids.push('zz' + q);
+      const closes = new Array(n).fill(1);
+      let p = 100;
+      for (let i = 0; i < n; i++) { closes[i] = p; p = p * (1 + 0.0006 + 0.02 * rndN()); }
+      const fvals = {}, fraw = {};
+      ids.forEach(id => { fvals[id] = new Array(n).fill(null); fraw[id] = new Array(n).fill(null); });
+      const cs = new Array(n).fill(0);
+      for (let i = start; i < n; i++) cs[i] = o.cAt ? o.cAt(i, closes) : rndN() * 0.5;
+      for (let i = start; i < n; i++) {
+        for (let q = 0; q < k; q++) {
+          let raw;
+          if (mode === 'sync') raw = cs[i];
+          else if (mode === 'indep') raw = rndN() * (o.sd == null ? 1 : o.sd);
+          else raw = (q % 2 ? 1 : -1) * Math.abs(cs[i]);
+          fraw[ids[q]][i] = raw;
+          fvals[ids[q]][i] = cl(raw, -2.5, 2.5);
+        }
+      }
+      const scores = new Array(n).fill(null);
+      for (let i = start; i < n; i++) {
+        let sm = 0; for (let q = 0; q < k; q++) sm += fvals[ids[q]][i];
+        scores[i] = Math.round(cl(50 + 22 * (sm / k), 2, 98));
+      }
+      return { n: n, start: start, closes: closes, scores: scores, fvals: fvals, fraw: fraw,
+        calTs: closes.map((_, i) => Date.now() + i * 86400000) };
+    };
+
+    /* ---- R0 扩张窗口标准化：必须是「只用过去」 ---- */
+    {
+      const c = new Array(400).fill(null);
+      for (let i = 0; i < 400; i++) c[i] = rndN() * 0.5;
+      const E = call('expandZ', c, 120, 0.25, false);
+      let nNull = 0;
+      for (let i = 0; i < 400; i++) if (E.z[i] == null) nNull++;
+      chk('R0 burn-in：前 minN 天不给值', nNull, 120);
+      /* 无前视的直接检验：改未来的 c，过去的 z 一个都不能动 */
+      const i0 = 300;
+      const zBefore = E.z[i0];
+      const c2 = c.slice(); c2[i0 + 7] = 999; c2[399] = -999;
+      const E2 = call('expandZ', c2, 120, 0.25, false);
+      near('R0 无前视：改未来样本不改变过去的 z', E2.z[i0], zBefore, 0);
+      near('R0 无前视：改未来样本也不改变当期的 σ', E2.sg[i0], E.sg[i0], 0);
+      /* 常数序列 ⇒ sd=0 ⇒ 下限必须生效（否则除零） */
+      const cc = new Array(300).fill(0.7);
+      const Ec = call('expandZ', cc, 50, 0.25, false);
+      chk('R0 sd=0 时 σ 下限 100% 生效（不会除零）', Ec.bindRate, 1);
+      chk('R0 sd=0 时 z 仍有限', isFinite(Ec.z[299]), 'true');
+      near('R0 sd=0 时 z = c / 下限', Ec.z[299], 0.7 / 0.25, 1e-12);
+      /* demean 只差一个 μ/σ */
+      const Ed = call('expandZ', c, 120, 0.25, true);
+      near('R0 demean 版 = 非 demean 版 − μ/σ', Ed.z[350], E.z[350] - E.mu[350] / Math.max(E.sg[350], 0.25), 1e-12);
+      /* 解析验算：第 minN 个 z 应等于 (c − μ前120)/σ前120 */
+      let m = 0, m2 = 0;
+      for (let i = 0; i < 120; i++) { m += c[i]; m2 += c[i] * c[i]; }
+      m /= 120; const sd0 = Math.sqrt(m2 / 120 - m * m);
+      near('R0 第 minN 个 z 与解析式一致', E.z[120], c[120] / Math.max(sd0, 0.25), 1e-12);
+      near('R0 第 minN 个 σ 与解析式一致', E.sg[120], sd0, 1e-12);
+    }
+
+    /* ---- R1 幅度分解：收缩比必须有自洽刻度 ---- */
+    {
+      const K = 4;
+      const Ss = call('scoreScale', mkRepS(900, 10, K, 'sync'));
+      const Si = call('scoreScale', mkRepS(900, 10, K, 'indep'));
+      near('R1 完全同步 ⇒ 收缩比 = 1（无收缩）', Ss.shrink, 1, 0.05);
+      near('R1 完全同步 ⇒ 一致性 = 1', Ss.agree, 1, 0.02);
+      near('R1 互相独立 k=4 ⇒ 收缩比 = 1/√4', Si.shrink, 0.5, 0.08);
+      near('R1 互相独立 k=4 ⇒ 一致性 = 1/√4', Si.agree, 0.5, 0.06);
+      near('R1 独立基准 1/√N_eff（等权 k=4 ⇒ N_eff=4）', Si.indepShrink, 0.5, 1e-12);
+      chk('R1 收缩比落在 [独立基准, 1] 之间', Si.shrink >= Si.indepShrink - 0.05 && Si.shrink <= 1.05, 'true');
+      near('R1 标尺常数需求 = 50/(2.5·sd复合)', Ss.mult.need, 50 / (2.5 * Ss.comp.sd), 1e-9);
+      /* 一半对一半反号 ⇒ 复合恒为 0 ⇒ 收缩比应≈0 */
+      const So = call('scoreScale', mkRepS(900, 10, K, 'opp'));
+      near('R1 严格一半对一半反号 ⇒ 收缩比 ≈ 0', So.shrink, 0, 0.05);
+      near('R1 严格反号 ⇒ 一致性 ≈ 0', So.agree, 0, 0.05);
+      /* 夹紧统计 */
+      const Ssmall = call('scoreScale', mkRepS(600, 10, 3, 'sync', { cAt: () => 1.0 }));
+      chk('R1 |zRaw| 恒 < 2.5 ⇒ 撞顶占比 = 0', Ssmall.per.every(p => p.pClamp === 0), 'true');
+      chk('R1 |zRaw| 恒 < 2.5 ⇒ sd 损失 = 0', Ssmall.per.every(p => Math.abs(p.lossSd) < 1e-12), 'true');
+      /* raw 必须「都超过 2.5」但「彼此不同」 —— 若写成恒定 9.0，sdRaw 也是 0，
+       * 1 − 0/0 无定义，损失反而算不出来（这是自己写错的断言，留作警示）。 */
+      const Sbig = call('scoreScale', mkRepS(600, 10, 3, 'sync', { cAt: i => 3 + (i % 11) * 0.4 }));
+      chk('R1 |zRaw| = 9 ⇒ 撞顶占比 = 1', Sbig.per.every(p => Math.abs(p.pClamp - 1) < 1e-12), 'true');
+      chk('R1 |zRaw| = 9 ⇒ 并列占比 = 1（区分度全失）', Sbig.per.every(p => Math.abs(p.pTie - 1) < 1e-12), 'true');
+      chk('R1 全被压成同一个值 ⇒ sd = 0 ⇒ 损失 100%', Sbig.per.every(p => Math.abs(p.lossSd - 1) < 1e-12), 'true');
+    }
+
+    /* ---- R2 标尺重标定：幅度要涨，IC 不许凭空涨 ---- */
+    {
+      /* 真信号：c 与未来 10 日收益成正比 */
+      const repSig = mkRepS(1000, 10, 5, 'sync', { cAt: (i, cl2) => cl(30 * ((cl2[i + 10] || cl2[i]) / cl2[i] - 1), -2.4, 2.4) });
+      const R1r = call('scoreRescale', repSig);
+      chk('R2 有信号时旧标尺 IC 显著为正', R1r.ic.old > 0.2, 'true');
+      chk('R2 重标定后 IC 仍显著为正（信号没被弄丢）', R1r.ic.neu > 0.2, 'true');
+      chk('R2 IC 变化很小（换标尺，不是塞信息）', Math.abs(R1r.ic.neu - R1r.ic.old) < 0.03, 'true');
+      chk('R2 重标定后评分仍落在 [2,98]', R1r.range.neu[0] >= 2 && R1r.range.neu[1] <= 98, 'true');
+      /* 强信号场景（σ 已接近 2.5）下，旧标尺本来就在两端饱和，重标定反而把它**收窄**
+       * —— 这是正确行为，不是 bug。真正该守的是「收敛到 sd ≈ 22」。 */
+      near('R2 强幅度序列重标定后 sd 收敛到 22（不再靠撞顶刷幅度）', R1r.sd.neu, 22, 4);
+      chk('R2 强幅度序列本来就在饱和（旧 sd 被边界压住）', R1r.satRateOld > 0, 'true');
+      /* 弱幅度场景（σ 远小于 2.5，= 真实数据的情形）才是「撑开」的主战场 */
+      const repWeak = mkRepS(1000, 10, 5, 'sync', { cAt: (i, cl2) => cl(6 * ((cl2[i + 10] || cl2[i]) / cl2[i] - 1), -2.4, 2.4) });
+      const Rw = call('scoreRescale', repWeak);
+      chk('R2 弱幅度：重标定后 sd 变大', Rw.sd.neu > Rw.sd.old * 1.5, 'true');
+      chk('R2 弱幅度：平均 |w| 变大', Rw.w.neuAvg > Rw.w.oldAvg * 1.5, 'true');
+      chk('R2 弱幅度：评分范围被撑开', (Rw.range.neu[1] - Rw.range.neu[0]) > (Rw.range.old[1] - Rw.range.old[0]), 'true');
+      chk('R2 弱幅度：IC 仍然守得住（信号没被弄丢）', Rw.ic.neu > 0.2 && Math.abs(Rw.ic.neu - Rw.ic.old) < 0.03, 'true');
+      /* 无前视：动未来，过去分数不动 */
+      const i0 = 500;
+      const sBefore = R1r.scores[i0];
+      const rep2 = JSON.parse(JSON.stringify({ f: repSig.fvals }));
+      const ids = Object.keys(repSig.fvals);
+      const saved = ids.map(id => repSig.fvals[id][i0 + 9]);
+      ids.forEach(id => { repSig.fvals[id][i0 + 9] = 2.4; });
+      const R2r = call('scoreRescale', repSig);
+      ids.forEach((id, q) => { repSig.fvals[id][i0 + 9] = saved[q]; });
+      chk('R2 无前视：改未来因子值不改变过去的评分', R2r.scores[i0], sBefore);
+      /* σ 下限防爆：σ 塌陷期不能冒出爆炸分数 */
+      const repFlat = mkRepS(600, 10, 5, 'sync', { cAt: i => (i < 200 ? 0.001 : 2.4) });
+      const R3r = call('scoreRescale', repFlat);
+      let allFin = true, allIn = true;
+      for (let i = 0; i < repFlat.n; i++) {
+        if (R3r.scores[i] == null) continue;
+        if (!isFinite(R3r.scores[i])) allFin = false;
+        if (R3r.scores[i] < 2 || R3r.scores[i] > 98) allIn = false;
+      }
+      chk('R2 σ 塌陷期分数全部有限（下限生效）', allFin, 'true');
+      chk('R2 σ 塌陷期分数不越界', allIn, 'true');
+      chk('R2 σ 下限确有触发', R3r.bindRate > 0, 'true');
+      /* 饱和度：极端序列必然撞到两端 */
+      chk('R2 饱和率在 [0,1]', R3r.satRate >= 0 && R3r.satRate <= 1, 'true');
+      chk('R2 极端序列的饱和率高于普通序列', R3r.satRate > R1r.satRate, 'true');
+      /* burn-in：起手不给值 */
+      chk('R2 有效起点 = start + minN', R1r.lo, 10 + 120);
+    }
+
+    /* ---- R3 夹紧代价：撞顶因子由数据点名 ---- */
+    {
+      const repBig = mkRepS(700, 10, 4, 'sync', { cAt: i => 3 + (i % 11) * 0.4 });
+      const K1 = call('clampCost', repBig);
+      chk('R3 撞顶因子被识别出来', K1.worst.length, 4);
+      chk('R3 撞顶比例被量化为 100%', Math.abs(K1.worst[0].pClamp - 1) < 1e-12, 'true');
+      chk('R3 对照实验有结果', K1.cmp != null, 'true');
+      chk('R3 对照实验覆盖了被点名的因子', K1.cmp.ids.length > 0, 'true');
+      chk('R3 重标定后撞顶比例下降', K1.cmp.per[K1.cmp.ids[0]].pClampAfter <= 1, 'true');
+      const repOk = mkRepS(700, 10, 4, 'sync', { cAt: () => 0.8 });
+      const K2 = call('clampCost', repOk);
+      chk('R3 不撞顶时 worst 为空', K2.worst.length, 0);
+      chk('R3 不撞顶时对照实验为空', K2.cmp, null);
+    }
+
+    /* ---- R4 面板渲染 ---- */
+    {
+      const repR = mkRepS(900, 10, 5, 'sync', { cAt: (i, cl2) => cl(30 * ((cl2[i + 10] || cl2[i]) / cl2[i] - 1), -2.4, 2.4) });
+      state.hist = { rep: repR };
+      let okR = true, msgR = '';
+      try { call('renderScaleBox'); } catch (e) { okR = false; msgR = e && e.message; }
+      chk('R4 面板渲染不抛异常', okR, 'true' + (msgR ? ' (' + msgR + ')' : ''));
+      const hb = $id('scaleBox').innerHTML || '';
+      chk('R4 面板点出实测评分范围', hb.indexOf('20') >= 0 || hb.indexOf('理论标尺') >= 0, 'true');
+      chk('R4 面板含三道压缩的分解', hb.indexOf('平均化收缩') >= 0, 'true');
+      chk('R4 面板含标尺重标定对照', hb.indexOf('扩张窗口') >= 0, 'true');
+      chk('R4 面板含 IC 变化的判定', hb.indexOf('IC 变化') >= 0, 'true');
+      chk('R4 面板含 σ 下限的触发率', hb.indexOf('触发率') >= 0, 'true');
+      chk('R4 面板含饱和度警示', hb.indexOf('饱和率') >= 0, 'true');
+      chk('R4 面板含夹紧代价', hb.indexOf('这道夹紧') >= 0, 'true');
+      /* ㉙ 的对照实验只在「确有因子撞顶」时才渲染，所以另造一个撞顶 rep 单独验 */
+      const repClamp = mkRepS(900, 10, 5, 'sync', { cAt: (i, cl2) => cl(3 + 30 * ((cl2[i + 10] || cl2[i]) / cl2[i] - 1), -50, 50) });
+      state.hist = { rep: repClamp };
+      call('renderScaleBox');
+      const hc = $id('scaleBox').innerHTML || '';
+      chk('R4 撞顶因子被面板点名', hc.indexOf('撞顶超过') >= 0, 'true');
+      chk('R4 面板给出对照实验', hc.indexOf('对照实验') >= 0, 'true');
+      chk('R4 面板给出对照实验的 IC 结论（提升/没提升二选一）', hc.indexOf('提升') >= 0, 'true');
+      /* 空态 */
+      state.hist = null;
+      let okE = true;
+      try { call('renderScaleBox'); } catch (e) { okE = false; }
+      chk('R4 未回放时安全降级', okE, 'true');
+      chk('R4 提示需要先跑回放', ($id('scaleBox').innerHTML || '').indexOf('需要先跑一次十年回放') >= 0, 'true');
+      state.hist = null;
+    }
+
+    /* ---- R5 连锁影响：换标尺 ≠ 变聪明 ---- */
+    {
+      const repI = mkRepS(1200, 10, 5, 'sync', { cAt: (i, cl2) => cl(6 * ((cl2[i + 10] || cl2[i]) / cl2[i] - 1), -2.4, 2.4) });
+      const RI = call('scoreRescale', repI);
+      const IM = call('rescaleImpact', repI, RI);
+      chk('R5 连锁影响有结果', IM != null, 'true');
+      chk('R5 校正标尺后平均 |w| 变大', IM.wNeu > IM.wOld, 'true');
+      chk('R5 校正标尺后 timing 的绝对值变大', Math.abs(IM.timingNeu) > Math.abs(IM.timingOld), 'true');
+      /* 归因恒等式在两种标尺下都必须成立 —— 换标尺不能把它换坏 */
+      chk('R5 原标尺归因恒等式成立', Math.abs(IM.old.attr.totalY - (IM.old.attr.betaY + IM.old.attr.timingY)) < 1e-9, 'true');
+      chk('R5 校正标尺归因恒等式成立', Math.abs(IM.neu.attr.totalY - (IM.neu.attr.betaY + IM.neu.attr.timingY)) < 1e-9, 'true');
+      /* 夏普是尺度无关的：年化涨了，夏普不该同比例涨 */
+      chk('R5 年化确实变了', Math.abs(IM.dNet) > 0.01, 'true');
+      chk('R5 但夏普变化远小于年化变化（夏普对缩放免疫）', Math.abs(IM.dSh) < 0.6, 'true');
+      /* 买入持有作为参照：timing 必须恰好为 0 */
+      near('R5 买入持有 timing = 0（纯 beta）', IM.bh.attr.timingY, 0, 1e-12);
+      near('R5 买入持有 beta = 市场年化', IM.bh.attr.betaY, IM.bh.mktY, 1e-9);
+      /* 比较区间必须对齐，否则两组数字不可比 */
+      chk('R5 两组用同一个起点', IM.lo, RI.lo);
+    }
+  }
+
   console.log('\n' + (fail ? `❌ 失败 ${fail} 项` : '✅ 全部断言通过'));
   process.exit(fail ? 1 : 0);
 })().catch(e => { console.error('FATAL', e.stack || e.message); process.exit(1); });

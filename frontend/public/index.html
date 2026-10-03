@@ -308,6 +308,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
           <div class="fscore-center"><div id="nxScore" class="fscore-n">—</div><div id="nxSig" class="fscore-l n">—</div></div>
         </div>
       </div>
+      <div id="nxCal" class="fnote" style="display:none;margin:-2px 0 6px"></div>
       <div class="fnote">每个因子先算 z（相对自身历史的偏离），再乘方向 dir 得到多空贡献：<b style="color:var(--green)">绿=利多</b> · <b style="color:var(--red)">红=利空</b> · 灰「仅展示」不参与评分。悬停卡片可看权重与原始 z。</div>
       <div id="factorGrid" class="fgrid"></div>
       <div class="sub2" style="margin-top:2px">
@@ -363,6 +364,9 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
     </div>
     <div class="hgrid">
       <div class="hbox" id="selectBox" style="grid-column:1/-1"></div>
+    </div>
+    <div class="hgrid">
+      <div class="hbox" id="scaleBox" style="grid-column:1/-1"></div>
     </div>
     <div class="hgrid">
       <div class="hbox" style="grid-column:1/-1">

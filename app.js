@@ -658,12 +658,17 @@ function computeNexusScore(ids) {
     }
     const z = clampZ(r.z);
     const contribution = Math.max(-2.5, Math.min(2.5, (f.dir || 0) * z));   // 方向化贡献
-    out[f.id] = { z, contribution, dir: f.dir || 0, note: r.note, ok: has, stale: r.stale === true, evTime: r.ev };
+    /* v3.24：zRaw = clamp 之前的原始 z。评分幅度诊断要分清「因子本身温和」与
+     * 「被 ±2.5 截断」这两种完全不同的成因 —— 只看夹紧后的值永远分不开。 */
+    out[f.id] = { z, contribution, zRaw: isFinite(r.z) ? r.z : null, dir: f.dir || 0, note: r.note, ok: has, stale: r.stale === true, evTime: r.ev };
     if (f.dir && has) { sum += contribution * f.w; wsum += f.w; nScored++; }
     else if (f.dir && !has) nDead++;
   });
-  const score = Math.round(50 + (wsum ? sum / wsum : 0) * 22);
-  return { score: Math.max(2, Math.min(98, score)), out, nScored, nDead };
+  const cRaw = wsum ? sum / wsum : 0;
+  const score = Math.round(50 + cRaw * 22);
+  /* v3.24：把夹紧前的复合值 cRaw 一并带出去。实时模式的标尺校正要用它 ——
+   * score 已经被 round + clamp 到 2–98，取整和截断都不可逆，拿它反推会失真。 */
+  return { score: Math.max(2, Math.min(98, score)), c: cRaw, out, nScored, nDead };
 }
 
 /* =====================================================================
@@ -1634,6 +1639,20 @@ function renderFactors() {
   const ring = $('nxRing'); if (ring) { ring.setAttribute('stroke-dasharray', `${score * 2.51} 251`); ring.setAttribute('stroke', score > 60 ? '#00e5a0' : score < 40 ? '#ff3d6e' : '#ffc107'); }
   if ($('nxScore')) $('nxScore').textContent = score;
   if ($('nxSig')) { const s = score > 60 ? '偏多' : score < 40 ? '偏空' : '中性'; $('nxSig').textContent = s; $('nxSig').className = 'fscore-l ' + (score > 60 ? 'up' : score < 40 ? 'dn' : 'n'); }
+  /* v3.24 ㉘：实时评分旁挂一个「标尺校正后」的分数。σ 来自回放末端，
+   * 没跑过回放就整块不显示 —— 编一个 σ 等于编一个结论。 */
+  {
+    const calEl = $('nxCal');
+    if (calEl) {
+      const rl = (typeof rescaleLive === 'function') ? rescaleLive(res) : null;
+      if (rl) {
+        calEl.style.display = '';
+        calEl.innerHTML = '标尺校正后 <b style="color:' + (rl.score > 60 ? 'var(--green)' : rl.score < 40 ? 'var(--red)' : 'var(--gold)') + '">' +
+          rl.score + '</b>（z=' + rl.z.toFixed(2) + '，σ=' + rl.sg.toFixed(2) + '，取自 ' + rl.n + ' 天回放末端）· ' +
+          '<span style="opacity:.7">同一套权重，只把标尺换成「相对自身近期波动」—— 排序基本不变，幅度可用。</span>';
+      } else calEl.style.display = 'none';
+    }
+  }
   const box = $('factorGrid'); if (!box) return; box.innerHTML = '';
   FACTORS.forEach(f => {
     if (f.replayOnly) return;            // 回放专用因子不出现在实时面板
@@ -1837,7 +1856,7 @@ function replayHistory() {
   /* v3.9：逐日收集「每个因子的方向化贡献」，用于单项因子 IC 归因。
    * v3.11：同时收集原始 z —— 极端行情归因要回答的是「这次暴跌，是哪些因子
    * 处在极端位置」，看的是 z 本身，而不是已经乘过方向、被裁剪到 ±2.5 的贡献。 */
-  const fvals = {}, fzs = {};
+  const fvals = {}, fzs = {}, fraw = {};
   let nScored = 0;
   state.interval = '1d';
   if (ser.HR) state.chainSeries.hashrate = ser.HR.v;
@@ -1855,9 +1874,10 @@ function replayHistory() {
       for (const fid in r.out) {
         const o = r.out[fid];
         if (o.dir && o.ok) {
-          if (!fvals[fid]) { fvals[fid] = new Array(n).fill(null); fzs[fid] = new Array(n).fill(null); }
+          if (!fvals[fid]) { fvals[fid] = new Array(n).fill(null); fzs[fid] = new Array(n).fill(null); fraw[fid] = new Array(n).fill(null); }
           fvals[fid][i] = o.contribution;
           fzs[fid][i] = o.z;
+          fraw[fid][i] = o.zRaw;
         }
       }
     }
@@ -1868,7 +1888,7 @@ function replayHistory() {
     state.macroSeries = keep.series; state.zT = keep.zT;
     state.btcZ = keep.btcZ; state.klIdx = keep.klIdx;
   }
-  return { calTs, closes, scores, fvals, fzs, start, n, nScored, nAct,
+  return { calTs, closes, scores, fvals, fzs, fraw, start, n, nScored, nAct,
     minActive: REPLAY_MIN_ACTIVE, activeAt: nActiveAt, srcs: H.srcs || {} };
 }
 
@@ -2710,6 +2730,8 @@ function renderHistory() {
   try { renderPolicyBox(); } catch (e) { console.warn('policy box fail', e && e.message); }
   try { renderAttrBox(); } catch (e) { console.warn('attr box fail', e && e.message); }
   try { renderSelectBox(); } catch (e) { console.warn('select box fail', e && e.message); }
+  /* v3.24 ㉗㉘㉙：评分幅度分解 / 标尺重标定 / 夹紧代价 */
+  try { renderScaleBox(); } catch (e) { console.warn('scale box fail', e && e.message); }
   renderOOS(S.oos);
   drawRollChart($('rollCanvas'), S.roll);
   drawHistChart($('histCanvas'), rep);
@@ -6946,4 +6968,544 @@ function renderSelectBox() {
       '换句话说：<b>一个"夏普显著为正"的策略，可能只是"端着多头仓"而已</b>。</span></div>';
   }
   box.innerHTML = h;
+}
+
+/* =====================================================================
+ *  v3.24 · 评分为什么只用了一半标尺（20–77，而不是 0–100）
+ *  ---------------------------------------------------------------------
+ *  承接 v3.23 敞口诊断那个数：平均 |w| 只有 0.15，不是因为「不敢下注」，
+ *  而是因为评分本身几乎不动。这一版不再绕开它，直接把它拆开。
+ *
+ *  拆解结论必须是可归因的，否则「幅度小」只是一个没有行动价值的观感。
+ *  复合评分 c = Σw·(dir·z) / Σw，从单个因子到 0–100 的分数，中间有
+ *  三道独立的压缩，各自可量化、各自可修：
+ *
+ *    A. 单因子自身幅度 —— z 的标定就是不是 sd=1？（实测中位数 1.28，健康）
+ *    B. 夹紧截断 —— ±2.5 之后所有极端变成同一个值（技术面 42% 的时间在撞顶）
+ *    C. 平均化收缩 —— 除以 Σw 之后，N 个信号的加权平均必然比单个信号窄
+ *       √(N_eff) 倍（实测收缩到 1/3，这是构造性的，不是 bug）
+ *    D. 标尺常数 —— 22 是按「c 能到 ±2.5」定的，但 c 实测只到 ±1.3
+ *
+ *  其中只有 C 是「必须接受」的（任何因子平均模型都有），A/B/D 都可修。
+ *
+ *  ㉗ 幅度分解 scoreScale：把 A/B/C/D 各自的贡献量化出来并指明谁是主因
+ *  ㉘ 标尺重标定 scoreRescale：**扩张窗口**（只用过去，无前视）把 c 标准化，
+ *     再套同一个 22 倍映射。诚实的前提：这不产生新信息，只让标尺可用 ——
+ *     所以必须同时报「新旧两套评分的 IC」，若 IC 变了要如实说明
+ *  ㉙ 夹紧代价 clampCost：逐因子量化 B，并对撞顶最狠的因子做重标定对照
+ * ===================================================================== */
+
+const SCALE_MIN_N = 120;        // 扩张窗口 burn-in：不足这么多天不给标准化值
+const SCALE_SIG_FLOOR = 0.25;   // σ 下限：σ 塌陷时除以小数会把噪声放大成信号
+const SCALE_MULT = 22;          // 与现行标尺同一个乘数，保证「只改标尺不改权重」
+const SCALE_CLAMP = 2.5;        // 与 clampZ 一致
+
+/* 把每帧「加权平均、尚未乘 22 的原始复合值 c」重建出来。
+ * rep.scores = round(clamp(50 + 22·c))，取整与截断都不可逆，
+ * 所以幅度分析必须回到 fvals（方向化贡献）按权重重算，不能拿 rep.scores 反推。
+ * replace 用于 ㉙ 的对照实验：把某些因子的贡献换成重标定后的版本。 */
+function compositeRaw(rep, replace) {
+  if (!rep || !rep.fvals) return null;
+  const ids = Object.keys(rep.fvals), n = rep.n;
+  const c = new Array(n).fill(null), k = new Array(n).fill(0);
+  for (let i = rep.start; i < n; i++) {
+    let s = 0, ws = 0, kk = 0;
+    for (let q = 0; q < ids.length; q++) {
+      const id = ids[q];
+      let v = rep.fvals[id][i];
+      if (v == null || !isFinite(v)) continue;
+      if (replace && replace[id]) {
+        const rv = replace[id][i];
+        if (rv != null && isFinite(rv)) v = rv;
+      }
+      const w = fWeight(id);
+      s += v * w; ws += w; kk++;
+    }
+    if (kk >= 3 && ws > 0) { c[i] = s / ws; k[i] = kk; }
+  }
+  return { c: c, k: k, ids: ids };
+}
+
+/* 扩张窗口标准化：t 时刻的 μ/σ 只用 t 之前的样本算。
+ * 用全样本 σ 去标准化是前视 —— 那是把「未来十年评分波动多大」偷偷喂给了第一天。
+ * demean=false 时只除 σ 不减 μ，保留「50 = 因子中性」这个语义锚点。 */
+function expandZ(c, minN, sigFloor, demean) {
+  const n = c.length;
+  const z = new Array(n).fill(null), mu = new Array(n).fill(null), sg = new Array(n).fill(null);
+  const mn = minN == null ? SCALE_MIN_N : minN;
+  const fl = sigFloor == null ? SCALE_SIG_FLOOR : sigFloor;
+  let s = 0, s2 = 0, k = 0, bind = 0, tot = 0;
+  for (let i = 0; i < n; i++) {
+    const v = c[i];
+    if (v == null || !isFinite(v)) continue;
+    if (k >= mn) {
+      const m = s / k;
+      const sd0 = Math.sqrt(Math.max(s2 / k - m * m, 0));
+      const use = Math.max(sd0, fl);
+      tot++; if (sd0 < fl) bind++;
+      mu[i] = m; sg[i] = sd0;
+      z[i] = (demean ? (v - m) : v) / use;
+    }
+    s += v; s2 += v * v; k++;
+  }
+  const qs = sg.filter(function (x) { return x != null; }).sort(function (a, b) { return a - b; });
+  const qv = function (p) { return qs.length ? qs[Math.min(qs.length - 1, Math.max(0, Math.floor(p * (qs.length - 1))))] : null; };
+  return {
+    z: z, mu: mu, sg: sg, nScored: tot, bindRate: tot ? bind / tot : null,
+    sigQ: { p05: qv(.05), p25: qv(.25), p50: qv(.5), p75: qv(.75), p95: qv(.95), min: qs.length ? qs[0] : null },
+  };
+}
+
+const v3mean = a => a.reduce(function (x, y) { return x + y; }, 0) / a.length;
+function v3sd(a) { if (a.length < 2) return null; const m = v3mean(a); let v = 0; for (let i = 0; i < a.length; i++) v += (a[i] - m) * (a[i] - m); return Math.sqrt(v / (a.length - 1)); }
+const v3q = (a, p) => { const b = a.slice().sort(function (x, y) { return x - y; }); return b.length ? b[Math.min(b.length - 1, Math.max(0, Math.floor(p * (b.length - 1))))] : null; };
+
+/* ---------------------------------------------------------------
+ * ㉗ 幅度分解：A/B/C/D 各自吃了多少
+ * --------------------------------------------------------------- */
+function scoreScale(rep) {
+  if (!rep || !rep.fvals) return null;
+  const ids = Object.keys(rep.fvals);
+  const per = [];
+  let sw = 0, sw2 = 0;
+  ids.forEach(function (id) {
+    const w = fWeight(id); sw += w; sw2 += w * w;
+    const raw = [], cl = [];
+    let nClamp = 0, nTie = 0, nDay = 0;
+    for (let i = rep.start; i < rep.n; i++) {
+      const b = rep.fvals[id][i];
+      if (b == null || !isFinite(b)) continue;
+      nDay++;
+      cl.push(b);
+      const a = (rep.fraw && rep.fraw[id]) ? rep.fraw[id][i] : null;
+      if (a != null && isFinite(a)) {
+        raw.push(a);
+        if (Math.abs(a) > SCALE_CLAMP + 1e-12) nClamp++;
+      }
+      if (Math.abs(Math.abs(b) - SCALE_CLAMP) < 1e-9) nTie++;
+    }
+    if (!nDay) return;
+    const sdR = raw.length > 5 ? v3sd(raw) : null, sdC = cl.length > 5 ? v3sd(cl) : null;
+    per.push({
+      id: id, name: fName(id), w: w, nDay: nDay, sdRaw: sdR, sdCl: sdC,
+      meanAbsRaw: raw.length ? v3mean(raw.map(Math.abs)) : null,
+      meanAbsCl: v3mean(cl.map(Math.abs)),
+      pClamp: raw.length ? nClamp / raw.length : null,
+      pTie: nTie / nDay,
+      /* sdCl = 0 是合法且最极端的一种结果（夹紧吃光了全部方差 = 100% 损失），
+       * 不能写成 `sdR && sdC && ...` —— 0 是 falsy，会把这一档静默变成 null。
+       * 必须显式判 null。 */
+      lossSd: (sdR != null && sdC != null && sdR > 0) ? 1 - sdC / sdR : null,
+    });
+  });
+  per.sort(function (a, b) { return (b.pClamp == null ? -1 : b.pClamp) - (a.pClamp == null ? -1 : a.pClamp); });
+
+  const CR = compositeRaw(rep);
+  if (!CR) return null;
+  const cs = CR.c.filter(function (v) { return v != null; });
+  if (cs.length < 60) return null;
+  /* 单因子的「典型幅度」用加权 RMS —— 与复合同口径，可比 */
+  const rms = [];
+  for (let i = rep.start; i < rep.n; i++) {
+    let ss = 0, ws = 0, kk = 0;
+    for (let q = 0; q < ids.length; q++) {
+      const v = rep.fvals[ids[q]][i]; if (v == null || !isFinite(v)) continue;
+      const w = fWeight(ids[q]); ss += v * v * w; ws += w; kk++;
+    }
+    if (kk >= 3 && ws > 0) rms.push(Math.sqrt(ss / ws));
+  }
+  const sdComp = v3sd(cs), rmsAvg = v3mean(rms);
+  /* 一致性：|加权平均| / 加权|z|。≈1 全体共振，≈1/√N_eff 随机独立 */
+  const ag = [], ab = [];
+  for (let i = rep.start; i < rep.n; i++) {
+    let s = 0, sa = 0, ws = 0, kk = 0;
+    for (let q = 0; q < ids.length; q++) {
+      const v = rep.fvals[ids[q]][i]; if (v == null || !isFinite(v)) continue;
+      const w = fWeight(ids[q]); s += v * w; sa += Math.abs(v) * w; ws += w; kk++;
+    }
+    if (kk >= 3 && ws > 0) { ag.push(Math.abs(s / ws)); ab.push(sa / ws); }
+  }
+  const nEffW = sw2 > 0 ? sw * sw / sw2 : null;
+  const indepShrink = nEffW ? 1 / Math.sqrt(nEffW) : null;
+  const agree = (v3mean(ab) > 0) ? v3mean(ag) / v3mean(ab) : null;
+  /* 「完全没有收缩」的基准：若所有因子完全同步（相关系数 = 1），复合的 sd
+   * 就等于各因子 sd 的加权平均。拿这个当分母，收缩比才有干净的刻度：
+   *   1.00 = 全体同步（无收缩）  1/√N_eff = 互相独立（最大收缩）
+   * 早期版本用「当日加权 RMS」当分母，那个量对高斯分布恒比 sd 大 1.25 倍，
+   * 于是「完全同步」会算出 1.25 —— 刻度不自洽，无法和 1/√N_eff 直接比。 */
+  let sfw = 0, sfs = 0;
+  per.forEach(function (p) { if (p.sdCl != null) { sfw += p.w; sfs += p.w * p.sdCl; } });
+  const sdFac = sfw > 0 ? sfs / sfw : null;
+  const sc = rep.scores.filter(function (v) { return v != null; });
+  return {
+    n: cs.length, per: per,
+    comp: { sd: sdComp, mean: v3mean(cs), min: Math.min.apply(null, cs), max: Math.max.apply(null, cs) },
+    rmsFactor: rmsAvg, sdFac: sdFac, shrink: (sdFac > 0) ? sdComp / sdFac : null,
+    nEffW: nEffW, indepShrink: indepShrink,
+    agree: agree, agreeIndep: indepShrink,
+    mult: { cur: SCALE_MULT, need: sdComp > 0 ? 50 / (2.5 * sdComp) : null },
+    score: { sd: sc.length ? v3sd(sc) : null, min: sc.length ? Math.min.apply(null, sc) : null, max: sc.length ? Math.max.apply(null, sc) : null,
+      p05: v3q(sc, .05), p50: v3q(sc, .5), p95: v3q(sc, .95) },
+    nFac: ids.length,
+  };
+}
+
+/* ---------------------------------------------------------------
+ * ㉘ 标尺重标定：扩张窗口标准化 + 新旧双标尺对照
+ * --------------------------------------------------------------- */
+function scoreRescale(rep, opts) {
+  const o = opts || {};
+  const CR = compositeRaw(rep);
+  if (!CR) return null;
+  const E = expandZ(CR.c, o.minN, o.sigFloor, false);
+  if (!E.nScored) return null;
+  /* 只除 σ（保留 50 = 因子中性的锚点） */
+  const sc1 = new Array(rep.n).fill(null);
+  /* 同时减 μ（把「近期平均」重新定义为 50）—— 会改变分数的跨期含义，单列对照 */
+  const E2 = expandZ(CR.c, o.minN, o.sigFloor, true);
+  const sc2 = new Array(rep.n).fill(null);
+  for (let i = 0; i < rep.n; i++) {
+    if (E.z[i] != null) sc1[i] = Math.round(Math.max(2, Math.min(98, 50 + SCALE_MULT * Math.max(-SCALE_CLAMP, Math.min(SCALE_CLAMP, E.z[i])))));
+    if (E2.z[i] != null) sc2[i] = Math.round(Math.max(2, Math.min(98, 50 + SCALE_MULT * Math.max(-SCALE_CLAMP, Math.min(SCALE_CLAMP, E2.z[i])))));
+  }
+  const h = o.h || 10;
+  const lo = Math.max(rep.start, E.z.findIndex(function (v) { return v != null; }));
+  const icOld = icCore(rep.scores, rep, h, lo, rep.n);
+  const icNew = icCore(sc1, rep, h, lo, rep.n);
+  const icDemean = icCore(sc2, rep, h, lo, rep.n);
+  /* 样本外：后 40% 单独再算一遍（前段只用来烧入窗口，不参与挑参） */
+  const cut = lo + Math.round((rep.n - lo) * 0.6);
+  const oosOk = (cut - lo >= 120) && (rep.n - cut >= 120);
+  const oosOld = oosOk ? icCore(rep.scores, rep, h, cut, rep.n) : null;
+  const oosNew = oosOk ? icCore(sc1, rep, h, cut, rep.n) : null;
+
+  const wOld = [], wNew = [];
+  for (let i = lo; i < rep.n; i++) {
+    if (rep.scores[i] != null) wOld.push(Math.min(1, Math.abs((rep.scores[i] - 50) / 50)));
+    if (sc1[i] != null) wNew.push(Math.min(1, Math.abs((sc1[i] - 50) / 50)));
+  }
+  const s1 = sc1.filter(function (v) { return v != null; });
+  const s2v = sc2.filter(function (v) { return v != null; });
+  /* 饱和率：评分被压在 2 或 98（对应 |z| > 2.18）的天数占比。
+   * 标尺放大之后必然有一批值撞到两端，不报这个数就等于默认「98 分就是 98 分」——
+   * 实际上 98 分里塞着所有 z > 2.18 的日子，它们之间已经没有区分度了。 */
+  let sat = 0;
+  for (let i = lo; i < rep.n; i++) if (sc1[i] === 2 || sc1[i] === 98) sat++;
+  const nSc = rep.n - lo;
+  let satOld = 0;
+  for (let i = rep.start; i < rep.n; i++) if (rep.scores[i] === 2 || rep.scores[i] === 98) satOld++;
+  return {
+    satRate: nSc ? sat / nSc : null, satRateOld: (rep.n - rep.start) ? satOld / (rep.n - rep.start) : null,
+    lo: lo, h: h, minN: o.minN == null ? SCALE_MIN_N : o.minN, sigFloor: o.sigFloor == null ? SCALE_SIG_FLOOR : o.sigFloor,
+    scores: sc1, scoresDemean: sc2, z: E.z, sg: E.sg, mu: E.mu,
+    bindRate: E.bindRate, sigQ: E.sigQ, nScored: E.nScored,
+    ic: { old: icOld ? icOld.spear : null, oldT: icOld ? icOld.t : null,
+      neu: icNew ? icNew.spear : null, neuT: icNew ? icNew.t : null,
+      dem: icDemean ? icDemean.spear : null, demT: icDemean ? icDemean.t : null },
+    oos: oosOk ? { old: oosOld ? oosOld.spear : null, neu: oosNew ? oosNew.spear : null, cut: cut } : null,
+    range: { old: [Math.min.apply(null, rep.scores.filter(function (v) { return v != null; })), Math.max.apply(null, rep.scores.filter(function (v) { return v != null; }))],
+      neu: [Math.min.apply(null, s1), Math.max.apply(null, s1)],
+      dem: [Math.min.apply(null, s2v), Math.max.apply(null, s2v)] },
+    sd: { old: v3sd(rep.scores.filter(function (v) { return v != null; })), neu: v3sd(s1), dem: v3sd(s2v) },
+    w: { oldAvg: wOld.length ? v3mean(wOld) : null, oldP95: wOld.length ? v3q(wOld, .95) : null,
+      neuAvg: wNew.length ? v3mean(wNew) : null, neuP95: wNew.length ? v3q(wNew, .95) : null },
+  };
+}
+
+/* ---------------------------------------------------------------
+ * ㉙ 夹紧代价：±2.5 这道截断到底吃掉了什么
+ * --------------------------------------------------------------- */
+function clampCost(rep, opts) {
+  const o = opts || {};
+  const S = scoreScale(rep);
+  if (!S) return null;
+  const fixIds = o.fix || null;
+  /* 撞击最狠的前几个因子 —— 不写死 tech/mom，让数据自己说 */
+  const worst = S.per.filter(function (p) { return p.pClamp != null && p.pClamp > 0.08; });
+  const fix = fixIds || worst.slice(0, 3).map(function (p) { return p.id; });
+  /* 对照实验：把撞顶因子的 z 用**扩张窗口**自身标准差归一化（不是全样本 sd，那是前视），
+   * 再夹紧回 ±2.5。这样「极端」仍然极端，但不再被压成同一个值。 */
+  const replace = {};
+  const per = {};
+  fix.forEach(function (id) {
+    const rawArr = (rep.fraw && rep.fraw[id]) ? rep.fraw[id] : null;
+    if (!rawArr) return;
+    const hasDir = (FACTORS.find(function (x) { return x.id === id; }) || {}).dir || 0;
+    const E = expandZ(rawArr, o.minN, o.sigFloor, false);
+    const out = new Array(rep.n).fill(null);
+    let nBind = 0, nTot = 0;
+    for (let i = 0; i < rep.n; i++) {
+      if (E.z[i] == null) continue;
+      nTot++;
+      if (Math.abs(E.z[i]) > SCALE_CLAMP) nBind++;
+      out[i] = hasDir * Math.max(-SCALE_CLAMP, Math.min(SCALE_CLAMP, E.z[i]));
+    }
+    replace[id] = out;
+    per[id] = { id: id, name: fName(id), pClampAfter: nTot ? nBind / nTot : null, n: nTot };
+  });
+  const has = Object.keys(replace).length;
+  let cmp = null;
+  if (has) {
+    const CR2 = compositeRaw(rep, replace);
+    const sc2 = new Array(rep.n).fill(null);
+    for (let i = rep.start; i < rep.n; i++) if (CR2.c[i] != null) sc2[i] = Math.round(Math.max(2, Math.min(98, 50 + SCALE_MULT * CR2.c[i])));
+    const h = o.h || 10;
+    const a = icCore(rep.scores, rep, h, rep.start, rep.n);
+    const b = icCore(sc2, rep, h, rep.start, rep.n);
+    const cs2 = CR2.c.filter(function (v) { return v != null; });
+    cmp = { ids: Object.keys(replace), per: per, icOld: a ? a.spear : null, icFix: b ? b.spear : null,
+      sdOld: v3sd(rep.scores.filter(function (v) { return v != null; })), sdFix: v3sd(sc2.filter(function (v) { return v != null; })),
+      rangeFix: [Math.min.apply(null, sc2.filter(function (v) { return v != null; })), Math.max.apply(null, sc2.filter(function (v) { return v != null; }))],
+      compSd: v3sd(cs2) };
+  }
+  return { scale: S, worst: worst, fix: fix, cmp: cmp };
+}
+
+/* 标尺改了之后，同一套仓位政策会变成什么样？
+ * 这不是「新加一个政策」—— 权重一个字没改，只是把标尺换掉。
+ * 之所以必须单独跑一遍：幅度翻倍意味着敞口翻倍，而在牛市里敞口翻倍
+ * 会白捡一倍的 beta。若不把「多出来的收益」拆成 beta 与 timing，
+ * 就会把「仓位变大了」当成「模型变准了」。
+ * 事前声明：这个对照**不进入** ㉖ 的政策计数（N 不 +1），
+ * 它不是从 6 个候选里挑出来的第七个，而是同一个政策的两种刻度。 */
+function rescaleImpact(rep, R) {
+  if (!rep || !R || !R.scores) return null;
+  const lo = R.lo;
+  const mkRep = function (sc) { return { n: rep.n, start: lo, closes: rep.closes, scores: sc, calTs: rep.calTs }; };
+  const A = mkRep(rep.scores.slice()), B = mkRep(R.scores.slice());
+  const w1 = policyW(A, 'linear'), w2 = policyW(B, 'linear'), wb = policyW(A, 'bh');
+  if (!w1 || !w2 || !wb) return null;
+  const e1 = policyEval(A, w1), e2 = policyEval(B, w2), eb = policyEval(A, wb);
+  if (!e1 || !e2 || !eb) return null;
+  const a1 = e1.attr, a2 = e2.attr;
+  return {
+    lo: lo, old: e1, neu: e2, bh: eb,
+    wOld: a1 ? a1.avgAbsW : null, wNeu: a2 ? a2.avgAbsW : null,
+    betaOld: a1 ? a1.betaY : null, betaNeu: a2 ? a2.betaY : null,
+    timingOld: a1 ? a1.timingY : null, timingNeu: a2 ? a2.timingY : null,
+    dNet: e2.netY - e1.netY, dSh: e2.shN - e1.shN,
+    dBeta: (a1 && a2) ? a2.betaY - a1.betaY : null,
+    dTiming: (a1 && a2) ? a2.timingY - a1.timingY : null,
+    dMdd: e2.ddN.mdd - e1.ddN.mdd,
+  };
+}
+
+/* 实时模式的标尺校正：用回放末端学到的 σ 把今天的复合值 c 标准化。
+ * 若还没跑过回放，就老老实实不给值 —— 编一个 σ 出来等于编一个结论。 */
+function rescaleLive(res) {
+  const cal = state.scaleCal;
+  if (!cal || !(cal.sg > 0)) return null;
+  const c = res && res.c;
+  if (c == null || !isFinite(c)) return null;
+  const z = Math.max(-SCALE_CLAMP, Math.min(SCALE_CLAMP, c / Math.max(cal.sg, SCALE_SIG_FLOOR)));
+  return { score: Math.round(Math.max(2, Math.min(98, 50 + SCALE_MULT * z))), z: z, sg: cal.sg, n: cal.n };
+}
+
+/* ---------- ㉗㉘㉙ 渲染：评分为什么只用了一半标尺 ---------- */
+function renderScaleBox() {
+  const box = $('scaleBox');
+  if (!box) return;
+  const H = state.hist;
+  if (!H || !H.rep) { box.innerHTML = '<div class="rg-sub">需要先跑一次十年回放。</div>'; return; }
+  const rep = H.rep;
+  const S = H.scaleDiag || (H.scaleDiag = scoreScale(rep));
+  const R = H.rescale || (H.rescale = scoreRescale(rep));
+  const K = H.clamp || (H.clamp = clampCost(rep));
+  if (!S || !R) { box.innerHTML = '<div class="rg-sub">数据不足以做幅度分解。</div>'; return; }
+
+  /* 把末端 σ 交给实时评分用 */
+  if (R.sg) {
+    for (let i = R.sg.length - 1; i >= 0; i--) {
+      if (R.sg[i] != null && isFinite(R.sg[i]) && R.sg[i] > 0) { state.scaleCal = { sg: R.sg[i], n: R.nScored }; break; }
+    }
+  }
+
+  const num = function (v, dp) { return v == null ? '—' : v.toFixed(dp == null ? 2 : dp); };
+  const pc = function (v, dp) { return v == null ? '—' : (v >= 0 ? '+' : '') + (v * 100).toFixed(dp == null ? 1 : dp) + '%'; };
+  const dstr = t => new Date(t).toISOString().slice(0, 10);
+
+  let h = '<div class="rg-sub"><b>评分实测只在 ' + S.score.min + '–' + S.score.max + ' 之间波动，理论标尺是 0–100。</b>' +
+    '这不是「模型保守」，是三道压缩叠在一起的结果 —— 而它们的可修性完全不同。<br>' +
+    '<span class="rg-dim">为什么这件事要紧：仓位 w = (评分−50)/50。评分只用 57% 的标尺，' +
+    '意味着<b>即使模型百分之百确信，最大仓位也只有 0.54</b>，平均只有 ' + num(R.w.oldAvg) +
+    '。v3.23 那个「timing 补不回放弃的 beta」，根子就在这里。</span></div>';
+
+  /* ---- ㉗ 三道压缩 ---- */
+  h += '<div class="rg-sub" style="margin-top:8px"><b>㉗ 三道压缩，各自吃了多少</b></div>';
+  h += '<div class="rg-tbl">';
+  h += '<div class="rg-hd" style="grid-template-columns:2fr .8fr .8fr .8fr 1.6fr"><span>环节</span><span>压缩前</span><span>压缩后</span><span>比值</span><span>性质</span></div>';
+  h += '<div class="rg-row" style="grid-template-columns:2fr .8fr .8fr .8fr 1.6fr">' +
+    '<span class="rg-nm">A 单因子自身幅度（zRaw sd 中位数）</span><span>应 ≈1</span><span>' +
+    num(S.per.map(function (p) { return p.sdRaw; }).filter(function (v) { return v != null; }).sort(function (a, b) { return a - b; })[Math.floor(S.nFac / 2)]) +
+    '</span><span class="rg-dim">—</span><span class="rg-g" style="text-align:left">标定正常，不是病因</span></div>';
+  h += '<div class="rg-row" style="grid-template-columns:2fr .8fr .8fr .8fr 1.6fr">' +
+    '<span class="rg-nm">C 平均化收缩（除以 Σw）</span><span>' + num(S.sdFac) + '</span><span>' + num(S.comp.sd) + '</span><span class="rg-y">' +
+    num(S.shrink) + '</span><span class="rg-dim" style="text-align:left">构造性，任何因子平均模型都有</span></div>';
+  h += '<div class="rg-row" style="grid-template-columns:2fr .8fr .8fr .8fr 1.6fr">' +
+    '<span class="rg-nm">D 标尺常数</span><span>' + S.mult.cur + '</span><span class="rg-dim">应为</span><span class="rg-y">' +
+    num(S.mult.need) + '</span><span class="rg-r" style="text-align:left">纯标定错误，可直接修</span></div>';
+  h += '</div>';
+  h += '<div class="rg-sub"><span class="rg-dim"><b>C 不可避，但有干净的刻度可对照</b>：' +
+    '收缩比的分母是「若所有因子完全同步时的复合 sd」（= 各因子 sd 的加权平均 ' + num(S.sdFac) + '）。' +
+    '于是刻度是：<b>1.00 = 全体同步、无收缩</b>；<b>1/√N_eff = ' + num(S.indepShrink) +
+    ' = 互相独立、最大收缩</b>（N_eff = ' + num(S.nEffW) + '，共 ' + S.nFac + ' 维）。实测 ' + num(S.shrink) +
+    '，落在两端之间，方向一致性 ' + num(S.agree) + ' vs 独立基准 ' + num(S.agreeIndep) + '。' +
+    (S.agree > S.agreeIndep
+      ? '一致性高于独立基准 ⇒ 因子之间是<b>正相关</b>的，收缩比独立情形更轻 —— 也就是说「因子互相打架」<b>不是</b>额外病因，' +
+        '主因就是「把 ' + S.nFac + ' 个信号取加权平均」这个动作本身。'
+      : '一致性低于独立基准 ⇒ 因子之间存在抵消，这部分的压缩是额外的、可以避免的。') +
+    '<br>22 个 sd≈1 的信号取平均，标准差必然掉到 1/√22 量级 —— <b>这不是 bug，是算术</b>。' +
+    '真正错的是 D：标尺常数 22 是按「复合值能到 ±2.5」定的，而实测只到 ' +
+    num(Math.max(Math.abs(S.comp.min), Math.abs(S.comp.max))) + '，所以常数该是 ' + num(S.mult.need) + '。</span></div>';
+
+  /* ---- ㉘ 重标定 ---- */
+  h += '<div class="rg-sub" style="margin-top:8px"><b>㉘ 标尺重标定（扩张窗口，无前视）</b>：' +
+    '把复合值除以<b>只用过去数据</b>算出的 σ，再套同一个 ' + S.mult.cur + ' 倍映射。' +
+    'burn-in ' + R.minN + ' 天，从第 ' + R.lo + ' 天（' + dstr(rep.calTs[R.lo]) + '）起给值。<br>' +
+    '<span class="rg-dim">用全样本 σ 去标准化是<b>前视</b> —— 那等于把「未来十年评分波动多大」偷偷喂给了第一天。</span></div>';
+  h += '<div class="rg-tbl" style="margin-top:6px">';
+  h += '<div class="rg-hd" style="grid-template-columns:1.6fr .9fr .7fr .8fr .7fr .9fr">' +
+    '<span>口径</span><span>评分范围</span><span>sd</span><span>IC(' + R.h + '日)</span><span>t</span><span>样本外 IC</span></div>';
+  const rws = [
+    { nm: '现行（线性 ' + S.mult.cur + '）', rg: R.range.old, sd: R.sd.old, ic: R.ic.old, t: R.ic.oldT, oo: R.oos ? R.oos.old : null },
+    { nm: '除 σ（保留 50=中性锚点）', rg: R.range.neu, sd: R.sd.neu, ic: R.ic.neu, t: R.ic.neuT, oo: R.oos ? R.oos.neu : null, hl: true },
+    { nm: '除 σ 且减 μ（50=近期均值）', rg: R.range.dem, sd: R.sd.dem, ic: R.ic.dem, t: R.ic.demT, oo: null },
+  ];
+  rws.forEach(function (x) {
+    h += '<div class="rg-row" style="grid-template-columns:1.6fr .9fr .7fr .8fr .7fr .9fr' + (x.hl ? ';background:rgba(0,229,160,.06)' : '') + '">' +
+      '<span class="rg-nm">' + x.nm + '</span>' +
+      '<span><b>' + x.rg[0] + ' – ' + x.rg[1] + '</b></span>' +
+      '<span>' + num(x.sd) + '</span>' +
+      '<span class="' + (x.ic > 0.05 ? 'rg-g' : x.ic < -0.05 ? 'rg-r' : 'rg-dim') + '">' + num(x.ic, 3) + '</span>' +
+      '<span class="rg-dim">' + num(x.t) + '</span>' +
+      '<span class="rg-dim">' + num(x.oo, 3) + '</span></div>';
+  });
+  h += '</div>';
+  const dIc = (R.ic.neu != null && R.ic.old != null) ? R.ic.neu - R.ic.old : null;
+  h += '<div class="rg-sub"><b>关键判定：IC 变化 ' + (dIc == null ? '—' : (dIc >= 0 ? '+' : '') + num(dIc, 4)) + '</b> —— ' +
+    (dIc != null && Math.abs(dIc) < 0.01
+      ? '<span class="rg-g">几乎不变，这正是想要的结果</span>：说明这一步<b>只是换了个标尺，没有往里塞任何信息</b>。' +
+        '如果 IC 明显上升，反而该警惕 —— 那意味着「归一化」偷偷引入了时序漂移，把运气当成了信号。'
+      : '<span class="rg-y">有明显变化</span>：标尺改动引入了时序效应，不能当成单纯的尺度修正。') +
+    '<br><b>幅度收益却是实打实的</b>：平均 |w| ' + num(R.w.oldAvg) + ' → <b>' + num(R.w.neuAvg) + '</b>（×' +
+    num(R.w.neuAvg / R.w.oldAvg) + '），p95 ' + num(R.w.oldP95) + ' → ' + num(R.w.neuP95) +
+    '。评分终于把 0–100 用满了，仓位政策的讨论才有意义。</div>';
+  h += '<div class="rg-sub"><span class="rg-dim"><b>两个必须同时看的副作用</b>：' +
+    '① σ 下限设的是 ' + num(R.sigFloor) + '，触发率 ' + ((R.bindRate || 0) * 100).toFixed(1) + '%（σ 实测分位 p05=' +
+    num(R.sigQ.p05) + ' p50=' + num(R.sigQ.p50) + ' p95=' + num(R.sigQ.p95) + '，最小 ' + num(R.sigQ.min) +
+    '）。σ 很小时除以它会把噪声放大成信号，所以必须有下限；下限若设太高则会长期生效，等于换了个常数标尺 —— 现在触发率很低，说明落在了合理的空档里。' +
+    '<br>② <b>饱和率 ' + pc(R.satRate) + '</b>（旧标尺 ' + pc(R.satRateOld) + '）：标尺放大后，' +
+    pc(R.satRate) + ' 的日子被压在 2 分或 98 分。<b>98 分不等于「98 分」</b> —— 它把 z 超过 2.18 的所有日子压成了同一个值，' +
+    '它们之间已经没有区分度。看极端读数时必须记住这一点。</span></div>';
+
+  /* ---- ㉙ 夹紧代价 ---- */
+  if (K) {
+    /* 撞顶最狠那个之外的其余因子的 zRaw sd 区间与中位数 —— 必须现算。
+     * 把这些数写死进散文（早期版本就是这么干的）会让面板在换数据后说假话。 */
+    const oth = S.per.slice(1).map(function (p) { return p.sdRaw; }).filter(function (v) { return v != null; }).sort(function (a, b) { return a - b; });
+    const oMin = oth.length ? oth[0] : null, oMax = oth.length ? oth[oth.length - 1] : null;
+    const oMed = oth.length ? oth[Math.floor(oth.length / 2)] : null;
+    h += '<div class="rg-sub" style="margin-top:8px"><b>㉙ ±' + SCALE_CLAMP + ' 这道夹紧吃掉了什么</b>：' +
+      '撞顶超过 8% 的因子由数据点名 —— <b>' + (K.worst.length ? K.worst.map(function (p) { return p.name + ' ' + (p.pClamp * 100).toFixed(0) + '%'; }).join('、') : '无') +
+      '</b>。<br><span class="rg-dim">「并列占比」是被夹紧的天数比例：这些天里无论 z 是 2.5 还是 8，' +
+      '贡献都变成同一个 ±2.5，<b>顶部区分度彻底丧失</b>。</span></div>';
+    h += '<div class="rg-tbl" style="margin-top:6px">';
+    h += '<div class="rg-hd" style="grid-template-columns:1.5fr .6fr .8fr .8fr .8fr .8fr">' +
+      '<span>因子（撞顶降序）</span><span>权重</span><span>zRaw sd</span><span>撞顶占比</span><span>sd 损失</span><span>并列占比</span></div>';
+    S.per.slice(0, 8).forEach(function (p) {
+      const bad = (p.pClamp || 0) > 0.08;
+      h += '<div class="rg-row" style="grid-template-columns:1.5fr .6fr .8fr .8fr .8fr .8fr">' +
+        '<span class="rg-nm">' + p.name + '</span>' +
+        '<span class="rg-dim">' + num(p.w, 1) + '</span>' +
+        '<span class="' + (p.sdRaw > 2 ? 'rg-r' : 'rg-dim') + '">' + num(p.sdRaw) + '</span>' +
+        '<span class="' + (bad ? 'rg-r' : 'rg-dim') + '">' + (p.pClamp == null ? '—' : (p.pClamp * 100).toFixed(1) + '%') + '</span>' +
+        '<span class="' + (bad ? 'rg-y' : 'rg-dim') + '">' + (p.lossSd == null ? '—' : (p.lossSd * 100).toFixed(1) + '%') + '</span>' +
+        '<span class="rg-dim">' + (p.pTie * 100).toFixed(1) + '%</span></div>';
+    });
+    h += '</div>';
+    if (K.cmp) {
+      const d2 = (K.cmp.icFix != null && K.cmp.icOld != null) ? K.cmp.icFix - K.cmp.icOld : null;
+      h += '<div class="rg-sub"><b>对照实验</b>：把 ' + K.cmp.ids.map(function (id) { return fName(id); }).join('、') +
+        ' 的 z 用<b>扩张窗口自身 sd</b>归一化后再夹紧（不能用全样本 sd，那是前视）。<br>' +
+        '撞顶比例：' + K.cmp.ids.map(function (id) {
+          const o = S.per.find(function (x) { return x.id === id; });
+          return fName(id) + ' ' + ((o.pClamp || 0) * 100).toFixed(0) + '% → ' + ((K.cmp.per[id].pClampAfter || 0) * 100).toFixed(1) + '%';
+        }).join('；') + '。<br>' +
+        '复合 sd ' + num(S.comp.sd) + ' → ' + num(K.cmp.compSd) + '，评分 sd ' + num(K.cmp.sdOld) + ' → ' + num(K.cmp.sdFix) + '。<br>' +
+        '<b>IC ' + num(K.cmp.icOld, 3) + ' → ' + num(K.cmp.icFix, 3) + '（' + (d2 >= 0 ? '+' : '') + num(d2, 4) + '）</b> —— ' +
+        (d2 == null ? '—' : d2 > 0
+          ? '<span class="rg-g">修好夹紧后 IC 提升</span>：被砍掉的极端值里确实有信息，这道截断是真损失。'
+          : '<span class="rg-y">修好夹紧后 IC 反而没提升</span>。这个反直觉的结果本身就是结论：' +
+            '<b>那 ' + (S.per[0].pClamp * 100).toFixed(0) + '% 撞顶的日子里，被砍掉的部分没有额外预测力</b>。' +
+            'zRaw sd 高达 ' + num(S.per[0].sdRaw) + '（其余因子在 ' + num(oMin) + '–' + num(oMax) + '）说明它的 z 标定本身就过宽 —— ' +
+            '大部分「极端」是噪声，压平它们没损失什么。' +
+            '<span class="rg-dim">所以这一项<b>不动</b>：看起来像 bug 的东西，实测改了更差。</span>') +
+        '</div>';
+    }
+    h += '<div class="rg-sub"><span class="rg-dim"><b>方法论提醒</b>：zRaw sd 中位数 ' +
+      num(S.per.map(function (p) { return p.sdRaw; }).filter(function (v) { return v != null; }).sort(function (a, b) { return a - b; })[Math.floor(S.nFac / 2)]) +
+      '。撞得最狠的「' + S.per[0].name + '」sd 是 ' + num(S.per[0].sdRaw) + '，其余因子在 ' + num(oMin) + '–' + num(oMax) +
+      ' —— 它的「z」根本不是标准正态。' +
+      '把它和 sd≈' + num(oMed) + ' 的因子放进同一个 ±2.5 的框里，等于让它在 ' + (S.per[0].pClamp * 100).toFixed(0) +
+      '% 的时间里一个人说了算，而其余时间被压平。这是<b>因子定义层面</b>的问题，' +
+      '不是评分公式的问题；但既然修了 IC 不涨，就先留着并如实标注，不去动它。</span></div>';
+  }
+  /* ---- 连锁影响：同一个线性政策，只换标尺 ---- */
+  const IM = H.rescaleImpact || (H.rescaleImpact = rescaleImpact(rep, R));
+  if (IM) {
+    h += '<div class="rg-sub" style="margin-top:8px"><b>连锁影响：同一个「线性」政策，只换标尺</b>' +
+      '（权重一个字没改，比较区间统一取 ' + dstr(rep.calTs[IM.lo]) + ' 起）。<br>' +
+      '<span class="rg-dim">这一行<b>不进入</b> ㉖ 的政策计数 —— 它不是从 6 个候选里挑出来的第七个，' +
+      '而是同一个政策的两种刻度，事前声明、一并披露。</span></div>';
+    h += '<div class="rg-tbl" style="margin-top:6px">';
+    h += '<div class="rg-hd" style="grid-template-columns:1.5fr .8fr .8fr .8fr .8fr .9fr">' +
+      '<span>口径</span><span>净年化</span><span>净夏普</span><span>平均|w|</span><span>最大回撤</span><span>beta / timing</span></div>';
+    const row = function (nm, E, A, ww, hl) {
+      return '<div class="rg-row" style="grid-template-columns:1.5fr .8fr .8fr .8fr .8fr .9fr' + (hl ? ';background:rgba(0,229,160,.06)' : '') + '">' +
+        '<span class="rg-nm">' + nm + '</span>' +
+        '<span>' + pc(E.netY, 1) + '</span>' +
+        '<span class="' + (E.shN >= 0 ? 'rg-g' : 'rg-r') + '">' + num(E.shN) + '</span>' +
+        '<span>' + num(ww) + '</span>' +
+        '<span class="rg-r">' + pc(-E.ddN.mdd, 1) + '</span>' +
+        '<span class="rg-dim">' + (A ? pc(A.betaY, 1) + ' / ' + pc(A.timingY, 1) : '—') + '</span></div>';
+    };
+    h += row('线性 · 原标尺', IM.old, IM.old.attr, IM.wOld, false);
+    h += row('线性 · 校正标尺', IM.neu, IM.neu.attr, IM.wNeu, true);
+    h += row('买入持有（参照）', IM.bh, IM.bh.attr, 1, false);
+    h += '</div>';
+    h += '<div class="rg-sub"><b>多出来的 ' + pc(IM.dNet, 1) + ' 年化里，beta 贡献 ' + pc(IM.dBeta, 1) +
+      '、timing 贡献 ' + pc(IM.dTiming, 1) + '</b> —— ' +
+      ((IM.dBeta != null && IM.dTiming != null && Math.abs(IM.dBeta) > Math.abs(IM.dTiming))
+        ? '<span class="rg-y">大头是 beta</span>：敞口从 ' + num(IM.wOld) + ' 涨到 ' + num(IM.wNeu) +
+          '，在牛市里自然白捡更多市场漂移。<b>这不代表模型变准了，只代表仓端得更大了。</b>' +
+          '校正标尺的价值在于「模型本来就在说的话终于能表达出来」，' +
+          '而不是「收益变高了」—— 收益变化里相当一部分是市场送的。'
+        : '<span class="rg-g">大头是 timing</span>：说明标尺修好之后，模型原本被压扁的判断' +
+          '确实转化成了额外的择时收益。') +
+      '<br><span class="rg-dim"><b>但夏普只动了 ' + (IM.dSh >= 0 ? '+' : '') + num(IM.dSh) + '</b> —— ' +
+      '这不是没效果，是<b>夏普对仓位整体缩放几乎免疫</b>：w 乘 k 倍，收益的均值与标准差同乘 k，比值不变。' +
+      '剩下那点差值几乎全部来自「固定的换手成本被摊到更大的仓位上」。<b>放大标尺不会让人变聪明，' +
+      '它只是让原本被压扁的判断能落到仓位上。</b><br>' +
+      '最大回撤同步' + (IM.dMdd > 0 ? '放大' : '缩小') + ' ' + pc(Math.abs(IM.dMdd), 1) +
+      ' —— 敞口变大必然伴随风险变大，这两件事是同一枚硬币，不能只报收益。' +
+      '<br>与买入持有 ' + pc(IM.bh.netY, 1) + ' 相比，校正后仍是 ' + pc(IM.neu.netY - IM.bh.netY, 1) +
+      '：标尺修好<b>没有</b>解决「跑不赢躺平」这个 v3.23 就摆出来的问题，' +
+      '它解决的是「模型说的话传不到仓位上」这个更靠前的一环。</span></div>';
+  }
+
+  box.innerHTML = h;
+
+  /* 实时评分同步显示校正后的分数 */
+  const nx = $('nxCal');
+  if (nx) {
+    try {
+      const rl = rescaleLive(computeNexusScore());
+      if (rl) {
+        nx.style.display = '';
+        nx.innerHTML = '标尺校正后 <b style="color:' + (rl.score > 60 ? 'var(--green)' : rl.score < 40 ? 'var(--red)' : 'var(--gold)') + '">' +
+          rl.score + '</b>（z=' + num(rl.z) + '，σ=' + num(rl.sg) + '，取自 ' + rl.n + ' 天回放末端）· ' +
+          '<span style="opacity:.7">同一套权重，只把标尺换成「相对自身近期波动」—— 排序基本不变，幅度可用。</span>';
+      } else { nx.style.display = 'none'; }
+    } catch (e) { if (nx) nx.style.display = 'none'; }
+  }
 }
