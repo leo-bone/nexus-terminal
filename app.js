@@ -1,5 +1,5 @@
 /* =====================================================================
- * NEXUS TERMINAL v3.6 — 加密货币实时监测与因子关系终端
+ * NEXUS TERMINAL v3.25 — 加密货币实时监测与因子关系终端
  * 纯前端 / 无后端 / 无构建步骤。可直接 file:// 打开，也可部署到 Cloudflare。
  *
  * 数据源（全经 Cloudflare Worker 代理，解决中国大陆无法直连 + 浏览器 CORS）:
@@ -737,7 +737,18 @@ function renderTA() {
  * ===================================================================== */
 let net = null;
 let netRunning = false;      // 全局唯一动画循环开关（修复每 60 秒泄漏一个 rAF 循环）
-const NET_OPTS = { mode: 'mst', rel: 'corr', win: 120 };
+const NET_OPTS = { mode: 'mst', rel: 'corr', win: 120, layout: 'radial', maxNodes: 64 };
+/* 环的定义：先按「内生 → 外生」从内到外，同一类里再按「强 → 中 → 弱」。
+ * 用户要的是「外生因素围在外围、一眼看清谁在往里打」，所以外生一定在外圈。
+ * 顺序写死在 RINGS 里，环的**存在与否**由数据决定（空环不画）。 */
+const RINGS = [
+  { exo: 0, tier: 'strong', label: '内生·强', color: '#00e5a0' },
+  { exo: 0, tier: 'mid', label: '内生·中', color: '#7ee0c0' },
+  { exo: 0, tier: 'weak', label: '内生·弱', color: '#4a7f9e' },
+  { exo: 1, tier: 'strong', label: '外生·强', color: '#ffb300' },
+  { exo: 1, tier: 'mid', label: '外生·中', color: '#c98a3a' },
+  { exo: 1, tier: 'weak', label: '外生·弱', color: '#6b5a44' },
+];
 const CLUSTER_COLORS = ['#00b4ff', '#ffb300', '#b388ff', '#00e5a0', '#ff9100', '#ff3d6e'];
 let netAna = null;
 
@@ -831,6 +842,8 @@ function netEdges(A) {
 
 function initNetwork() {
   const cv = $('netCanvas'); if (!cv) return;
+  /* v3.25：径向影响星系图 —— 有筛选结果就默认走它（外生围外围、节点大小=影响强度） */
+  if (NET_OPTS.layout === 'radial') { if (initRadial(cv)) return; }
   const A = netAnalyzed();
   if (!A) {
     if ($('netCount')) $('netCount').textContent = '—';
@@ -3149,8 +3162,11 @@ async function refreshAll() {
   renderPaper();
   initNetwork(); renderHeatmap();
   try { renderNetStats(); renderCorrPanels(); renderSystemic(); } catch (e) { console.warn('net v2 fail', e && e.message); }
+  try { if (state.universe && Object.keys(state.universe.series).length) renderUniverseBox(); } catch (e) { console.warn('uni box fail', e && e.message); }
   renderStatus(ok);
-  refreshDvolAlarm();   // v3.14: 实时波动率恐慌警报（异步，不阻塞主渲染）
+  refreshDvolAlarm();
+  /* 回放刚跑完 → BTC 历史到位了，若因子宇宙已加载就补一次筛选渲染 */
+  try { if (state.universe && Object.keys(state.universe.series).length && state.histBundle && state.histBundle.btc) renderUniverseBox(); } catch (e) { console.warn('uni after hist fail', e && e.message); }   // v3.14: 实时波动率恐慌警报（异步，不阻塞主渲染）
 }
 
 /* =====================================================================
@@ -3162,7 +3178,22 @@ function bindUI() {
   const cv = $('mainCanvas');
   if (cv) cv.addEventListener('mousemove', e => { const rect = cv.getBoundingClientRect(); const k = state.klines['BTC' + state.interval]; if (!k) return; const i = Math.round((e.clientX - rect.left) / (rect.width) * (k.length - 1)); chartState.hover = Math.max(0, Math.min(k.length - 1, i)); renderChart(); });
   if (cv) cv.addEventListener('mouseleave', () => { chartState.hover = -1; const tt = $('chartTip'); if (tt) tt.style.display = 'none'; renderChart(); });
+  /* 径向影响星系图的悬停 / 点按。触控设备没有 hover，所以 click 也要走同一条路。 */
+  const ncv = $('netCanvas');
+  if (ncv) {
+    const onMove = function (e) {
+      if (!net || net.layout !== 'radial') return;
+      const rect = ncv.getBoundingClientRect();
+      const i = radialHit(e.clientX - rect.left, e.clientY - rect.top);
+      if (i !== net.hover) { net.hover = i; drawRadial(); }
+      ncv.style.cursor = i >= 0 ? 'pointer' : 'default';
+    };
+    ncv.addEventListener('mousemove', onMove);
+    ncv.addEventListener('mouseleave', function () { if (net && net.layout === 'radial' && net.hover !== -1) { net.hover = -1; drawRadial(); } });
+    ncv.addEventListener('click', onMove);
+  }
   const bt = $('btRun'); if (bt) bt.addEventListener('click', renderBacktest);
+  const ul = $('uniLoad'); if (ul) ul.addEventListener('click', function () { runUniverse(); });
   const hb = $('histRun'); if (hb) hb.addEventListener('click', runHistoryCheck);
   // 策略切换：原实现绑定的是 HTML 中并不存在的 #btStrat，导致点 RSI/突破毫无反应
   document.querySelectorAll('.bt-tab').forEach(tab => tab.addEventListener('click', () => {
@@ -3184,7 +3215,18 @@ function bindUI() {
       tab.classList.add('on');
       const v = tab.dataset.v;
       if (g === 'win') NET_OPTS.win = parseInt(v, 10) || 120;
+      else if (g === 'maxNodes') NET_OPTS.maxNodes = parseInt(v, 10) || 64;
       else NET_OPTS[g] = v;
+      /* 布局 / 节点数只换画法，不换数据 —— 没必要重算谱分解与偏相关。
+       * 那套 ⑬-⑯ 的分析实测约 650ms，每次点开关都重跑纯属浪费。 */
+      if (g === 'layout' || g === 'maxNodes') {
+        const nt = $('netNote');
+        if (nt && NET_OPTS.layout === 'radial') {
+          nt.textContent = '影响星系：半径=内生(内圈)→外生(外圈)、同层内按 强→中→弱 往外 · 节点大小=|IC| · 连线粗细=|IC|、绿=推涨/红=压跌、虚线=样本外符号反转 · 悬停看明细。切到「力导向」看的是因子之间的相互关系（连边由 BH-FDR 判定）。';
+        }
+        try { initNetwork(); } catch (e) { console.warn('net init fail', e && e.message); }
+        return;
+      }
       try {
         netAnalyzed(true);
         initNetwork(); renderHeatmap(); renderNetStats(); renderCorrPanels(); renderSystemic();
@@ -7508,4 +7550,719 @@ function renderScaleBox() {
       } else { nx.style.display = 'none'; }
     } catch (e) { if (nx) nx.style.display = 'none'; }
   }
+}
+
+
+/* =====================================================================
+ *  v3.25 · 因子宇宙：把「候选池」从 32 维扩到 160+ 维，再让数据裁定强弱
+ *  ---------------------------------------------------------------------
+ *  前一版的困境：因子只有 32 个，而「哪些是强影响」这个问题在 32 个样本上
+ *  根本没法回答 —— 你看到的强弱可能只是这 32 个恰好被挑中时的运气。
+ *
+ *  真实量化机构的做法是反过来的：**先有几百到几千个候选，再用统一口径筛**。
+ *  筛选口径（这套是业界通用、且必须事前定死的）：
+ *
+ *    IC      因子值与未来收益的秩相关 —— 「方向对不对」
+ *    ICIR    滚动 IC 的均值/标准差  —— 「稳不稳」，比 IC 更重要
+ *    t(有效)  IC / SE，SE 按**非重叠窗口数**折算（重叠前向窗会让 n 虚高）
+ *    q       BH-FDR 校正后的显著性 —— 160 个因子一起测，必然有假阳性
+ *    胜率    滚动 IC 与总 IC 同号的比例
+ *    半衰期  |IC| 衰减到一半所需的天数 —— 决定该多久调一次仓
+ *    样本外  前 60% 选 / 后 40% 验，符号必须一致，否则判「漂移」
+ *
+ *  三条纪律（每一次都得守，否则整套筛选就是自欺）：
+ *    ① **信号必须是无前视的**：因子值用它自己**过去**的均值/标准差标准化，
+ *       不是全样本 —— 用全样本 z 会让「整个样本里它波动多大」提前泄露给第一天。
+ *    ② **方向不挑**：不因为测出 IC 是负的就把它翻正再用。翻正是典型的
+ *       样本内过拟合，这里只如实报 IC 的符号。
+ *    ③ **门槛事前定死**：强/中/弱的 |IC| 门槛与 q 门槛写死在 SCR 里，
+ *       不因为「看起来应该是强因子」而放宽。
+ * ===================================================================== */
+
+const SCR = {
+  HORIZONS: [1, 3, 5, 10, 20],
+  H: 10,             // 主视野（事前定死，不挑最优 h）
+  ZWIN: 120,         // 扩张窗口 z 的 burn-in
+  MIN_N: 250,        // 配对样本下限
+  ROLL: 120,         // 滚动 IC 窗口（按 BTC 日历日）
+  STEP: 60,
+  Q: 0.05,           // BH-FDR 门槛
+  STRONG: 0.08,      // 强影响 |IC| 门槛
+  MID: 0.045,        // 中影响 |IC| 门槛
+  TOP_PCT: 0.5,      // 不漂移的池子里取前 50% 作为「强」（相对刻度）
+  OOS_CUT: 0.6,      // 前 60% 选 / 后 40% 验
+};
+
+/* 外生 / 内生的判定：不由加密市场内部决定、从外部打进来的变量。
+ * 只影响网络图的布环（外生排外围），**不参与**任何强度判定 —— 强度一律由数据裁定。 */
+const CAT_ZH = { index: '全球股指', sector: '美股板块', rate: '利率债券', credit: '信用利差', fx: '外汇', commodity: '大宗商品', vol: '波动率', cryptostock: '加密概念股', altcoin: '山寨币', tech: '科技巨头' };
+
+function universeUrl(cats) { return CONFIG.PROXY ? CONFIG.PROXY + '/api/universe?cat=' + encodeURIComponent(cats) : null; }
+
+async function loadUniverse(cats, opts) {
+  const o = opts || {};
+  const url = universeUrl(cats || 'all');
+  if (!url) return null;
+  try {
+    const d = await getJSON(url, 180000);
+    if (!d || !d.series) return null;
+    if (!state.universe) state.universe = { series: {}, cats: {}, exo: {}, meta: {}, _keyCat: {}, _name: {} };
+    Object.keys(d.series).forEach(function (k) { state.universe.series[k] = d.series[k]; });
+    (d.cats || []).forEach(function (c) { state.universe.cats[c] = true; });
+    if (d.exo) Object.keys(d.exo).forEach(function (c) { state.universe.exo[c] = !!d.exo[c]; });
+    if (d.keyCat) Object.keys(d.keyCat).forEach(function (k) { state.universe._keyCat[k] = d.keyCat[k]; });
+    if (d.names) Object.keys(d.names).forEach(function (k) { state.universe._name[k] = d.names[k]; });
+    state.universe.fail = d.fail || {};
+    state.universe.nOk = d.nOk || 0;
+    state.universe.n = d.n || 0;
+    state.universe.ts = d.ts || Date.now();
+    /* 换了一批数据 → 之前算的筛选结果作废，不能挂着旧结论 */
+    state.screening = null;
+    if (!o.quiet) console.log('universe loaded', Object.keys(state.universe.series).length);
+    return state.universe;
+  } catch (e) { console.warn('universe fail', e && e.message); return null; }
+}
+
+/* 与 v3mean/v3sd 同义，但筛选模块要的是「不抛异常」的短写法：
+ * 空数组返回 null 而不是 NaN，下游判空更省心。 */
+function meanOf(a) { if (!a || !a.length) return null; let s = 0; for (let i = 0; i < a.length; i++) s += a[i]; return s / a.length; }
+function sdOf(a) { if (!a || a.length < 2) return null; const m = meanOf(a); let v = 0; for (let i = 0; i < a.length; i++) v += (a[i] - m) * (a[i] - m); return Math.sqrt(v / (a.length - 1)); }
+
+/* ---------- 对齐：把任意序列的日期映射到 BTC 日线下标 ---------- */
+const dayKey = t => new Date(t).toISOString().slice(0, 10);
+
+function btcCtx() {
+  const b = state.histBundle && state.histBundle.btc;
+  if (!b || !b.ts || !b.closes || b.ts.length < 500) return null;
+  const map = new Map();
+  for (let i = 0; i < b.ts.length; i++) map.set(dayKey(b.ts[i]), i);
+  return { b: b, map: map, n: b.ts.length, closes: b.closes, ts: b.ts };
+}
+
+/* ---------- 单因子筛选 ---------- */
+function screenOne(key, ts, closes, ctx, cat) {
+  const N = ctx.n, bc = ctx.closes, map = ctx.map;
+  const n = Math.min(ts.length, closes.length);
+  /* ① 扩张窗口 z（只用过去）作为信号，再对齐到 BTC 日历 */
+  const J = [], Z = [];
+  let s = 0, s2 = 0, k = 0;
+  for (let i = 0; i < n; i++) {
+    const v = closes[i];
+    if (v == null || !isFinite(v)) continue;
+    if (k >= SCR.ZWIN) {
+      const m = s / k, sd = Math.sqrt(Math.max(s2 / k - m * m, 0));
+      if (sd > 1e-12) {
+        const j = map.get(dayKey(ts[i]));
+        if (j != null) { J.push(j); Z.push((v - m) / sd); }
+      }
+    }
+    s += v; s2 += v * v; k++;
+  }
+  if (J.length < SCR.MIN_N) return { key: key, cat: cat, n: J.length, short: true };
+
+  /* ② 各视野 IC（半衰期用） */
+  const icH = {};
+  for (let q = 0; q < SCR.HORIZONS.length; q++) {
+    const h = SCR.HORIZONS[q], xs = [], ys = [];
+    for (let i = 0; i < J.length; i++) {
+      const j = J[i], j2 = j + h;
+      if (j2 >= N) break;
+      const p0 = bc[j]; if (!p0) continue;
+      xs.push(Z[i]); ys.push(bc[j2] / p0 - 1);
+    }
+    if (xs.length >= 60) icH[h] = pearson(rankAvg(xs), rankAvg(ys));
+    else icH[h] = null;
+  }
+
+  /* ③ 主视野的配对（滚动 IC / 样本外都基于它） */
+  const H = SCR.H, X = [], Y = [], JJ = [];
+  for (let i = 0; i < J.length; i++) {
+    const j = J[i], j2 = j + H;
+    if (j2 >= N) break;
+    const p0 = bc[j]; if (!p0) continue;
+    X.push(Z[i]); Y.push(bc[j2] / p0 - 1); JJ.push(j);
+  }
+  if (X.length < SCR.MIN_N) return { key: key, cat: cat, n: X.length, short: true };
+  const m = X.length;
+  const ic = pearson(rankAvg(X), rankAvg(Y));
+  if (ic == null || !isFinite(ic)) return { key: key, cat: cat, n: m, short: true };
+
+  /* ④ 有效样本量：重叠的前向窗 → 非重叠窗口数才是真 n */
+  const neff = Math.max(4, Math.floor(m / H));
+  const se = 1 / Math.sqrt(neff);
+  const t = ic / se;
+  const p = tToP2(t);
+
+  /* ⑤ 滚动 IC → ICIR 与胜率（按日历窗口，跨品种可比） */
+  const roll = [];
+  if (JJ.length > SCR.ROLL + 40) {
+    for (let w = JJ[0]; w + SCR.ROLL <= JJ[JJ.length - 1]; w += SCR.STEP) {
+      let a = 0;
+      while (a < JJ.length && JJ[a] < w) a++;
+      let e = a;
+      while (e < JJ.length && JJ[e] < w + SCR.ROLL) e++;
+      if (e - a >= 40) {
+        const sp = pearson(rankAvg(X.slice(a, e)), rankAvg(Y.slice(a, e)));
+        if (sp != null && isFinite(sp)) roll.push(sp);
+      }
+    }
+  }
+  const rm = roll.length ? meanOf(roll) : null;
+  const rsd = roll.length > 2 ? sdOf(roll) : null;
+  const icir = (rm != null && rsd && rsd > 0) ? rm / rsd : null;
+  const winRate = (roll.length && ic != null) ? roll.filter(function (v) { return (v > 0) === (ic > 0); }).length / roll.length : null;
+
+  /* ⑥ 样本外：前 60% / 后 40%，符号必须一致 */
+  const cut = Math.floor(m * SCR.OOS_CUT);
+  const icIn = cut >= 80 ? pearson(rankAvg(X.slice(0, cut)), rankAvg(Y.slice(0, cut))) : null;
+  const icOut = (m - cut) >= 80 ? pearson(rankAvg(X.slice(cut)), rankAvg(Y.slice(cut))) : null;
+  const flip = (icIn != null && icOut != null && isFinite(icIn) && isFinite(icOut)) ? (icIn > 0) !== (icOut > 0) : null;
+
+  /* ⑦ 半衰期：|IC| 从 h=1 衰减到一半的天数（网格内线性插值） */
+  let hl = null;
+  const a1 = icH[1];
+  if (a1 != null && isFinite(a1) && Math.abs(a1) > 1e-9) {
+    const half = Math.abs(a1) / 2;
+    for (let q = 1; q < SCR.HORIZONS.length; q++) {
+      const h0 = SCR.HORIZONS[q - 1], h1 = SCR.HORIZONS[q];
+      const v0 = Math.abs(icH[h0] == null ? 0 : icH[h0]), v1 = Math.abs(icH[h1] == null ? 0 : icH[h1]);
+      if (v1 <= half && v0 > half) { hl = h0 + (h1 - h0) * (v0 - half) / Math.max(v0 - v1, 1e-12); break; }
+    }
+    if (hl == null && Math.abs(icH[20] != null ? icH[20] : 0) > half) hl = null;   // 20 日内没衰减到一半 → 记为持久
+  }
+
+  return {
+    key: key, cat: cat, n: m, neff: neff, ic: ic, t: t, p: p, icir: icir,
+    winRate: winRate, nRoll: roll.length, hl: hl, icH: icH,
+    icIn: icIn, icOut: icOut, flip: flip,
+    /* 实时读数：末端 z（用于宇宙评分） */
+    lastZ: Z.length ? Z[Z.length - 1] : null, lastJ: JJ.length ? JJ[JJ.length - 1] : null,
+  };
+}
+
+/* ---------- 全池筛选 ---------- */
+function factorScreening(opts) {
+  const o = opts || {};
+  const ctx = btcCtx();
+  if (!ctx) return null;
+  const U = state.universe;
+  if (!U || !U.series) return null;
+  const keys = Object.keys(U.series);
+  if (!keys.length) return null;
+  const rows = [], short = [];
+  for (let i = 0; i < keys.length; i++) {
+    const k = keys[i];
+    const s = U.series[k];
+    if (!s || !s.ts || !s.closes) continue;
+    const r = screenOne(k, s.ts, s.closes, ctx, catOfKey(k));
+    if (!r) continue;
+    if (r.short) { short.push(r); continue; }
+    if (r.n < SCR.MIN_N) { short.push(r); continue; }
+    rows.push(r);
+  }
+  if (!rows.length) return { rows: [], short: short, ctx: ctx };
+
+  /* BH-FDR：160 个因子一起测，不做这一步必然有一批假阳性 */
+  const ps = rows.map(function (r) { return r.p; });
+  const qs = bhQ(ps);
+  rows.forEach(function (r, i) { r.q = qs[i]; });
+
+  /* 分层：门槛全部来自 SCR，事前定死。
+   * 「漂移」的因子即使 |IC| 很大也不给强 —— 前 60% 与后 40% 符号相反，
+   * 说明它的方向不是稳定的结构，而是两段行情的偶然。 */
+  const stable = rows.filter(function (r) { return !r.flip; });
+  const sorted = stable.slice().sort(function (a, b) { return Math.abs(b.ic) - Math.abs(a.ic); });
+  const strongCut = Math.max(1, Math.round(sorted.length * SCR.TOP_PCT));
+  const strongSet = new Set(sorted.slice(0, strongCut).map(function (r) { return r.key; }));
+  rows.forEach(function (r) {
+    const abs = Math.abs(r.ic);
+    if (!r.flip && abs >= SCR.STRONG && strongSet.has(r.key)) r.tier = 'strong';
+    else if (!r.flip && abs >= SCR.MID) r.tier = 'mid';
+    else r.tier = 'weak';
+    r.qPass = r.q < SCR.Q;                  // 严格显著性（单独列示，不参与定档）
+    r.dir = r.ic > 0 ? 1 : -1;              // 如实记录符号，不翻正
+    r.exo = !!U.exo[r.cat];
+    r.abs = abs;
+  });
+  const nQ = rows.filter(function (r) { return r.qPass; }).length;
+  const nFlip = rows.filter(function (r) { return r.flip; }).length;
+  const byTier = { strong: [], mid: [], weak: [] };
+  rows.forEach(function (r) { byTier[r.tier].push(r); });
+  ['strong', 'mid', 'weak'].forEach(function (t) {
+    byTier[t].sort(function (a, b) { return b.abs - a.abs; });
+  });
+  const catStat = {};
+  rows.forEach(function (r) {
+    if (!catStat[r.cat]) catStat[r.cat] = { n: 0, strong: 0, mid: 0, weak: 0, absSum: 0 };
+    const c = catStat[r.cat]; c.n++; c[r.tier]++; c.absSum += r.abs;
+  });
+  Object.keys(catStat).forEach(function (c) { catStat[c].absAvg = catStat[c].absSum / catStat[c].n; });
+  return {
+    rows: rows, short: short, byTier: byTier, catStat: catStat, ctx: ctx,
+    nTotal: keys.length, nScreened: rows.length, nShort: short.length,
+    nQ: nQ, nFlip: nFlip, nStable: stable.length,
+    minDetect: rows.length ? Math.min.apply(null, rows.map(function (r) { return 1.96 / Math.sqrt(r.neff); })) : null,
+    btcSpan: { t0: ctx.ts[0], t1: ctx.ts[ctx.n - 1] },
+    h: SCR.H, q: SCR.Q, thr: { strong: SCR.STRONG, mid: SCR.MID },
+  };
+}
+
+/* key → 分类（取数时按 cat 打过标记，这里反查；查不到归为 other） */
+function catOfKey(k) { return (state.universe && state.universe._keyCat && state.universe._keyCat[k]) || 'other'; }
+
+/* ---------- ㉚b 宇宙评分：前 60% 选、后 40% 验 ----------
+ * 为什么必须这样切：如果在全样本上挑出「强因子」再回测它们的合成表现，
+ * 那是拿答案去考自己 —— 挑的时候已经看过未来了。
+ * 这里只做一件事：把「筛选」这一步本身也放到样本外去检验。 */
+function universeScore(S, opts) {
+  const o = opts || {};
+  if (!S || !S.rows || !S.rows.length) return null;
+  const K = o.k || 12;
+  const ctx = S.ctx;
+  /* 用**样本内段**选 Top-K（按 |IC|，且必须 q 显著、无漂移） */
+  const pool = S.rows.filter(function (r) { return r.icIn != null && isFinite(r.icIn); });
+  const cand = pool.slice().sort(function (a, b) { return Math.abs(b.icIn) - Math.abs(a.icIn); }).slice(0, K);
+  if (!cand.length) return null;
+
+  /* 重建每条序列在 BTC 日历上的扩张窗口 z（与 screenOne 同一算法，杜绝口径不一致） */
+  const zs = {};
+  cand.forEach(function (r) {
+    const s = state.universe.series[r.key];
+    if (!s || !s.ts || !s.closes) return;
+    const n = Math.min(s.ts.length, s.closes.length);
+    const arr = new Array(ctx.n).fill(null);
+    let a = 0, a2 = 0, k = 0;
+    for (let i = 0; i < n; i++) {
+      const v = s.closes[i];
+      if (v == null || !isFinite(v)) continue;
+      if (k >= SCR.ZWIN) {
+        const m = a / k, sd = Math.sqrt(Math.max(a2 / k - m * m, 0));
+        if (sd > 1e-12) { const j = ctx.map.get(dayKey(s.ts[i])); if (j != null) arr[j] = (v - m) / sd; }
+      }
+      a += v; a2 += v * v; k++;
+    }
+    zs[r.key] = arr;
+  });
+  const ids = Object.keys(zs);
+  if (!ids.length) return null;
+
+  /* 样本内段 = 每个因子配对的**前 60%**；样本外段 = 后 40%。
+   * 切点按 BTC 日历取，所有因子共用同一个切点，保证两组天数一致。 */
+  const js = [];
+  for (let j = 0; j < ctx.n; j++) {
+    let ok = 0;
+    for (let q = 0; q < ids.length; q++) if (zs[ids[q]][j] != null) ok++;
+    if (ok >= Math.max(3, Math.floor(ids.length * 0.6))) js.push(j);
+  }
+  if (js.length < 300) return null;
+  const cut = js[Math.floor(js.length * SCR.OOS_CUT)];
+
+  const comp = new Array(ctx.n).fill(null);
+  for (let q = 0; q < js.length; q++) {
+    const j = js[q];
+    let sm = 0, kk = 0;
+    for (let x = 0; x < ids.length; x++) {
+      const v = zs[ids[x]][j];
+      if (v == null || !isFinite(v)) continue;
+      const r = cand.find(function (c) { return c.key === ids[x]; });
+      if (!r) continue;
+      const d = r.icIn > 0 ? 1 : -1;
+      sm += Math.max(-2.5, Math.min(2.5, d * v)); kk++;
+    }
+    if (kk >= 3) comp[j] = sm / kk;
+  }
+  const H = SCR.H, bc = ctx.closes, N = ctx.n;
+  const icIn = icOfArr(comp, bc, N, 0, cut, H);
+  const icOut = icOfArr(comp, bc, N, cut, N, H);
+  const icAll = icOfArr(comp, bc, N, 0, N, H);
+
+  /* 实时读数：末端复合值 */
+  let lastC = null;
+  for (let j = ctx.n - 1; j >= 0; j--) if (comp[j] != null) { lastC = comp[j]; break; }
+
+  return {
+    k: ids.length, ids: ids, dirs: cand.filter(function (c) { return zs[c.key]; }).map(function (c) { return { key: c.key, dir: c.icIn > 0 ? 1 : -1, icIn: c.icIn, icOut: c.icOut, ic: c.ic, q: c.q, icir: c.icir }; }),
+    cut: cut, cutDate: ctx.ts[cut],
+    icIn: icIn, icOut: icOut, icAll: icAll,
+    lastC: lastC,
+    nIn: null,
+  };
+}
+
+function icOfArr(sig, closes, N, lo, hi, h) {
+  const xs = [], ys = [];
+  for (let j = Math.max(0, lo); j < hi; j++) {
+    const v = sig[j];
+    if (v == null || !isFinite(v)) continue;
+    const j2 = j + h; if (j2 >= N) break;
+    const p0 = closes[j]; if (!p0) continue;
+    xs.push(v); ys.push(closes[j2] / p0 - 1);
+  }
+  if (xs.length < 60) return null;
+  const sp = pearson(rankAvg(xs), rankAvg(ys));
+  const neff = Math.max(4, Math.floor(xs.length / h));
+  return { ic: sp, n: xs.length, neff: neff, t: sp == null ? null : sp / (1 / Math.sqrt(neff)) };
+}
+
+
+/* =====================================================================
+ * ㉛ 径向影响星系图
+ * ---------------------------------------------------------------------
+ * 原来的力导向网络解决的是「因子之间怎么互相连」；这一版要回答的是另一个
+ * 问题：**谁在对 BTC 施加影响、影响多强、方向如何、它是内部的还是外面打进来的**。
+ * 这两个问题需要的布局完全不同 —— 力导向图里「离中心近」纯粹是布局算法的产物，
+ * 没有任何含义，用户没法从距离读出任何东西。
+ *
+ * 所以径向布局把三个维度分别绑到三个视觉通道上，每个都有明确刻度：
+ *   半径   = 内生(内圈) → 外生(外圈)，同一类里按 强 → 中 → 弱 往外排
+ *   节点大小 = |IC|（实测影响强度），有最大值参照
+ *   连线粗细 = |IC|，颜色 = 方向（绿=推涨 / 红=压跌），虚线=该因子 IC 在
+ *             前 60% 与后 40% 符号相反（漂移，不可轻信）
+ *   描边   = 所属数据分类（同一个颜色 = 同一类变量）
+ *
+ * 不做力模拟：60+ 个节点在手机上跑 rAF 力模拟纯属浪费电，而且每次刷新位置都变，
+ * 「图变了」和「数据变了」会分不开 —— 径向布局是确定性的，位置只由数据决定。
+ * ===================================================================== */
+const CAT_COLORS = {
+  index: '#00b4ff', sector: '#4fc3f7', rate: '#26c6da', credit: '#26a69a',
+  fx: '#7e57c2', commodity: '#ffb300', vol: '#ff3d6e', cryptostock: '#ff9100',
+  altcoin: '#b388ff', tech: '#8bc34a', other: '#78909c',
+};
+
+function initRadial(cv) {
+  const S = state.screening;
+  if (!S || !S.rows || !S.rows.length) return false;
+  const W = cv.clientWidth, H = cv.clientHeight;
+  if (W < 40 || H < 40) return false;
+  const cx = W / 2, cy = H / 2;
+  const maxR = Math.min(W, H) / 2 - 30;
+
+  /* 取前 maxNodes 个（按 |IC|）—— 160 个节点全画上去只会变成一团糊。 */
+  const rows = S.rows.slice().sort(function (a, b) { return b.abs - a.abs; }).slice(0, NET_OPTS.maxNodes);
+  if (!rows.length) return false;
+  const maxAbs = Math.max.apply(null, rows.map(function (r) { return r.abs; }).concat([1e-9]));
+
+  const rings = RINGS.map(function (r) { return { exo: r.exo, tier: r.tier, label: r.label, color: r.color, items: [] }; });
+  rows.forEach(function (r) {
+    for (let i = 0; i < rings.length; i++) {
+      if ((rings[i].exo ? 1 : 0) === (r.exo ? 1 : 0) && rings[i].tier === r.tier) { rings[i].items.push(r); return; }
+    }
+    rings[rings.length - 1].items.push(r);
+  });
+  const used = rings.filter(function (r) { return r.items.length; });
+  const nR = used.length || 1;
+  used.forEach(function (r, i) { r.rad = maxR * (0.30 + 0.70 * (i + 1) / nR); });
+
+  const nodes = [];
+  used.forEach(function (ring, ri) {
+    ring.items.forEach(function (r, k) {
+      /* 每环错开一点起始角，避免各环的节点在同一条辐条上重叠 */
+      const off = ri * 0.35;
+      const ang = -Math.PI / 2 + off + (k / ring.items.length) * Math.PI * 2;
+      nodes.push({
+        id: r.key, label: uniName(r.key), cat: r.cat, tier: r.tier, exo: r.exo,
+        ic: r.ic, abs: r.abs, q: r.q, icir: r.icir, win: r.winRate, hl: r.hl, flip: r.flip,
+        icOut: r.icOut, icIn: r.icIn, n: r.n,
+        ang: ang, rad: ring.rad, ring: ring.label, ringColor: ring.color,
+        r: 3.5 + 9 * Math.sqrt(r.abs / maxAbs),
+        x: cx + Math.cos(ang) * ring.rad, y: cy + Math.sin(ang) * ring.rad,
+      });
+    });
+  });
+
+  const btc = { id: 'BTC', label: 'BTC', r: Math.max(16, Math.min(26, maxR * 0.11)), x: cx, y: cy, isBtc: true };
+  net = { cv: cv, ctx: cv.getContext('2d'), layout: 'radial', nodes: nodes, btc: btc, rings: used, W: W, H: H, cx: cx, cy: cy, maxAbs: maxAbs, idle: 0, hover: -1 };
+  if ($('netCount')) {
+    $('netCount').textContent = '影响星系 · ' + nodes.length + '/' + S.nScreened + ' 因子 · ' +
+      (S.byTier.strong.length) + '强 / ' + (S.byTier.mid.length) + '中 / ' + (S.byTier.weak.length) + '弱 · 主视野 ' + S.h + ' 日';
+  }
+  /* 静态图：画一次就停，不吃 rAF。前面那版力导向每 60 秒泄漏一个 rAF 循环的坑不再重犯。 */
+  drawRadial();
+  return true;
+}
+
+function uniName(k) { return (state.universe && state.universe._name && state.universe._name[k]) || k; }
+
+function drawRadial() {
+  if (!net || net.layout !== 'radial') return;
+  const n = net, ctx = n.ctx, W = n.W, H = n.H, cx = n.cx, cy = n.cy;
+  const dpr = window.devicePixelRatio || 1;
+  if (n.cv.width !== Math.round(W * dpr)) { n.cv.width = Math.round(W * dpr); n.cv.height = Math.round(H * dpr); }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  const small = W < 520;
+
+  /* 1) 环参考线 + 环标签 */
+  n.rings.forEach(function (ring) {
+    ctx.strokeStyle = 'rgba(58,80,112,' + (small ? 0.30 : 0.45) + ')';
+    ctx.lineWidth = 1; ctx.setLineDash([2, 4]);
+    ctx.beginPath(); ctx.arc(cx, cy, ring.rad, 0, 7); ctx.stroke(); ctx.setLineDash([]);
+    if (!small) {
+      ctx.fillStyle = ring.color; ctx.font = '9px JetBrains Mono, monospace';
+      ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+      ctx.fillText(ring.label + ' ' + ring.items.length, cx + ring.rad + 4, cy - 6);
+    }
+  });
+
+  /* 2) 辐条：中心 BTC → 各因子。粗细=|IC|，颜色=方向，虚线=漂移 */
+  n.nodes.forEach(function (nd) {
+    const w = 0.5 + 4.2 * (nd.abs / n.maxAbs);
+    const up = nd.ic > 0;
+    ctx.strokeStyle = (up ? 'rgba(0,229,160,' : 'rgba(255,61,110,') + Math.min(0.8, 0.16 + 2.2 * (nd.abs / n.maxAbs)) + ')';
+    ctx.lineWidth = w;
+    ctx.setLineDash(nd.flip ? [2, 3] : []);
+    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(nd.x, nd.y); ctx.stroke();
+    ctx.setLineDash([]);
+  });
+
+  /* 3) 中心 BTC */
+  const b = n.btc;
+  ctx.fillStyle = '#00e5a0';
+  ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, 7); ctx.fill();
+  ctx.fillStyle = '#060c18'; ctx.font = 'bold ' + (small ? 9 : 11) + 'px JetBrains Mono, monospace';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('BTC', b.x, b.y);
+
+  /* 4) 节点 */
+  n.nodes.forEach(function (nd, i) {
+    const hov = n.hover === i;
+    ctx.fillStyle = CAT_COLORS[nd.cat] || CAT_COLORS.other;
+    ctx.beginPath(); ctx.arc(nd.x, nd.y, nd.r, 0, 7); ctx.fill();
+    ctx.strokeStyle = hov ? '#fff' : nd.ringColor;
+    ctx.lineWidth = hov ? 2 : 1.3;
+    ctx.beginPath(); ctx.arc(nd.x, nd.y, nd.r + 2, 0, 7); ctx.stroke();
+    /* 标签只在够大或 hover 时画 —— 60 个标签全画出来就是一坨黑 */
+    if (!small || hov) {
+      ctx.fillStyle = hov ? '#fff' : '#a8bfd6';
+      ctx.font = (hov ? 'bold ' : '') + '8px Inter, sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      const tx = nd.x + Math.cos(nd.ang) * (nd.r + 8), ty = nd.y + Math.sin(nd.ang) * (nd.r + 8);
+      ctx.fillText(nd.label.slice(0, 7), tx, ty);
+    }
+  });
+
+  /* 5) hover 信息框 */
+  if (n.hover >= 0 && n.hover < n.nodes.length) {
+    const nd = n.nodes[n.hover];
+    const lines = [
+      nd.label + ' · ' + (CAT_ZH[nd.cat] || nd.cat),
+      'IC ' + (nd.ic >= 0 ? '+' : '') + nd.ic.toFixed(3) + '  ' + (nd.ic > 0 ? '推涨' : '压跌') + '  ' + nd.ring,
+      'q ' + (nd.q == null ? '—' : nd.q.toFixed(3)) + (nd.q < SCR.Q ? ' 通过FDR' : ' 未通过') +
+        '  ICIR ' + (nd.icir == null ? '—' : nd.icir.toFixed(2)) + '  胜率 ' + (nd.win == null ? '—' : (nd.win * 100).toFixed(0) + '%'),
+      '样本内 ' + (nd.icIn == null ? '—' : nd.icIn.toFixed(3)) + ' → 样本外 ' + (nd.icOut == null ? '—' : nd.icOut.toFixed(3)) + (nd.flip ? '  ⚠符号反转' : ''),
+      '半衰期 ' + (nd.hl == null ? '>20日' : nd.hl.toFixed(1) + '日') + '  样本 ' + nd.n,
+    ];
+    const bw = Math.min(W - 12, 260), bh = lines.length * 14 + 12;
+    let bx = Math.max(6, Math.min(W - bw - 6, nd.x + 14)), by = Math.max(6, Math.min(H - bh - 6, nd.y - bh - 10));
+    ctx.fillStyle = 'rgba(8,17,31,.97)'; ctx.strokeStyle = '#243d60'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.rect(bx, by, bw, bh); ctx.fill(); ctx.stroke();
+    ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+    lines.forEach(function (t, k) {
+      ctx.fillStyle = k === 0 ? '#d0e2f5' : (k === 1 ? (nd.ic > 0 ? '#00e5a0' : '#ff3d6e') : '#a8bfd6');
+      ctx.font = (k === 0 ? 'bold 10px' : '9px') + ' Inter, sans-serif';
+      ctx.fillText(t, bx + 7, by + 6 + k * 14);
+    });
+  }
+}
+
+/* hover：找最近节点（阈值取节点半径 + 6px，触控时放宽到 +14） */
+function radialHit(mx, my) {
+  if (!net || net.layout !== 'radial') return -1;
+  let best = -1, bd = 1e9;
+  const pad = (isTouchLike() ? 14 : 6);
+  for (let i = 0; i < net.nodes.length; i++) {
+    const nd = net.nodes[i], dx = mx - nd.x, dy = my - nd.y, d = Math.sqrt(dx * dx + dy * dy);
+    if (d < nd.r + pad && d < bd) { bd = d; best = i; }
+  }
+  return best;
+}
+function isTouchLike() { try { return ('ontouchstart' in window) || (navigator.maxTouchPoints > 0); } catch (e) { return false; } }
+
+
+/* 加载 + 渲染。两步都必须「先给反馈、再干活」：
+ * ① 取数要打 167 次 Yahoo，首轮近一分钟 —— 不给提示用户会以为页面死了；
+ * ② 筛选要算 5 秒左右，同步跑会把主线程堵死，所以先渲染「计算中」再让出一帧。 */
+async function runUniverse(opts) {
+  const o = opts || {};
+  const btn = $('uniLoad'), cnt = $('uniCount');
+  const setMsg = function (t) { const b = $('uniBox'); if (b) b.innerHTML = '<div class="rg-sub">' + t + '</div>'; };
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ 加载中…'; }
+  if (cnt) cnt.textContent = '加载中…';
+  /* 筛选要用 BTC 十年日线做对齐基准。缺了它面板会永远停在「请先跑回放」——
+   * 与其让用户自己去别处点一下，不如这里顺手拉了（同一个源，带缓存）。 */
+  if (!state.histBundle || !state.histBundle.btc) {
+    setMsg('正在拉取 BTC 十年日线（筛选的对齐基准）…');
+    try {
+      const d = await getJSON(histUrl(), 120000);
+      if (d && d.btc) state.histBundle = d;
+    } catch (e) { console.warn('uni hist fail', e && e.message); }
+  }
+  setMsg('正在拉取 167 条真实日频序列（首次约需一分钟，之后走 6 小时边缘缓存）…');
+  let U = await loadUniverse('all');
+  const got = U ? Object.keys(U.series).length : 0;
+  /* 一次打 167 个容易被限流 —— 拿不到 2/3 就按分类逐个补。
+   * 分类各自有独立缓存，补到多少算多少，失败的如实留在 fail 里。 */
+  if (got < 110) {
+    const cats = ['index', 'sector', 'rate', 'credit', 'fx', 'commodity', 'vol', 'cryptostock', 'altcoin', 'tech'];
+    for (let i = 0; i < cats.length; i++) {
+      setMsg('逐类补拉中（' + (i + 1) + '/' + cats.length + '）… 已拿到 ' + Object.keys((state.universe || {}).series || {}).length + ' 条');
+      await loadUniverse(cats[i], { quiet: true });
+    }
+  }
+  const n = Object.keys(((state.universe || {}).series) || {}).length;
+  if (cnt) cnt.textContent = n ? n + ' 条序列' : '加载失败';
+  if (btn) { btn.disabled = false; btn.textContent = n ? '重新加载' : '重试'; }
+  if (!o.skipRender) {
+    setMsg('数据就绪（' + n + ' 条），正在逐条测量 IC / ICIR / 样本外漂移，约需数秒…');
+    setTimeout(function () { try { renderUniverseBox(); } catch (e) { console.warn('uni render fail', e && e.message); } try { initNetwork(); } catch (e) { } }, 30);
+  }
+}
+
+/* ---------- ㉚ 渲染：因子宇宙 · 影响强度筛选 ---------- */
+function renderUniverseBox() {
+  const box = $('uniBox');
+  if (!box) return;
+  const num = function (v, dp) { return v == null ? '—' : v.toFixed(dp == null ? 2 : dp); };
+  const pc = function (v, dp) { return v == null ? '—' : (v * 100).toFixed(dp == null ? 1 : dp) + '%'; };
+  const sg = function (v, dp) { return v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(dp == null ? 3 : dp); };
+
+  if (!CONFIG.PROXY) { box.innerHTML = '<div class="rg-sub">需要 Worker 代理（/api/universe）；当前为直连模式。</div>'; return; }
+  const U = state.universe;
+  if (!U || !Object.keys(U.series).length) {
+    box.innerHTML = '<div class="rg-sub"><b>因子宇宙尚未加载。</b>' +
+      '<span class="rg-dim">候选池是 ' + (U && U.n ? U.n : '167') + ' 条真实日频序列（全球股指 / 板块 / 利率 / 信用 / 外汇 / 商品 / 波动率 / 加密概念股 / 山寨币 / 科技股），' +
+      '首次拉取要逐条走 Yahoo，约需一分钟，之后走 6 小时边缘缓存。点上方「加载因子宇宙」开始。</span></div>';
+    return;
+  }
+  if (!state.histBundle || !(state.histBundle.btc)) {
+    box.innerHTML = '<div class="rg-sub"><b>需要先跑一次十年回放</b>（筛选要用 BTC 日线的完整历史做对齐基准）。' +
+      '<span class="rg-dim">已加载 ' + Object.keys(U.series).length + ' 条候选序列。</span></div>';
+    return;
+  }
+  const S = state.screening || (state.screening = factorScreening());
+  if (!S || !S.rows.length) { box.innerHTML = '<div class="rg-sub">样本不足以筛选（BTC 历史序列太短）。</div>'; return; }
+
+  const dstr = t => new Date(t).toISOString().slice(0, 10);
+  const ns = S.byTier.strong.length, nm = S.byTier.mid.length, nw = S.byTier.weak.length;
+
+  let h = '<div class="rg-sub"><b>候选池 ' + S.nTotal + ' 条真实序列，' + S.nScreened + ' 条样本足够、进入筛选，' +
+    S.nShort + ' 条因样本不足被排除。</b>BTC 区间 ' + dstr(S.btcSpan.t0) + ' → ' + dstr(S.btcSpan.t1) +
+    '，主视野 <b>' + S.h + ' 日</b>（事前定死、不挑最优）。<br>' +
+    '<span class="rg-dim">筛选结果：<b class="rg-g">强影响 ' + ns + '</b> · <b class="rg-y">中影响 ' + nm + '</b> · <b class="rg-dim">弱影响 ' + nw + '</b>' +
+    '（共 ' + S.nStable + ' 条样本外不漂移，' + S.nFlip + ' 条漂移）。</span></div>';
+
+  /* 两条必须先说的坏消息 —— 它们决定了下面所有数字该怎么读 */
+  h += '<div class="rg-sub" style="margin-top:6px"><b>先说两条坏消息，否则下面的表会被误读：</b><br>' +
+    '<span class="rg-r">① 按 BH-FDR 校正，' + S.nScreened + ' 个因子里通过 q&lt;' + S.q + ' 的有 <b>' + S.nQ + ' 个</b>。</span>' +
+    '<span class="rg-dim">同时测 160 个因子必然产生一批假阳性，校正后能站住的一个都没有 —— ' +
+    '这套数据的最小可探测 |IC| 约 <b>' + num(S.minDetect, 3) + '</b>（|IC| 要超过它才能算显著），' +
+    '而实测最强的单因子 |IC| 也只有 ' + num(S.rows.length ? Math.max.apply(null, S.rows.map(function (r) { return r.abs; })) : null, 3) + '。' +
+    '<b>这不是筛选做错了，这就是答案。</b></span><br>' +
+    '<span class="rg-r">② ' + S.nFlip + ' / ' + S.nScreened + ' 个因子的 IC 在前 60% 与后 40% <b>符号相反</b>。</span>' +
+    '<span class="rg-dim">也就是说：随便挑一个因子，它的方向有 ' + pc(S.nFlip / S.nScreened, 0) +
+    ' 的概率只是某一段行情的偶然。这就是为什么下面用<b>相对刻度</b>分档（回答「这批候选里谁更强」），' +
+    '而不是用显著性分档 —— 用显著性分档的结果会是「全是弱」，那不是诚实，是把刻度用废了。</span></div>';
+
+  /* ---- 分类汇总 ---- */
+  h += '<div class="rg-sub" style="margin-top:8px"><b>按数据分类看：哪一类变量整体上更有用</b></div>';
+  h += '<div class="rg-tbl">';
+  h += '<div class="rg-hd" style="grid-template-columns:1.4fr .7fr .7fr .7fr .7fr .9fr"><span>分类</span><span>条数</span><span>强</span><span>中</span><span>弱</span><span>平均|IC|</span></div>';
+  const cs = Object.keys(S.catStat).sort(function (a, b) { return S.catStat[b].absAvg - S.catStat[a].absAvg; });
+  cs.forEach(function (c) {
+    const v = S.catStat[c];
+    h += '<div class="rg-row" style="grid-template-columns:1.4fr .7fr .7fr .7fr .7fr .9fr">' +
+      '<span class="rg-nm" style="color:' + (CAT_COLORS[c] || CAT_COLORS.other) + '">' + (CAT_ZH[c] || c) + '</span>' +
+      '<span class="rg-dim">' + v.n + '</span>' +
+      '<span class="rg-g">' + (v.strong || '·') + '</span>' +
+      '<span class="rg-y">' + (v.mid || '·') + '</span>' +
+      '<span class="rg-dim">' + v.weak + '</span>' +
+      '<span><b>' + num(v.absAvg, 3) + '</b></span></div>';
+  });
+  h += '</div>';
+
+  /* ---- 强影响明细 ---- */
+  h += '<div class="rg-sub" style="margin-top:8px"><b>强影响因子（按 |IC| 降序）</b>' +
+    '<span class="rg-dim"> · ICIR 是滚动 IC 的均值/标准差，比 IC 更能说明「能不能长期用」；' +
+    '胜率是滚动窗口里与总 IC 同号的比例；半衰期决定该多久调一次仓。</span></div>';
+  if (!ns) {
+    h += '<div class="rg-sub"><span class="rg-y">按事前定死的门槛，一条强影响因子都没筛出来。</span>' +
+      '<span class="rg-dim">这本身就是结论：在这批候选里，没有哪个单一变量对 BTC 未来 ' + S.h +
+      ' 日收益有稳定且足够大的预测力。宁可如实说「没有」，也不要靠放宽门槛造出几个「强因子」。</span></div>';
+  } else {
+    h += '<div class="rg-tbl">';
+    h += '<div class="rg-hd" style="grid-template-columns:1.5fr .8fr .7fr .7fr .7fr .8fr 1fr .7fr">' +
+      '<span>因子</span><span>IC</span><span>ICIR</span><span>胜率</span><span>q</span><span>内→外</span><span>半衰期</span><span>样本</span></div>';
+    S.byTier.strong.slice(0, 24).forEach(function (r) {
+      h += '<div class="rg-row" style="grid-template-columns:1.5fr .8fr .7fr .7fr .7fr .8fr 1fr .7fr">' +
+        '<span class="rg-nm" style="color:' + (CAT_COLORS[r.cat] || CAT_COLORS.other) + '">' + uniName(r.key) + '<span class="rg-dim" style="font-size:8px"> ' + (CAT_ZH[r.cat] || r.cat) + '</span></span>' +
+        '<span class="' + (r.ic > 0 ? 'rg-g' : 'rg-r') + '"><b>' + sg(r.ic) + '</b></span>' +
+        '<span class="' + (r.icir != null && Math.abs(r.icir) >= 0.5 ? 'rg-g' : 'rg-dim') + '">' + num(r.icir) + '</span>' +
+        '<span class="rg-dim">' + pc(r.win, 0) + '</span>' +
+        '<span class="rg-dim">' + (r.q == null ? '—' : r.q.toFixed(3)) + '</span>' +
+        '<span class="rg-dim">' + sg(r.icIn) + '→' + sg(r.icOut) + '</span>' +
+        '<span class="rg-dim">' + (r.hl == null ? '&gt;20日' : num(r.hl, 1) + '日') + '</span>' +
+        '<span class="rg-dim">' + r.n + '</span></div>';
+    });
+    h += '</div>';
+  }
+
+  /* ---- 中影响（折叠式：只列前 12） ---- */
+  if (nm) {
+    h += '<div class="rg-sub" style="margin-top:8px"><b>中影响因子（前 12）</b></div>';
+    h += '<div class="rg-tbl">';
+    h += '<div class="rg-hd" style="grid-template-columns:1.5fr .8fr .7fr .7fr .7fr .8fr 1fr .7fr">' +
+      '<span>因子</span><span>IC</span><span>ICIR</span><span>胜率</span><span>q</span><span>内→外</span><span>半衰期</span><span>样本</span></div>';
+    S.byTier.mid.slice(0, 12).forEach(function (r) {
+      h += '<div class="rg-row" style="grid-template-columns:1.5fr .8fr .7fr .7fr .7fr .8fr 1fr .7fr">' +
+        '<span class="rg-nm" style="color:' + (CAT_COLORS[r.cat] || CAT_COLORS.other) + '">' + uniName(r.key) + '<span class="rg-dim" style="font-size:8px"> ' + (CAT_ZH[r.cat] || r.cat) + '</span></span>' +
+        '<span class="' + (r.ic > 0 ? 'rg-g' : 'rg-r') + '">' + sg(r.ic) + '</span>' +
+        '<span class="rg-dim">' + num(r.icir) + '</span>' +
+        '<span class="rg-dim">' + pc(r.win, 0) + '</span>' +
+        '<span class="rg-dim">' + (r.q == null ? '—' : r.q.toFixed(3)) + '</span>' +
+        '<span class="rg-dim">' + sg(r.icIn) + '→' + sg(r.icOut) + (r.flip ? ' ⚠' : '') + '</span>' +
+        '<span class="rg-dim">' + (r.hl == null ? '&gt;20日' : num(r.hl, 1) + '日') + '</span>' +
+        '<span class="rg-dim">' + r.n + '</span></div>';
+    });
+    h += '</div>';
+  }
+
+  /* ---- 宇宙评分的样本外检验 ---- */
+  const US = state.uniScore || (state.uniScore = universeScore(S));
+  if (US) {
+    h += '<div class="rg-sub" style="margin-top:8px"><b>把「筛选」本身也放到样本外检验</b>：' +
+      '只在<b>前 60%</b>（截至 ' + dstr(US.cutDate) + '）挑出 Top-' + US.k + '，再只看它们在<b>后 40%</b> 的表现。<br>' +
+      '<span class="rg-dim">为什么必须这样切：如果在全样本上挑出「强因子」再回测它们的合成，那是拿答案考自己 —— 挑的时候已经看过未来了。</span></div>';
+    h += '<div class="rg-tbl" style="margin-top:6px">';
+    h += '<div class="rg-hd" style="grid-template-columns:1.4fr .8fr .7fr .8fr .8fr"><span>区间</span><span>IC</span><span>t</span><span>样本</span><span>有效n</span></div>';
+    [['样本内（用于挑因子）', US.icIn], ['样本外（真正意义上的检验）', US.icOut], ['全样本', US.icAll]].forEach(function (x, i) {
+      const v = x[1];
+      h += '<div class="rg-row" style="grid-template-columns:1.4fr .8fr .7fr .8fr .8fr' + (i === 1 ? ';background:rgba(0,229,160,.06)' : '') + '">' +
+        '<span class="rg-nm">' + x[0] + '</span>' +
+        '<span class="' + (v && v.ic > 0.05 ? 'rg-g' : v && v.ic < -0.05 ? 'rg-r' : 'rg-dim') + '"><b>' + (v ? sg(v.ic) : '—') + '</b></span>' +
+        '<span class="rg-dim">' + (v ? num(v.t) : '—') + '</span>' +
+        '<span class="rg-dim">' + (v ? v.n : '—') + '</span>' +
+        '<span class="rg-dim">' + (v ? v.neff : '—') + '</span></div>';
+    });
+    h += '</div>';
+    const oi = US.icOut, ii = US.icIn;
+    if (ii && oi && ii.ic > 0.05 && oi.ic < 0.02) {
+      h += '<div class="rg-sub"><span class="rg-r"><b>这是整份报告里最要紧的一行</b></span>：' +
+        '只用样本内 IC 挑出来的这 Top-' + US.k + '，样本内 IC ' + sg(ii.ic) + '（t ' + num(ii.t) + '，看着很像回事），' +
+        '<b>样本外却掉到 ' + sg(oi.ic) + '（t ' + num(oi.t) + '）</b>。' +
+        '<span class="rg-dim">两者之差就是<b>选择偏差</b>的身价：挑因子这件事本身用掉了绝大部分表观收益。' +
+        '几乎所有「因子研究」都只报前者，因为后者不好看 —— 但后者才是能拿去交易的数。' +
+        '<br>顺带一条：如果反过来想，样本外 IC 显著为负意味着这套信号在后期是<b>反向</b>的，' +
+        '但 t 只有 ' + num(oi.t) + '，离「稳定的反向指标」还差得远，不要顺势去反过来做。</span></div>';
+    }
+    h += '<div class="rg-sub"><b>判定：' +
+      (oi == null ? '样本外数据不足' :
+        (Math.abs(oi.ic) < 0.03 ? '<span class="rg-y">样本外 IC 接近零 —— 筛选出来的「强因子」在后 40% 基本没有预测力</span>' :
+          ((oi.ic > 0) === (ii && ii.ic > 0) ? '<span class="rg-g">样本外符号与样本内一致</span>，方向站得住' :
+            '<span class="rg-r">样本外符号与样本内相反</span>，说明挑出来的方向是样本内的偶然'))) +
+      '</b> —— ' +
+      '<span class="rg-dim">样本内 ' + (ii ? sg(ii.ic) : '—') + ' → 样本外 ' + (oi ? sg(oi.ic) : '—') +
+      '。这个衰减幅度才是「因子研究」真实的样子：样本内好看、样本外打折，' +
+      '而绝大多数人只报前者。这里两个都报。</span></div>';
+  }
+  box.innerHTML = h;
 }

@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Nexus Terminal · 加密货币因子关系终端 v3.14</title>
+<title>Nexus Terminal · 加密货币因子关系终端 v3.25</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -239,6 +239,68 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
 .ttab.on{background:rgba(0,180,255,.12);color:var(--blue);border-color:rgba(0,180,255,.3)}
 .nopt-note{font-size:8.5px;color:var(--dim);margin-left:auto;line-height:1.5}
 .netstats{display:flex;flex-wrap:wrap;gap:6px;padding:9px 14px 2px}
+
+/* ============ v3.25 移动端 / 小屏适配 ============
+ * 三段断点：900（平板竖屏 / 小笔记本）、680（大手机横屏）、480（手机竖屏）。
+ * 三件事必须做到：① 多列网格塌成单列或两列 ② 宽表格可以横向滑，不把字挤成竖排
+ * ③ canvas 高度按屏缩放，否则手机上图表被压成一条线。 */
+@media (max-width:900px){
+  .wrap{padding:0 10px}
+  .main-grid{grid-template-columns:1fr}
+  .net-wrap{grid-template-columns:1fr}
+  .ticker-strip{grid-template-columns:repeat(3,1fr)}
+  .fgrid{grid-template-columns:repeat(4,1fr)}
+  .ta-grid{grid-template-columns:repeat(3,1fr)}
+  .hgrid{grid-template-columns:1fr}
+  .sub2{grid-template-columns:1fr}
+  .ex-wrap{grid-template-columns:1fr}
+  #mainCanvas{height:340px}.chart-split{min-height:340px}
+  #netCanvas{height:360px}
+  .heat{max-height:340px}
+  .phdr{flex-wrap:wrap;row-gap:4px}
+  .phdr .hint{display:none}
+  .phdr #netCount,.phdr #uniCount,.phdr #fCount{display:inline !important}
+}
+@media (max-width:680px){
+  .ticker-strip{grid-template-columns:repeat(2,1fr);gap:6px}
+  .ticker{padding:8px 10px}.ticker .price{font-size:17px}
+  .fgrid{grid-template-columns:repeat(3,1fr)}
+  .ta-grid{grid-template-columns:repeat(2,1fr)}
+  .mgrid{grid-template-columns:1fr 1fr;gap:6px;padding:8px}
+  .btgrid{grid-template-columns:1fr 1fr}
+  .bt-params{grid-template-columns:1fr}
+  .pt-row{grid-template-columns:1fr}
+  .header{gap:8px}.hdr-right{margin-left:0;gap:8px}
+  .logo{font-size:15px}.tagline{display:none}
+  #mainCanvas{height:280px}.chart-split{min-height:280px}
+  #netCanvas{height:300px}
+  #histCanvas{height:190px}
+  .fg-val{font-size:26px}
+  /* 宽表格横向滚动：把行摊平成固定宽度，父容器滚。
+   * 不这么做的话 8 列在 375px 上每列只剩 40px，数字会被截成「0.1」。 */
+  .rg-tbl{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  .rg-tbl .rg-hd,.rg-tbl .rg-row{min-width:560px}
+  .ic-row.fr,.ic-row.oos{min-width:480px}
+  .heat{overflow-x:auto}
+  .econ-list{max-height:280px}
+  .bt-trades .tr{grid-template-columns:64px 44px 1fr 92px;font-size:8px}
+  .netopts{gap:4px;padding:8px 10px}
+  .netopts .ttab{padding:3px 6px;font-size:8px}
+  .nopt-note{font-size:8px;line-height:1.5}
+}
+@media (max-width:480px){
+  .ticker-strip{grid-template-columns:1fr 1fr}
+  .fgrid{grid-template-columns:repeat(2,1fr)}
+  .ta-grid{grid-template-columns:1fr 1fr}
+  .mgrid{grid-template-columns:1fr 1fr}
+  .btgrid{grid-template-columns:1fr}
+  #mainCanvas{height:230px}.chart-split{min-height:230px}
+  #netCanvas{height:260px}
+  .footer{font-size:8px;line-height:1.6}
+  .uni-note{font-size:8.5px;padding:8px 10px}
+}
+.uni-note{font-size:9px;color:var(--dim);line-height:1.75;padding:9px 14px;border-bottom:1px solid var(--border)}
+.uni-note b{color:var(--text2)}
 </style>
 </head>
 <body>
@@ -246,7 +308,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
   <div class="header">
     <div class="logo">NEXUS <em>TERMINAL</em></div>
     <div class="tagline">CRYPTO FACTOR TERMINAL</div>
-    <div class="live-badge"><span class="live-dot"></span> LIVE · v3.14</div>
+    <div class="live-badge"><span class="live-dot"></span> LIVE · v3.25</div>
     <div class="hdr-right">
       <span class="net-lbl">数据源</span><span id="netDot" class="net-dot"></span>
       <span id="lastUpd" class="last-upd">—</span>
@@ -298,8 +360,8 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
   </div>
 
   <div class="panel">
-    <div class="phdr"><span class="icon">🧠</span><span class="lbl">因子模型 · Nexus Score</span><span id="fCount" class="hint">28 维</span><span class="hint">方向加权合成 · 实时</span><span id="regimeBadge" class="hint regime-badge">体制 —</span></div>
-      <div id="dvolAlarm" class="dvol-alarm" style="display:none"></div>体制 —</span></div>
+    <div class="phdr"><span class="icon">🧠</span><span class="lbl">因子模型 · Nexus Score</span><span id="fCount" class="hint">— 维</span><span class="hint">方向加权合成 · 实时</span><span id="regimeBadge" class="hint regime-badge">体制 —</span></div>
+      <div id="dvolAlarm" class="dvol-alarm" style="display:none"></div>
     <div class="fpanel">
       <div class="fhdr">
         <span class="fttl">综合多空评分</span>
@@ -407,6 +469,19 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
   </div>
 
   <div class="panel">
+    <div class="phdr"><span class="icon">🧬</span><span class="lbl">因子宇宙 · 影响强度筛选</span><span id="uniCount" class="hint">未加载</span>
+      <button id="uniLoad" class="refresh-btn">加载因子宇宙</button>
+      <span class="hint">167 维真实序列 · IC/ICIR/BH-FDR 统一口径裁定强弱</span></div>
+    <div class="uni-note">
+      <b>为什么要把因子从 32 个扩到 167 个：</b>在 32 个样本上谈「哪些是强影响」没有意义 —— 你看到的强弱可能只是这 32 个恰好被挑中时的运气。
+      真实量化机构是反着做的：<b>先有几百个候选，再用统一口径筛</b>。这里每条序列都走 Yahoo 真实日频数据（10 年），
+      用扩张窗口 z（只用过去、无前视）作信号，测它对 BTC 未来 10 日收益的 IC / ICIR / BH-q / 胜率 / 半衰期 / 样本外漂移，
+      <b>三档强弱全部由数据裁定，没有一条是人工指定的</b>。
+    </div>
+    <div id="uniBox" style="padding:0 14px 12px"></div>
+  </div>
+
+  <div class="panel">
     <div class="phdr"><span class="icon">🕸</span><span class="lbl">因子关系网络 · 实时相关性 v2</span><span id="netCount" class="hint">—</span><span class="hint">PSD 修正 · BH-FDR · MST / 偏相关</span></div>
     <div class="netopts">
       <span class="fttl">形态</span>
@@ -421,7 +496,15 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
       <button class="ttab" data-g="win" data-v="60">60日</button>
       <button class="ttab on" data-g="win" data-v="120">120日</button>
       <button class="ttab" data-g="win" data-v="365">365日</button>
-      <span class="nopt-note">连边与否由 BH-FDR 判定（不再是 |r| 阈值）· 虚线=负相关 · 线宽=|ρ| · 节点大小=强度 · 描边颜色=数据驱动分簇</span>
+      <span class="sep"></span>
+      <span class="fttl">布局</span>
+      <button class="ttab on" data-g="layout" data-v="radial">影响星系</button>
+      <button class="ttab" data-g="layout" data-v="force">力导向</button>
+      <span class="sep"></span>
+      <span class="fttl">节点</span>
+      <button class="ttab on" data-g="maxNodes" data-v="64">64</button>
+      <button class="ttab" data-g="maxNodes" data-v="120">120</button>
+      <span class="nopt-note" id="netNote">影响星系：半径=内生(内圈)→外生(外圈)、同层内按 强→中→弱 往外 · 节点大小=|IC| · 连线粗细=|IC|、绿=推涨/红=压跌、虚线=样本外符号反转 · 悬停看明细。力导向：连边由 BH-FDR 判定 · 虚线=负相关 · 线宽=|ρ| · 节点大小=强度 · 描边颜色=数据驱动分簇</span>
     </div>
     <div id="netStats" class="netstats"></div>
     <div class="net-wrap">
@@ -548,7 +631,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
   </div>
 
   <div class="footer">
-    NEXUS TERMINAL v3.14 · 纯前端实时加密终端 · 28 维实时 + 22 维历史回放（含 MVRV/活跃地址/手续费/永续溢价/持仓量）· 数据源: Bybit / CoinLore / DefiLlama / blockchain.info / alternative.me / mempool.space / CoinMetrics / Yahoo Finance / NY Fed / U.S. Treasury / Japan MOF / Forex Factory<br>
+    NEXUS TERMINAL v3.25 · 32 维实时评分 + 167 维因子宇宙（全球股指 / 板块 / 利率 / 信用 / 外汇 / 商品 / 波动率 / 加密概念股 / 山寨币 / 科技股，全部 Yahoo 真实日频）· 影响强度由 IC / ICIR / BH-FDR / 样本外漂移统一裁定 · 数据源: Bybit / CoinLore / DefiLlama / blockchain.info / alternative.me / mempool.space / CoinMetrics / Yahoo Finance / NY Fed / U.S. Treasury / Japan MOF / Forex Factory<br>
     仅供研究与教育，不构成投资建议。加密资产风险极高，请独立判断。
   </div>
 </div>

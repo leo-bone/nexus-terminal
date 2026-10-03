@@ -960,6 +960,222 @@ async function buildSnapshot() {
   return { macro, series, dates, _prev: prev, _src: srcMap, ts: Date.now() };
 }
 
+/* =====================================================================
+ *  v3.25 · 因子宇宙（UNIVERSE）
+ *  ---------------------------------------------------------------------
+ *  原来的因子表只有 32 项、可用序列只有 22 条 —— 这个量级没法回答
+ *  「哪些因子是强影响、哪些只是噪声」。真实量化机构的因子库是几百到几千维，
+ *  但它们从不靠「拍脑袋给权重」，而是**先筛后加权**：用 IC / ICIR / t / 胜率
+ *  把因子分成可用与不可用，再决定给多少权重。
+ *
+ *  所以这一版先把「候选池」扩到 160+ 条真实日频序列，把「谁强谁弱」交给
+ *  前端用真实十年数据去测（见 app.js 的 factorScreening），不在后端写死任何
+ *  影响强度结论 —— 后端只负责**给真实数据**，不负责**下判断**。
+ *
+ *  全部走 Yahoo Finance（免费、无需 key、覆盖全球股指/外汇/商品/债券/ETF）。
+ *  格式：KEY: [yahooSymbol, 中文名]
+ *
+ *  三类元数据在前端各有用处，不要混为一谈：
+ *    · cat  = 数据分类（取数用）
+ *    · exo  = 是否外生（网络图布环用：外生的排到外围）
+ *    · 影响强度 = **不在这里定义**，由 IC 测量裁定
+ * ===================================================================== */
+const UNIVERSE = {
+  /* —— 全球股指：风险偏好的总开关（外生） —— */
+  index: {
+    SPX500: ['^GSPC', '标普500'], NDX: ['^NDX', '纳指100'], DJI: ['^DJI', '道指'],
+    RUT: ['^RUT', '罗素2000'], EEM: ['EEM', '新兴市场'], EFA: ['EFA', '发达市场(非美)'],
+    VTI: ['VTI', '美股总市场'], QQQ: ['QQQ', '纳指ETF'], IWM: ['IWM', '小盘ETF'],
+    EZU: ['EZU', '欧元区'], EWJ: ['EWJ', '日本'], FXI: ['FXI', '中国大盘'],
+    KWEB: ['KWEB', '中概互联网'], INDA: ['INDA', '印度'], EWY: ['EWY', '韩国'],
+    EWG: ['EWG', '德国'], EWU: ['EWU', '英国'], EWA: ['EWA', '澳大利亚'],
+    EWC: ['EWC', '加拿大'], EWZ: ['EWZ', '巴西'], EWW: ['EWW', '墨西哥'],
+  },
+  /* —— 美股板块：资金在风险资产内部怎么轮动（外生） —— */
+  sector: {
+    XLK: ['XLK', '科技'], XLF: ['XLF', '金融'], XLE: ['XLE', '能源'],
+    XLV: ['XLV', '医疗'], XLI: ['XLI', '工业'], XLY: ['XLY', '可选消费'],
+    XLP: ['XLP', '必选消费'], XLU: ['XLU', '公用事业'], XLB: ['XLB', '材料'],
+    XLRE: ['XLRE', '房地产'], XLC: ['XLC', '通信'], XBI: ['XBI', '生物科技'],
+    SMH: ['SMH', '半导体'], IGV: ['IGV', '软件'],
+  },
+  /* —— 利率与债券：贴现率，加密估值最上游的分母（外生） —— */
+  rate: {
+    BILL13W: ['^IRX', '13周美债'], NOTE5Y: ['^FVX', '5年期'], BOND30Y: ['^TYX', '30年期'],
+    TLT: ['TLT', '长债ETF'], IEF: ['IEF', '中债ETF'], SHY: ['SHY', '短债ETF'],
+    TIP: ['TIP', '通胀债'], EMB: ['EMB', '新兴市场债'], BND: ['BND', '总债券'],
+    AGG: ['AGG', '综合债'], MUB: ['MUB', '市政债'],
+  },
+  /* —— 信用：风险溢价/违约恐慌（外生） —— */
+  credit: {
+    HYG: ['HYG', '高收益债'], LQD: ['LQD', '投资级公司债'], JNK: ['JNK', '垃圾债'],
+    VCSH: ['VCSH', '短公司债'], VCIT: ['VCIT', '中公司债'], SRLN: ['SRLN', '浮动利率贷款'],
+  },
+  /* —— 外汇：美元流动性 + 套息风向标（外生） —— */
+  fx: {
+    EURUSD: ['EURUSD=X', '欧元/美元'], GBPUSD: ['GBPUSD=X', '英镑/美元'],
+    USDCNY: ['USDCNY=X', '美元/离岸人民币'], USDCHF: ['USDCHF=X', '美元/瑞郎'],
+    AUDUSD: ['AUDUSD=X', '澳元/美元'], USDCAD: ['USDCAD=X', '美元/加元'],
+    USDSEK: ['USDSEK=X', '美元/瑞典克朗'], USDNOK: ['USDNOK=X', '美元/挪威克朗'],
+    USDZAR: ['USDZAR=X', '美元/南非兰特'], USDTRY: ['USDTRY=X', '美元/土耳其里拉'],
+    USDMXN: ['USDMXN=X', '美元/墨西哥比索'], USDINR: ['USDINR=X', '美元/印度卢比'],
+    USDKRW: ['USDKRW=X', '美元/韩元'], USDBRL: ['USDBRL=X', '美元/巴西雷亚尔'],
+    EURJPY: ['EURJPY=X', '欧元/日元'], AUDJPY: ['AUDJPY=X', '澳元/日元'],
+    GBPJPY: ['GBPJPY=X', '英镑/日元'], NZDUSD: ['NZDUSD=X', '纽元/美元'],
+    USDPLN: ['USDPLN=X', '美元/波兰兹罗提'], USDIDR: ['USDIDR=X', '美元/印尼盾'],
+  },
+  /* —— 商品：通胀预期 + 避险 + 工业需求（外生） —— */
+  commodity: {
+    GOLDF: ['GC=F', '黄金期货'], SILVER: ['SI=F', '白银'], PLAT: ['PL=F', '铂金'],
+    COPPER: ['HG=F', '铜'], WTIF: ['CL=F', 'WTI原油'], BRENTF: ['BZ=F', '布伦特原油'],
+    NATGAS: ['NG=F', '天然气'], GASOLINE: ['RB=F', '汽油'], CORN: ['ZC=F', '玉米'],
+    SOYBEAN: ['ZS=F', '大豆'], WHEAT: ['ZW=F', '小麦'], COFFEE: ['KC=F', '咖啡'],
+    SUGAR: ['SB=F', '糖'], COCOA: ['CC=F', '可可'], COTTON: ['CT=F', '棉花'],
+    DBA: ['DBA', '农业ETF'], DBC: ['DBC', '商品指数'], USO: ['USO', '原油ETF'],
+    UNG: ['UNG', '天然气ETF'], GLD: ['GLD', '黄金ETF'], SLV: ['SLV', '白银ETF'],
+    GDX: ['GDX', '金矿股'], XME: ['XME', '金属矿业'], FCX: ['FCX', '自由港铜矿'],
+  },
+  /* —— 波动率：恐慌温度计（外生，但与加密情绪高度共振） —— */
+  vol: {
+    VIX9D: ['^VIX9D', 'VIX 9日'], VIX3M: ['^VIX3M', 'VIX 3个月'],
+    VVIX: ['^VVIX', 'VIX的VIX'], OVX: ['^OVX', '原油波动率'],
+    GVZ: ['^GVZ', '黄金波动率'], VIXY: ['VIXY', 'VIX短债ETF'],
+    SKEW: ['^SKEW', '尾部偏斜'], VXN: ['^VXN', '纳指波动率'],
+    VIXM: ['VIXM', 'VIX中债ETF'], VXD: ['^VXD', '道指波动率'],
+  },
+  /* —— 加密概念股：传统市场对加密的定价（半外生） —— */
+  cryptostock: {
+    MSTR: ['MSTR', 'MicroStrategy'], COIN: ['COIN', 'Coinbase'],
+    MARA: ['MARA', 'Marathon'], RIOT: ['RIOT', 'Riot'],
+    CLSK: ['CLSK', 'CleanSpark'], HUT: ['HUT', 'Hut 8'],
+    BTDR: ['BTDR', 'Bitdeer'], IREN: ['IREN', 'IREN'],
+    WULF: ['WULF', 'TeraWulf'], CORZ: ['CORZ', 'Core Scientific'],
+    GLXY: ['GLXY', 'Galaxy Digital'], BTBT: ['BTBT', 'Bit Digital'],
+    HIVE: ['HIVE', 'HIVE Digital'], BITO: ['BITO', '比特币期货ETF'],
+    IBIT: ['IBIT', '贝莱德现货ETF'], FBTC: ['FBTC', '富达现货ETF'],
+  },
+  /* —— 山寨币：加密内部轮动 / 风险偏好斜率（内生，非外生） —— */
+  altcoin: {
+    ETH: ['ETH-USD', '以太坊'], SOL: ['SOL-USD', 'Solana'], XRP: ['XRP-USD', '瑞波'],
+    DOGE: ['DOGE-USD', '狗狗币'], ADA: ['ADA-USD', 'Cardano'], BNB: ['BNB-USD', '币安币'],
+    LTC: ['LTC-USD', '莱特币'], TRX: ['TRX-USD', '波场'], AVAX: ['AVAX-USD', 'Avalanche'],
+    LINK: ['LINK-USD', 'Chainlink'], DOT: ['DOT-USD', 'Polkadot'], MKR: ['MKR-USD', 'Maker'],
+    AAVE: ['AAVE-USD', 'Aave'], ATOM: ['ATOM-USD', 'Cosmos'], NEAR: ['NEAR-USD', 'NEAR'],
+    TON: ['TON11419-USD', 'TON'], ARB: ['ARB-USD', 'Arbitrum'], OP: ['OP-USD', 'Optimism'],
+    INJ: ['INJ-USD', 'Injective'], FIL: ['FIL-USD', 'Filecoin'], ICP: ['ICP-USD', 'Internet Computer'],
+    ETC: ['ETC-USD', '以太经典'], BCH: ['BCH-USD', '比特现金'], XLM: ['XLM-USD', '恒星'],
+    XMR: ['XMR-USD', '门罗币'], ALGO: ['ALGO-USD', 'Algorand'], VET: ['VET-USD', '唯链'],
+    SEI: ['SEI-USD', 'Sei'], TIA: ['TIA-USD', 'Celestia'], SHIB: ['SHIB-USD', '柴犬币'],
+  },
+  /* —— 科技巨头：流动性/成长预期的代理人（外生） —— */
+  tech: {
+    NVDA: ['NVDA', '英伟达'], AAPL: ['AAPL', '苹果'], MSFT: ['MSFT', '微软'],
+    GOOGL: ['GOOGL', '谷歌'], AMZN: ['AMZN', '亚马逊'], META: ['META', 'Meta'],
+    TSLA: ['TSLA', '特斯拉'], AMD: ['AMD', 'AMD'], AVGO: ['AVGO', '博通'],
+    TSM: ['TSM', '台积电'], ASML: ['ASML', '阿斯麦'], NFLX: ['NFLX', '奈飞'],
+    CRM: ['CRM', 'Salesforce'], ORCL: ['ORCL', '甲骨文'], PLTR: ['PLTR', 'Palantir'],
+  },
+};
+
+/* 数据分类 → 是否「外生」。外生 = 不由加密市场内部决定、从外部打进来的变量。
+ * 网络图据此把外生因子排到外围环 —— 用户要的是「一眼看出哪些是外面打进来的」。
+ * 注意 cryptostock 是例外：它是股票，受传统市场驱动，但也直接反映加密定价，
+ * 故判为半外生（前端按 exo:false 处理，但保留 cat 标记以便查看）。 */
+const UNIVERSE_EXO = { index: 1, sector: 1, rate: 1, credit: 1, fx: 1, commodity: 1, vol: 1, tech: 1, cryptostock: 0, altcoin: 0 };
+const UNIVERSE_CATS = Object.keys(UNIVERSE);
+
+/* 并发受限的批量抓取。164 个标的若一次性 Promise.all 打出去，Yahoo 会直接
+ * 限流（实测并发 >10 就大面积 429），而且 CF Worker 的并发子请求也有限。
+ * 这里是 6 路并发 + 单标的失败不影响其余（失败如实上报，不静默丢弃）。 */
+async function mapPool(items, limit, fn) {
+  const out = new Array(items.length);
+  let cur = 0;
+  const workers = new Array(Math.min(limit, items.length)).fill(0).map(async () => {
+    for (;;) {
+      const i = cur++;
+      if (i >= items.length) return;
+      try { out[i] = await fn(items[i], i); }
+      catch (e) { out[i] = { err: String(e.message || e) }; }
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
+const UNIV_CACHE_PREFIX = 'https://nexus-cache.internal/universe-v1/';
+const UNIV_TTL = 21600;          // 6 小时：日频数据，一天最多真正回源两次
+const UNIV_MIN_RETRY = 900;      // 失败退避 15 分钟
+const UNIV_CONCURRENCY = 3;
+/* 【实测教训】一开始用「3 个分类 × 6 并发 = 18 路同时打 Yahoo」，结果 10 个分类里
+ * 9 个全军覆没（返回 502）—— Yahoo 对 Cloudflare 的出口 IP 限流非常凶，
+ * 并发一大就是整批 429/404，而不是零星失败。改成「分类串行 + 类内 3 并发 +
+ * 每个标的之间 120ms 间隔」之后才稳定拿到数据。
+ * 慢一点没关系：结果是 6 小时边缘缓存，一天最多真正回源两次。 */
+const UNIV_GAP_MS = 120;
+
+async function fetchUniverseCat(cat) {
+  const spec = UNIVERSE[cat];
+  if (!spec) return null;
+  const cache = caches.default;
+  const dataKey = new Request(UNIV_CACHE_PREFIX + cat + '.data');
+  const metaKey = new Request(UNIV_CACHE_PREFIX + cat + '.meta');
+  const [hit, meta] = await Promise.all([cache.match(dataKey), cache.match(metaKey)]);
+  let lastTry = 0;
+  if (meta) { try { lastTry = (await meta.json()).t || 0; } catch (e) { } }
+  const ageSec = (Date.now() - lastTry) / 1000;
+  const wrap = (body, src, code) => new Response(body, { status: code || 200, headers: { ...CORS, 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=1800', 'X-Universe-Source': src } });
+
+  /* 命中缓存且未到退避窗口 → 直接吃缓存。
+   * 与 /api/history 同一套路：失败时限流退避，别把源打死。 */
+  if (hit && ageSec < UNIV_MIN_RETRY) return wrap(await hit.text(), 'edge-cache');
+
+  const keys = Object.keys(spec);
+  let lastAt = 0;
+  const res = await mapPool(keys, UNIV_CONCURRENCY, async (k) => {
+    const sym = spec[k][0];
+    try {
+      /* 节流：同一时刻最多 3 个在飞，且相邻发起间隔 >= UNIV_GAP_MS */
+      const wait = UNIV_GAP_MS - (Date.now() - lastAt);
+      if (wait > 0) await new Promise(r => setTimeout(r, wait));
+      lastAt = Date.now();
+      const d = await fetchYahoo(sym, '10y');
+      if (!d.closes || d.closes.length < 60) throw new Error('too short');
+      return { k: k, ok: true, ts: d.ts, closes: d.closes };
+    } catch (e) {
+      /* 主源失败 → stooq 兜底只对少数有等价符号的标的适用，这里直接记失败。
+       * 诚实上报比拿一条造出来的序列充数重要得多。 */
+      return { k: k, ok: false, err: String(e.message || e) };
+    }
+  });
+
+  const series = {}, ok = [], fail = {};
+  let okN = 0;
+  res.forEach(function (r) {
+    if (r && r.ok) { series[r.k] = { ts: r.ts, closes: r.closes }; ok.push(r.k); okN++; }
+    else fail[r.k] = (r && r.err) || 'unknown';
+  });
+  const payload = JSON.stringify({ cat: cat, series: series, ok: ok, fail: fail, n: keys.length, nOk: okN, ts: Date.now() });
+  /* 只要拿到一半以上就长缓存；否则短缓存，尽快重试 */
+  const good = okN >= Math.ceil(keys.length * 0.5);
+  const ttl = good ? UNIV_TTL : 600;
+  await cache.put(dataKey, new Response(payload, { headers: { 'Cache-Control': `public, max-age=${ttl}` } }));
+  await cache.put(metaKey, new Response(JSON.stringify({ t: Date.now(), ok: good }), { headers: { 'Cache-Control': `public, max-age=${ttl}` } }));
+  /* 全军覆没且无缓存 → 明确报错，不要返回一个空的 series 假装成功 */
+  if (!okN && !hit) return jsonResp({ error: 'universe ' + cat + ' all failed', cat: cat, fail: fail, ts: Date.now() }, 502);
+  if (!okN && hit) return wrap(await hit.text(), 'stale');
+  return wrap(payload, 'live');
+}
+
+async function universeMeta() {
+  const out = { cats: {}, exo: UNIVERSE_EXO, total: 0 };
+  UNIVERSE_CATS.forEach(function (c) {
+    const spec = UNIVERSE[c];
+    out.cats[c] = { n: Object.keys(spec).length, exo: !!UNIVERSE_EXO[c], items: Object.keys(spec).map(function (k) { return { key: k, sym: spec[k][0], name: spec[k][1] }; }) };
+    out.total += Object.keys(spec).length;
+  });
+  return out;
+}
+
 const PROBE_URLS = [
   // —— 经济日历备用源（FF JSON 会 429 限流）——
   'https://nfs.faireconomy.media/ff_calendar_thisweek.json',
@@ -1014,6 +1230,39 @@ export default {
       catch (e) { return jsonResp({ error: e.message, ts: Date.now() }, 502); }
     }
 
+    /* v3.25 因子宇宙：/api/universe?cat=fx,commodity 或 cat=meta 或 cat=all */
+    if (url.pathname === '/api/universe') {
+      try {
+        const raw = (url.searchParams.get('cat') || 'all').trim();
+        if (raw === 'meta') return jsonResp({ ...universeMeta(), ts: Date.now() }, 200, { 'Cache-Control': 'public, max-age=86400' });
+        const cats = raw === 'all' ? UNIVERSE_CATS : raw.split(',').map(x => x.trim()).filter(x => UNIVERSE[x]);
+        if (!cats.length) return jsonResp({ error: 'unknown cat: ' + raw, cats: UNIVERSE_CATS }, 400);
+        /* 分类之间必须串行 —— 见 UNIV_CONCURRENCY 处的实测注释 */
+        const parts = await mapPool(cats, 1, async (c) => {
+          const r = await fetchUniverseCat(c);
+          const j = await r.json();
+          return { cat: c, src: r.headers.get('X-Universe-Source') || 'live', ...j };
+        });
+        const series = {}, fails = {}, srcs = {};
+        /* keyCat / names 一并下发：前端要靠它做「外生排外围」的布环，
+         * 再发一次 meta 请求纯属浪费（且两份数据可能来自不同缓存快照而不一致）。 */
+        const keyCat = {}, names = {};
+        let nOk = 0, nTot = 0;
+        parts.forEach(function (p) {
+          Object.keys(p.series || {}).forEach(k => { series[k] = p.series[k]; });
+          if (p.fail && Object.keys(p.fail).length) fails[p.cat] = p.fail;
+          srcs[p.cat] = p.src;
+          const spec = UNIVERSE[p.cat] || {};
+          Object.keys(spec).forEach(k => { keyCat[k] = p.cat; names[k] = spec[k][1]; });
+          nOk += p.nOk || 0; nTot += p.n || 0;
+        });
+        return jsonResp({ series: series, ok: Object.keys(series), fail: fails, srcs: srcs,
+          keyCat: keyCat, names: names,
+          n: nTot, nOk: nOk, cats: cats, exo: UNIVERSE_EXO, ts: Date.now() },
+          200, { 'Cache-Control': 'public, max-age=1800' });
+      } catch (e) { return jsonResp({ error: e.message, ts: Date.now() }, 502); }
+    }
+
     if (url.pathname === '/api/dvol') {
       try {
         if (url.searchParams.get('series')) {
@@ -1043,7 +1292,7 @@ export default {
     }
 
     if (url.pathname === '/' || url.pathname === '/health') {
-      return jsonResp({ name: 'nexus-proxy', version: '3.24', status: 'ok', source: 'yahoo+stooq+nyfed+treasury+mof+coinlore+finforexfactory+bitcoin-data+bybit+deribit+proxy', symbols: Object.keys(SIMPLE).concat(['EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'JGB10Y', 'DVOL', 'DVHV']) });
+      return jsonResp({ name: 'nexus-proxy', version: '3.25', status: 'ok', source: 'yahoo+stooq+nyfed+treasury+mof+coinlore+finforexfactory+bitcoin-data+bybit+deribit+proxy', universe: Object.keys(UNIVERSE).reduce(function(a,c){return a+Object.keys(UNIVERSE[c]).length;},0), symbols: Object.keys(SIMPLE).concat(['EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'JGB10Y', 'DVOL', 'DVHV']) });
     }
 
     return new Response('Not Found', { status: 404, headers: CORS });

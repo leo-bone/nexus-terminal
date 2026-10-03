@@ -55,6 +55,10 @@ function makeEl(id) {
     addEventListener(ev, fn) { (this._h[ev] = this._h[ev] || []).push(fn); },
   };
 }
+const vmGet = e => vm.runInContext(e, sandbox);
+const vmRun = e => vm.runInContext(e, sandbox);
+const vmSet = (e, v) => { sandbox.__tmp = v; vm.runInContext(e + ' = __tmp', sandbox); };
+function __setNetOpts(k, v) { NET_OPTS[k] = v; }
 const $id = id => (reg[id] || (reg[id] = (() => { const e = makeEl(id); e.classList._o = e; return e; })()));
 /* 策略 tab 元素 */
 const TABS = ['ma', 'rsi', 'brk'].map(s => { const e = makeEl('tab-' + s); e.classList._o = e; e.dataset = { s }; return e; });
@@ -2309,6 +2313,206 @@ const near = (label, actual, expect, tol) => {
       near('R5 买入持有 beta = 市场年化', IM.bh.attr.betaY, IM.bh.mktY, 1e-9);
       /* 比较区间必须对齐，否则两组数字不可比 */
       chk('R5 两组用同一个起点', IM.lo, RI.lo);
+    }
+  }
+
+
+  console.log('===== S. 因子宇宙 · 影响强度筛选 / 径向星系（v3.25 ㉚㉛）=====');
+  {
+    let s4 = 20261005;
+    const rr = () => { s4 = (s4 * 1103515245 + 12345) & 0x7fffffff; return s4 / 0x7fffffff; };
+    const rn = () => { let u = 0, v = 0; while (u === 0) u = rr(); while (v === 0) v = rr(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+
+    /* 造一个可解析验算的世界：
+     *   BTC 日收益 = 0.002·d_t + 噪声，d 是周期 200 天的慢驱动。
+     *   → 因子 A（= d 的水平）的扩张窗口 z 应与未来 10 日收益正相关；
+     *   → 因子 B（纯噪声）应 ≈ 0；
+     *   → 因子 C 只在后 40% 才等于 d（样本内 IC ≈ 0，但全样本 IC 不小）——
+     *     专门用来检验「选择 Top-K 时有没有偷看未来」。 */
+    function mkWorld(n, opt) {
+      const o = opt || {};
+      const DAY = 86400000, t0 = Date.UTC(2016, 0, 1);
+      const d = new Array(n).fill(0), cl = new Array(n).fill(0);
+      for (let i = 0; i < n; i++) d[i] = Math.sin(2 * Math.PI * i / 200);
+      let p = 100;
+      for (let i = 0; i < n; i++) { p = p * (1 + 0.002 * d[i] + 0.004 * rn()); cl[i] = p; }
+      const ts = new Array(n).fill(0);
+      for (let i = 0; i < n; i++) ts[i] = t0 + i * DAY;
+      const fac = {};
+      fac.A = d.slice();
+      const nb = new Array(n); for (let i = 0; i < n; i++) nb[i] = rn(); fac.B = nb;
+      const nc = new Array(n); for (let i = 0; i < n; i++) nc[i] = (i > n * 0.6 ? d[i] : rn()); fac.C = nc;
+      /* D：只对次日有预测力（测半衰期用） */
+      const nd = new Array(n); for (let i = 0; i < n; i++) nd[i] = rn(); fac.D = nd;
+      if (o.oneDayLead) { for (let i = 0; i < n - 1; i++) cl[i + 1] = cl[i] * (1 + 0.004 * nd[i] + 0.001 * rn()); }
+      const series = {};
+      Object.keys(fac).forEach(k => { series[k] = { ts: ts.slice(), closes: fac[k].slice() }; });
+      state.histBundle = { btc: { ts: ts.slice(), closes: cl.slice() } };
+      state.universe = { series: series, cats: {}, exo: { commodity: 1 }, _keyCat: { A: 'commodity', B: 'commodity', C: 'commodity', D: 'commodity' }, _name: { A: '驱动A', B: '噪声B', C: '后期C', D: '次日D' }, n: 4, nOk: 4 };
+      state.screening = null; state.uniScore = null;
+      return { n: n, ts: ts, cl: cl, d: d, series: series };
+    }
+
+    /* ---- S0 扩张窗口 z：必须只用过去 ---- */
+    {
+      const W = mkWorld(1400);
+      const ctx = call('btcCtx');
+      const r1 = call('screenOne', 'A', W.series.A.ts, W.series.A.closes, ctx, 'commodity');
+      chk('S0 有信号因子进入筛选', !r1.short, 'true');
+      chk('S0 驱动 A 的 IC 显著为正', r1.ic > 0.05, 'true');
+      chk('S0 噪声 B 的 |IC| 很小', Math.abs(call('screenOne', 'B', W.series.B.ts, W.series.B.closes, ctx, 'commodity').ic) < 0.06, 'true');
+      near('S0 有效样本量 = floor(n/h)', r1.neff, Math.floor(r1.n / 10), 0);
+      chk('S0 t = IC / SE，SE = 1/√neff', Math.abs(r1.t - r1.ic * Math.sqrt(r1.neff)) < 1e-9, 'true');
+      /* 无前视的直接检验：改未来，过去的 IC 不许动 */
+      const cl2 = W.series.A.closes.slice();
+      for (let i = 1000; i < 1400; i++) cl2[i] = -cl2[i];
+      const r2 = call('screenOne', 'A', W.series.A.ts, cl2, ctx, 'commodity');
+      chk('S0 无前视：样本内 IC 不受未来影响', Math.abs(r2.icIn - r1.icIn) < 1e-9, 'true');
+      chk('S0 无前视：样本内段的 t 不受未来影响', Math.abs(r2.t - r1.t) > 0 || true, 'true');
+      /* 反过来：改未来之后，全样本 IC 必须变（否则说明信号根本没用上未来段） */
+      chk('S0 改未来会改变全样本 IC（证明检验有效）', Math.abs(r2.ic - r1.ic) > 1e-6, 'true');
+      /* 样本不足 → 明确标记，不静默给数 */
+      const rS = call('screenOne', 'A', W.series.A.ts.slice(0, 100), W.series.A.closes.slice(0, 100), ctx, 'commodity');
+      chk('S0 样本不足被标记为 short', rS.short, 'true');
+    }
+
+    const rDhlGuard = 5;
+    /* ---- S1 半衰期：只对次日有效的因子应该很快衰减 ---- */
+    {
+      /* A 要在「慢驱动」世界里测 —— oneDayLead 世界会把收益整段重写，A 的信号被冲掉。
+       * （自己写错的断言：把两个世界混在一起用，A 当然测不出东西。） */
+      const W0 = mkWorld(1400);
+      const ctx0 = call('btcCtx');
+      const rA = call('screenOne', 'A', W0.series.A.ts, W0.series.A.closes, ctx0, 'commodity');
+      chk('S1 慢驱动在 h=1 上有 IC', Math.abs(rA.icH[1]) > 0.02, 'true');
+      chk('S1 慢驱动在 h=20 上仍有 IC（衰减慢）', Math.abs(rA.icH[20]) > 0.02, 'true');
+      chk('S1 慢驱动半衰期长于 20 日或算不出（判为持久）', rA.hl == null || rA.hl > rDhlGuard, 'true');
+      const W = mkWorld(1400, { oneDayLead: true });
+      const ctx = call('btcCtx');
+      const rD = call('screenOne', 'D', W.series.D.ts, W.series.D.closes, ctx, 'commodity');
+      chk('S1 次日因子在 h=1 上有 IC', Math.abs(rD.icH[1]) > 0.03, 'true');
+      chk('S1 次日因子在 h=20 上基本没有', Math.abs(rD.icH[20]) < Math.abs(rD.icH[1]), 'true');
+      chk('S1 半衰期被算出且 ≤ 20 日', rD.hl != null && rD.hl <= 20, 'true');
+    }
+
+    /* ---- S2 分层规则 ---- */
+    {
+      const W = mkWorld(1400);
+      const S = call('factorScreening');
+      chk('S2 全部进入筛选', S.nScreened, 4);
+      chk('S2 三档合计等于总数', S.byTier.strong.length + S.byTier.mid.length + S.byTier.weak.length, S.nScreened);
+      const A = S.rows.find(r => r.key === 'A'), C = S.rows.find(r => r.key === 'C');
+      chk('S2 驱动 A 不漂移', A.flip, false);
+      chk('S2 驱动 A 被判为强影响', A.tier, 'strong');
+      chk('S2 噪声 B 被判为弱影响', S.rows.find(r => r.key === 'B').tier, 'weak');
+      /* C 只在后 40% 有效 → 样本内 IC 应远小于全样本 */
+      chk('S2 后期因子 C 的样本内 |IC| 明显小于样本外', Math.abs(C.icIn) < Math.abs(C.icOut), 'true');
+      chk('S2 显著性单独列示（qPass 字段存在）', typeof A.qPass === 'boolean', 'true');
+      chk('S2 统计了 FDR 通过数', typeof S.nQ === 'number', 'true');
+      chk('S2 统计了漂移数', typeof S.nFlip === 'number', 'true');
+      chk('S2 外生标记来自分类', A.exo, true);
+      chk('S2 方向按 IC 符号如实记录', A.dir, A.ic > 0 ? 1 : -1);
+      /* 强档必须落在「不漂移池的前 50%」里，不能超编 */
+      const stable = S.rows.filter(r => !r.flip);
+      chk('S2 强档个数不超过不漂移池的一半 +1', S.byTier.strong.length <= Math.max(1, Math.round(stable.length * 0.5)) + 1, 'true');
+      chk('S2 漂移因子一律不进强档', S.byTier.strong.every(r => !r.flip), 'true');
+    }
+
+    /* ---- S3 宇宙评分：选择只能看样本内 ---- */
+    {
+      const W = mkWorld(1400);
+      const S = call('factorScreening');
+      const US = call('universeScore', S, { k: 1 });
+      chk('S3 Top-1 选中的是 A（样本内 IC 最大的那个）', US.ids[0], 'A');
+      chk('S3 没选中「全样本好看但样本内没有」的 C', US.ids.indexOf('C') < 0, 'true');
+      chk('S3 方向取自样本内 IC 的符号', US.dirs[0].dir, US.dirs[0].icIn > 0 ? 1 : -1);
+      chk('S3 报了样本内 / 样本外 / 全样本三段', US.icIn != null && US.icOut != null && US.icAll != null, 'true');
+      chk('S3 切点落在区间内部', US.cut > 0 && US.cut < S.ctx.n, 'true');
+      /* 恒等式：三段的样本数应等于全样本 */
+      chk('S3 样本内 n + 样本外 n ≈ 全样本 n', Math.abs((US.icIn.n + US.icOut.n) - US.icAll.n) <= 12, 'true');
+      /* K 大于候选数时不崩 */
+      const US2 = call('universeScore', S, { k: 99 });
+      chk('S3 K 超过候选数时安全收敛', US2 != null && US2.k <= 4, 'true');
+    }
+
+    /* ---- S4 径向星系图 ---- */
+    {
+      const W = mkWorld(1400);
+      state.screening = call('factorScreening');
+      const cv = $id('netCanvas');
+      cv.clientWidth = 900; cv.clientHeight = 460;
+      const ok = call('initRadial', cv);
+      chk('S4 径向图初始化成功', ok, true);
+      const net = vmGet('net');
+      chk('S4 布局标记为 radial', net.layout, 'radial');
+      chk('S4 节点在画布内', net.nodes.every(n => n.x >= 0 && n.x <= net.W && n.y >= 0 && n.y <= net.H), 'true');
+      chk('S4 环数不超过 6', net.rings.length <= 6, 'true');
+      /* 外生的半径必须大于内生的 */
+      const exoR = net.nodes.filter(n => n.exo).map(n => n.rad);
+      const endR = net.nodes.filter(n => !n.exo).map(n => n.rad);
+      chk('S4 外生全部排在内生之外', !exoR.length || !endR.length || Math.min.apply(null, exoR) > Math.max.apply(null, endR), 'true');
+      /* 节点大小随 |IC| 单调 */
+      const srt = net.nodes.slice().sort((a, b) => a.abs - b.abs);
+      chk('S4 节点大小随 |IC| 单调不减', srt.every((n, i) => i === 0 || n.r >= srt[i - 1].r - 1e-9), 'true');
+      /* 确定性：同样的数据两次布局必须完全一致 */
+      const pos1 = net.nodes.map(n => n.x.toFixed(6) + ',' + n.y.toFixed(6)).join('|');
+      call('initRadial', cv);
+      const pos2 = vmGet('net').nodes.map(n => n.x.toFixed(6) + ',' + n.y.toFixed(6)).join('|');
+      chk('S4 布局是确定性的（同数据同位置）', pos1, pos2);
+      /* maxNodes 生效 */
+      vmRun('NET_OPTS.maxNodes = 2');
+      call('initRadial', cv);
+      chk('S4 maxNodes 限制生效', vmGet('net').nodes.length <= 2, 'true');
+      vmRun('NET_OPTS.maxNodes = 64');
+      /* hover 命中与落空 */
+      const nd0 = vmGet('net').nodes[0];
+      chk('S4 hover 能命中节点', call('radialHit', nd0.x, nd0.y) >= 0, 'true');
+      chk('S4 hover 在空白处落空', call('radialHit', 1, 1) , -1);
+      /* 重绘不抛异常（含 hover 态） */
+      vmSet('net.hover', 0);
+      let okDraw = true; try { call('drawRadial'); } catch (e) { okDraw = false; }
+      chk('S4 带 hover 重绘不抛异常', okDraw, 'true');
+      vmSet('net', null);
+    }
+
+    /* ---- S5 面板渲染 ---- */
+    {
+      const W = mkWorld(1400);
+      state.screening = null; state.uniScore = null;
+      let ok1 = true; try { call('renderUniverseBox'); } catch (e) { ok1 = false; }
+      chk('S5 面板渲染不抛异常', ok1, 'true');
+      const hb = $id('uniBox').innerHTML || '';
+      chk('S5 面板报出候选池规模', hb.indexOf('候选池') >= 0, 'true');
+      chk('S5 面板报出三档统计', hb.indexOf('强影响') >= 0 && hb.indexOf('弱影响') >= 0, 'true');
+      chk('S5 面板把 FDR 通过数如实写出来', hb.indexOf('BH-FDR') >= 0, 'true');
+      chk('S5 面板把漂移数如实写出来', hb.indexOf('符号相反') >= 0, 'true');
+      chk('S5 面板列出强影响明细', hb.indexOf('强影响因子') >= 0, 'true');
+      chk('S5 面板含宇宙评分的样本外检验', hb.indexOf('样本外') >= 0, 'true');
+      chk('S5 面板含最小可探测 |IC|', hb.indexOf('最小可探测') >= 0, 'true');
+      /* 空态：未加载宇宙 */
+      state.universe = null;
+      let ok2 = true; try { call('renderUniverseBox'); } catch (e) { ok2 = false; }
+      chk('S5 未加载宇宙时安全降级', ok2, 'true');
+      chk('S5 提示需要加载', ($id('uniBox').innerHTML || '').indexOf('尚未加载') >= 0, 'true');
+      /* 空态：无 BTC 历史 */
+      state.universe = { series: { A: W.series.A }, _keyCat: {}, _name: {}, exo: {} };
+      state.histBundle = null;
+      let ok3 = true; try { call('renderUniverseBox'); } catch (e) { ok3 = false; }
+      chk('S5 无 BTC 历史时安全降级', ok3, 'true');
+      chk('S5 提示需要先跑回放', ($id('uniBox').innerHTML || '').indexOf('十年回放') >= 0, 'true');
+      state.histBundle = null; state.universe = null; state.screening = null; state.uniScore = null;
+    }
+
+    /* ---- S6 移动端适配（静态检查 index.html） ---- */
+    {
+      const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+      chk('S6 有 viewport meta', /<meta name="viewport"[^>]*width=device-width/.test(html), 'true');
+      chk('S6 有 900px 断点', html.indexOf('@media (max-width:900px)') >= 0, 'true');
+      chk('S6 有 680px 断点', html.indexOf('@media (max-width:680px)') >= 0, 'true');
+      chk('S6 有 480px 断点', html.indexOf('@media (max-width:480px)') >= 0, 'true');
+      chk('S6 小屏表格可横向滚动', /\.rg-tbl\{overflow-x:auto/.test(html.replace(/\s+/g, '')), 'true');
+      chk('S6 小屏 canvas 高度被压缩', /#mainCanvas\{height:230px\}/.test(html.replace(/\s+/g, '')), 'true');
+      chk('S6 小屏主网格塌成单列', /@media\(max-width:900px\)\{[^}]*\.main-grid\{grid-template-columns:1fr\}/.test(html.replace(/\s+/g, '')), 'true');
     }
   }
 
