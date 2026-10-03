@@ -1,5 +1,5 @@
 /* =====================================================================
- * NEXUS TERMINAL v3.28 — 加密货币实时监测与因子关系终端
+ * NEXUS TERMINAL v3.29 — 加密货币实时监测与因子关系终端
  * 纯前端 / 无后端 / 无构建步骤。可直接 file:// 打开，也可部署到 Cloudflare。
  *
  * 数据源（全经 Cloudflare Worker 代理，解决中国大陆无法直连 + 浏览器 CORS）:
@@ -7660,6 +7660,7 @@ async function loadUniverse(cats, opts) {
  * 空数组返回 null 而不是 NaN，下游判空更省心。 */
 function meanOf(a) { if (!a || !a.length) return null; let s = 0; for (let i = 0; i < a.length; i++) s += a[i]; return s / a.length; }
 function sdOf(a) { if (!a || a.length < 2) return null; const m = meanOf(a); let v = 0; for (let i = 0; i < a.length; i++) v += (a[i] - m) * (a[i] - m); return Math.sqrt(v / (a.length - 1)); }
+function medianOf(a) { if (!a || !a.length) return null; const b = a.slice().filter(function (x) { return x != null && isFinite(x); }).sort(function (x, y) { return x - y; }); if (!b.length) return null; const k = b.length >> 1; return b.length % 2 ? b[k] : (b[k - 1] + b[k]) / 2; }
 
 /* ---------- 对齐：把任意序列的日期映射到 BTC 日线下标 ---------- */
 const dayKey = t => new Date(t).toISOString().slice(0, 10);
@@ -8535,6 +8536,16 @@ function oosTrack(S, opts) {
  * 定位问题：这套因子做不了方向择时（样本外摆在那儿），但「现在这批外生变量
  * 处在历史的什么位置」是**状态描述**，不是预测 —— 它不需要 IC 显著，
  * 只需要「当前值 / 历史分布」这个比值是真的。这正是它能诚实提供的东西。 */
+
+/* v3.29 历史崩溃体制窗口：用来给「当前读数有多极端」一个**有锚点的参照**。
+ * 光看「自身历史的 5/95 分位尾巴」阈值有点任意；更可辩护的问法是：
+ * 「现在这个变量偏离自己常态的幅度，达到了 2020 COVID / 2022 熊市那种级别的几成？」
+ * 这些窗口是固定的历史区间（UTC 日期），只用于回望、不参与任何前视。 */
+const RISK_CRASH_WINDOWS = [
+  { label: 'COVID', lo: '2020-02-20', hi: '2020-03-23' },   // 全球流动性冻结
+  { label: '2022熊', lo: '2021-11-08', hi: '2022-12-31' },  // 加息 + 崩盘 + FTX
+];
+
 function riskMonitor(S, opts) {
   const o = opts || {};
   if (!S || !S.rows || !S.rows.length) return null;
@@ -8581,9 +8592,41 @@ function riskMonitor(S, opts) {
       sd120 = Math.sqrt(Math.max(v2 / tail.length, 0));
     }
     const rc = (d60 != null && sd120 != null && sd120 > 1e-9) ? d60 / sd120 : null;
+
+    /* v3.29 历史崩溃体制对照 —— 把「极端」从任意的 5/95 尾巴升级成有锚点的崩溃级偏离。
+     * ext：当前值相对自身长周期（全样本）中位数、以全样本 σ 度量的带符号偏离（自身常态偏离）。
+     * vsCrash：|ext| 占历史上几次崩溃窗口内达到过的最大 |偏离| 的比例。
+     *   0.6 = 当前只到 2020/2022 峰值极端度的 6 成；≥1.0 = 已超过历史崩溃峰值。
+     * 只回望固定历史窗口、不碰未来，无前视。若某段数据根本不覆盖这些窗口（refMax 保持 0），
+     * 则 vsCrash=null，也不会因此误触发崩溃警报；覆盖到窗口但无真实崩盘尖峰时 vsCrash 仍 < 0.8。 */
+    const finite = vals.map(function (q) { return sig[q]; }).filter(function (x) { return x != null && isFinite(x); });
+    const med = medianOf(finite);
+    let v2s = 0; for (let q = 0; q < finite.length; q++) v2s += (finite[q] - med) * (finite[q] - med);
+    const sdAll = Math.sqrt(v2s / Math.max(finite.length, 1));
+    const ext = (sdAll > 1e-9 && med != null) ? (lastV - med) / sdAll : 0;
+    let refMax = 0;
+    for (let w = 0; w < RISK_CRASH_WINDOWS.length; w++) {
+      const W = RISK_CRASH_WINDOWS[w];
+      const tLo = Date.parse(W.lo + 'T00:00:00Z'), tHi = Date.parse(W.hi + 'T00:00:00Z');
+      let lo = -1, hi = -1;
+      for (let q = 0; q < ctx.ts.length; q++) { if (ctx.ts[q] >= tLo) { lo = q; break; } }
+      for (let q = ctx.ts.length - 1; q >= 0; q--) { if (ctx.ts[q] <= tHi) { hi = q; break; } }
+      if (lo < 0 || hi < 0 || hi < lo) continue;
+      for (let q = lo; q <= hi; q++) {
+        if (sig[q] == null || !isFinite(sig[q])) continue;
+        const e = (lastV - sig[q]); // 窗口内每天的偏离（相对当前），取绝对最大
+        if (Math.abs(e) > refMax) refMax = Math.abs(e);
+      }
+    }
+    // refMax 是窗口内相对当前的最大位移；换算成 σ 单位，与 ext 同口径
+    const refMaxSig = sdAll > 1e-9 ? refMax / sdAll : 0;
+    const vsCrash = refMaxSig > 1e-9 ? Math.abs(ext) / refMaxSig : null;
+    const crash = vsCrash != null && vsCrash >= 0.8;
+
     out.push({
       cat: c, zh: CAT_ZH[c] || c, n: ids.length, sig: sig, lastJ: lastJ,
       now: lastV, pct: pct, d60: d60, rc: rc,
+      med: med, sdAll: sdAll, ext: ext, vsCrash: vsCrash, crash: crash,
       extreme: pct == null ? null : (pct <= 0.05 ? 'low' : pct >= 0.95 ? 'high' : null),
       date: ctx.ts[lastJ],
     });
@@ -8604,8 +8647,10 @@ function riskMonitor(S, opts) {
  *
  * 三个分量（各自 0=静 / 1=警 / 2=危），护栏取三者最大值：
  *   ① DVOL 波动率体制：DVOL 当前值处于自身近1年的什么百分位（隐含波动率 = crypto 原生恐惧温度计）
- *   ② 全分类极端分位联动：风险监测里同时处于历史极端分位（≤5% 或 ≥95%）的分类有几类；
- *      再叠加 BTC 已实现波动率的「极端体制」（vol≥0.80 年化）。多个互不相关的资产类同时到极端 = 系统性联动。
+ *   ② 全分类极端分位联动（v3.29 历史锚定）：风险监测里同时「逼近/超过历史崩溃级偏离（vsCrash≥0.8×，
+ *      即达到 2020 COVID / 2022 熊市窗口内出现过的最大偏离的 8 成以上）」的分类有几类；
+ *      再叠加 BTC 已实现波动率的「极端体制」（vol≥0.80 年化）。多个互不相关的资产类同时到崩溃级 = 系统性联动。
+ *      阈值比 v3.28 的任意 5/95 尾巴更可辩护（对照的是真实崩盘级别，不是自身分布的尾部）。
  *   ③ 变化率联动：风险监测里「近60日位移 ≥ 1.5σ」的分类有几类（在加速）。
  * 任何单一分量到「危」即触发 RED；RED 的含义是「降杠杆 / 减仓 / 不追高」的参考，不是「做空」指令。
  * ===================================================================== */
@@ -8622,15 +8667,16 @@ function guardrail(S, opts) {
   }
 
   /* ② + ③ 来自风险监测（全分类状态） */
-  let nHigh = 0, nLow = 0, nAccel = 0;
+  let nHigh = 0, nLow = 0, nAccel = 0, nCrash = 0;
   const firing = [];
   if (RM && RM.rows && RM.rows.length) {
     RM.rows.forEach(function (r) {
-      if (r.extreme === 'high') { nHigh++; firing.push({ cat: r.cat, zh: r.zh, kind: '历史高位', pct: r.pct, rc: r.rc }); }
-      else if (r.extreme === 'low') { nLow++; firing.push({ cat: r.cat, zh: r.zh, kind: '历史低位', pct: r.pct, rc: r.rc }); }
+      if (r.extreme === 'high') { nHigh++; firing.push({ cat: r.cat, zh: r.zh, kind: '历史高位', pct: r.pct, rc: r.rc, vsCrash: r.vsCrash }); }
+      else if (r.extreme === 'low') { nLow++; firing.push({ cat: r.cat, zh: r.zh, kind: '历史低位', pct: r.pct, rc: r.rc, vsCrash: r.vsCrash }); }
+      if (r.crash) { nCrash++; firing.push({ cat: r.cat, zh: r.zh, kind: (r.vsCrash != null && r.vsCrash >= 1 ? '超历史峰值' : '逼近历史峰值(≥0.8×)'), pct: r.pct, rc: r.rc, vsCrash: r.vsCrash }); }
       if (r.rc != null && isFinite(r.rc) && Math.abs(r.rc) >= 1.5) {
         nAccel++;
-        if (!firing.some(function (f) { return f.cat === r.cat; })) firing.push({ cat: r.cat, zh: r.zh, kind: '加速(≥1.5σ)', pct: r.pct, rc: r.rc });
+        if (!firing.some(function (f) { return f.cat === r.cat; })) firing.push({ cat: r.cat, zh: r.zh, kind: '加速(≥1.5σ)', pct: r.pct, rc: r.rc, vsCrash: r.vsCrash });
       }
     });
   }
@@ -8638,7 +8684,9 @@ function guardrail(S, opts) {
   const reg = currentRegime();
   const volWild = !!(reg && reg.key === 'wild');
   let regimeLevel = null;
-  if (nExtreme != null) regimeLevel = (nExtreme >= 2 || volWild) ? 2 : (nExtreme === 1 ? 1 : 0);
+  /* v3.29：分量②的「危/警」改用历史锚定的 nCrash（≥0.8× 历史崩溃峰值）触发，
+   * 阈值比任意的 5/95 尾巴更可辩护；nExtreme（5/95 尾巴）保留为信息展示。 */
+  if (nCrash != null) regimeLevel = (nCrash >= 2 || volWild) ? 2 : (nCrash === 1 ? 1 : 0);
   let accelLevel = null;
   if (nAccel != null) accelLevel = nAccel >= 2 ? 2 : (nAccel === 1 ? 1 : 0);
 
@@ -8648,7 +8696,7 @@ function guardrail(S, opts) {
 
   return {
     dv: dv, dvolLevel: dvolLevel,
-    nHigh: nHigh, nLow: nLow, nExtreme: nExtreme, regimeLevel: regimeLevel, volWild: volWild, regVol: reg ? reg.vol : null,
+    nHigh: nHigh, nLow: nLow, nExtreme: nExtreme, nCrash: nCrash, regimeLevel: regimeLevel, volWild: volWild, regVol: reg ? reg.vol : null,
     nAccel: nAccel, accelLevel: accelLevel,
     status: status, label: label, firing: firing,
     asof: (RM && RM.asof) || (dv && dv.date) || null,
@@ -9010,7 +9058,8 @@ function guardrailHTML(G) {
     '<span class="rg-dim">' + (G.dv ? ('DVOL=' + num(G.dv.latest, 0) + ' · 近1年百分位 ' + pc(G.dv.pctTrailing1y) + ' · 60日z ' + num(G.dv.z60)) : 'DVOL 数据不可用（需先跑十年回放）') + '</span></div>';
   h += '<div class="rg-row" style="grid-template-columns:1.6fr .6fr 2.4fr">' +
     '<span class="rg-nm">② 全分类极端分位联动</span>' + badge(G.regimeLevel) +
-    '<span class="rg-dim">历史高位 ' + G.nHigh + ' 类 · 历史低位 ' + G.nLow + ' 类' +
+    '<span class="rg-dim">历史崩溃级偏离(≥0.8×峰值) ' + (G.nCrash || 0) + ' 类' +
+    (G.nExtreme ? ' · 5/95尾巴 ' + G.nExtreme + ' 类' : '') +
     (G.volWild ? ' · 叠加 BTC 波动率极端体制(vol≥0.80)' : (G.regVol != null ? ' · BTC 年化波动 ' + num(G.regVol) : '')) + '</span></div>';
   h += '<div class="rg-row" style="grid-template-columns:1.6fr .6fr 2.4fr">' +
     '<span class="rg-nm">③ 变化率联动</span>' + badge(G.accelLevel) +
@@ -9020,12 +9069,16 @@ function guardrailHTML(G) {
   /* 触发清单 */
   if (G.firing && G.firing.length) {
     h += '<div class="rg-sub" style="margin-top:8px"><b>正在触发：</b></div><div class="rg-tbl">';
-    h += '<div class="rg-hd" style="grid-template-columns:1.4fr 1.4fr 1fr .8fr"><span>分类</span><span>状态</span><span>历史分位</span><span>变化率σ</span></div>';
+    h += '<div class="rg-hd" style="grid-template-columns:1.3fr 1.5fr .9fr .9fr .7fr"><span>分类</span><span>状态</span><span>历史分位</span><span>vs崩溃峰值</span><span>变化率σ</span></div>';
     G.firing.forEach(function (f) {
-      h += '<div class="rg-row" style="grid-template-columns:1.4fr 1.4fr 1fr .8fr">' +
+      const vc = f.vsCrash == null ? null : f.vsCrash;
+      const vcCls = vc == null ? 'rg-dim' : (vc >= 1 ? 'rg-r' : vc >= 0.8 ? 'rg-y' : 'rg-dim');
+      const vcTxt = vc == null ? '—' : (vc >= 1 ? '超峰值' : vc.toFixed(1) + '×');
+      h += '<div class="rg-row" style="grid-template-columns:1.3fr 1.5fr .9fr .9fr .7fr">' +
         '<span class="rg-nm" style="color:' + (CAT_COLORS[f.cat] || CAT_COLORS.other) + '">' + f.zh + '</span>' +
         '<span class="rg-dim">' + f.kind + '</span>' +
         '<span class="rg-dim">' + pc(f.pct) + '</span>' +
+        '<span class="' + vcCls + '">' + vcTxt + '</span>' +
         '<span class="' + (f.rc == null ? 'rg-dim' : Math.abs(f.rc) >= 1.5 ? 'rg-y' : 'rg-dim') + '">' + (f.rc == null ? '—' : (f.rc >= 0 ? '+' : '') + f.rc.toFixed(1)) + '</span></div>';
     });
     h += '</div>';
@@ -9263,26 +9316,31 @@ function compositeHTML(C, S) {
       '（所以这里<b>不做方向翻正</b>，报的就是变量自身的位置，不是多空倾向）。' +
       '状态描述不需要 IC 显著，只需要分位是真的 —— 这正是这套因子能诚实提供的东西。</span></div>';
     h += '<div class="rg-tbl">';
-    h += '<div class="rg-hd" style="grid-template-columns:1.1fr .6fr 1.9fr .8fr .9fr"><span>分类</span><span>当前值</span><span>历史分位</span><span>近60日</span><span>变化率(σ)</span></div>';
+    h += '<div class="rg-hd" style="grid-template-columns:1.0fr .55fr 1.7fr 1.1fr .7fr .9fr"><span>分类</span><span>当前值</span><span>历史分位</span><span>历史对照(vs崩溃峰值)</span><span>近60日</span><span>变化率(σ)</span></div>';
     RM.rows.forEach(function (r) {
       const p = r.pct == null ? 0.5 : r.pct;
-      h += '<div class="rg-row" style="grid-template-columns:1.2fr .7fr 2.2fr .8fr">' +
+      const vc = r.vsCrash == null ? null : r.vsCrash;
+      const vcCls = vc == null ? 'rg-dim' : (vc >= 1 ? 'rg-r' : vc >= 0.8 ? 'rg-y' : 'rg-dim');
+      const vcTxt = vc == null ? '—' : (vc >= 1 ? '超历史峰值' : vc >= 0.8 ? (vc.toFixed(1) + '×逼近') : (vc.toFixed(1) + '×峰值'));
+      h += '<div class="rg-row" style="grid-template-columns:1.1fr .6fr 2.0fr 1.2fr .7fr .9fr">' +
         '<span class="rg-nm" style="color:' + (CAT_COLORS[r.cat] || CAT_COLORS.other) + '">' + r.zh + '</span>' +
         '<span class="rg-dim">' + sg(r.now) + '</span>' +
         '<span><span style="display:inline-block;width:64%;vertical-align:middle;height:6px;border-radius:3px;' +
         'background:linear-gradient(90deg,#00e5a0,#ffb300,#ff3d6e);position:relative">' +
         '<i style="position:absolute;top:-3px;left:' + (p * 100).toFixed(1) + '%;width:2px;height:12px;background:#fff;border-radius:1px"></i></span>' +
         ' <b style="font-size:9px">' + pc(r.pct, 0) + '</b>' +
-        (r.extreme ? ' <b class="' + (r.extreme === 'high' ? 'rg-r' : 'rg-g') + '" style="font-size:9px">' + (r.extreme === 'high' ? '历史高位' : '历史低位') + '</b>' : '') +
+        (r.extreme ? ' <b class="' + (r.extreme === 'high' ? 'rg-r' : 'rg-g') + '" style="font-size:9px">' + (r.extreme === 'high' ? '高位' : '低位') + '</b>' : '') +
         '</span>' +
+        '<span class="' + vcCls + '">' + (r.ext == null ? '—' : (r.ext >= 0 ? '+' : '') + r.ext.toFixed(1) + 'σ') + ' · ' + vcTxt + '</span>' +
         '<span class="rg-dim">' + sg(r.d60) + '</span>' +
         '<span class="' + (r.rc == null ? 'rg-dim' : Math.abs(r.rc) >= 1.5 ? 'rg-y' : 'rg-dim') + '">' + (r.rc == null ? '—' : (r.rc >= 0 ? '+' : '') + r.rc.toFixed(1)) + '</span></div>';
     });
     h += '</div>';
     h += '<div class="rg-sub"><span class="rg-dim">分位按「扩张窗口」算：只用当前时点之前的样本给自己排名次，' +
-      '所以不存在前视。近 60 日与变化率(σ)都是状态量，不是预测。' +
-      '<b>极端分位不等于要涨要跌</b> —— 它只说明这个变量现在离它自己的常态有多远；' +
-      '变化率(σ)大只说明它最近移动得快，不说明接下来往哪走。</span></div>';
+      '所以不存在前视。新增加的<b>历史对照</b>列：左边是该变量相对自身长周期常态的 σ 偏离（带符号），' +
+      '右边是「这个偏离占 2020 COVID / 2022 熊市那种崩溃窗口内出现过的最大偏离的几成」——' +
+      '这是给护栏分量②的「极端」阈值一个<b>有历史锚点的参照</b>，比单纯的 5/95 尾巴更可辩护。' +
+      '<b>极端分位 ≠ 要涨要跌</b>，它只说明变量现在离自己常态多远；变化率(σ)大只说明最近移动快。</span></div>';
   }
 
   /* ---- 定位声明 ---- */

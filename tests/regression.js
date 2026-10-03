@@ -3067,12 +3067,12 @@ const near = (label, actual, expect, tol) => {
       chk('V2 触发清单含两类', G && G.firing.length === 2, 'true');
 
       setRisk([
-        { cat: 'rate', zh: '利率', extreme: 'high', pct: 0.97, rc: 0.1 },
-        { cat: 'fx', zh: '外汇', extreme: 'high', pct: 0.96, rc: 0.1 },
+        { cat: 'rate', zh: '利率', extreme: 'high', pct: 0.97, rc: 0.1, crash: true, vsCrash: 1.1 },
+        { cat: 'fx', zh: '外汇', extreme: 'high', pct: 0.96, rc: 0.1, crash: true, vsCrash: 0.9 },
         calmRow('vol', '波动率'),
       ]);
       G = call('guardrail', {});
-      chk('V2 两类极端 → RED（极端分位联动）', G && G.label === 'RED' && G.status === 2, 'true');
+      chk('V2 两类崩溃级偏离 → RED（历史锚定的极端分位联动）', G && G.label === 'RED' && G.status === 2 && G.nCrash === 2, 'true');
 
       setRisk([
         { cat: 'rate', zh: '利率', extreme: null, pct: 0.5, rc: 1.8 },
@@ -3096,8 +3096,8 @@ const near = (label, actual, expect, tol) => {
     /* V3 护栏 HTML 渲染：无 undefined / NaN，含状态标签与三联分量 */
     {
       setRisk([
-        { cat: 'rate', zh: '利率', extreme: 'high', pct: 0.97, rc: 0.1 },
-        { cat: 'fx', zh: '外汇', extreme: 'high', pct: 0.96, rc: 1.8 },
+        { cat: 'rate', zh: '利率', extreme: 'high', pct: 0.97, rc: 0.1, crash: true, vsCrash: 1.1 },
+        { cat: 'fx', zh: '外汇', extreme: 'high', pct: 0.96, rc: 1.8, crash: true, vsCrash: 0.9 },
         calmRow('vol', '波动率'),
       ]);
       state.histBundle = { btc: {} };
@@ -3109,6 +3109,7 @@ const near = (label, actual, expect, tol) => {
       chk('V3 面板报出 RED', html.indexOf('RED') >= 0, 'true');
       chk('V3 面板报出「不报方向」', html.indexOf('不报方向') >= 0, 'true');
       chk('V3 面板报出三联分量', html.indexOf('DVOL 波动率体制') >= 0 && html.indexOf('全分类极端分位联动') >= 0 && html.indexOf('变化率联动') >= 0, 'true');
+      chk('V3 面板含「vs崩溃峰值」列', html.indexOf('vs崩溃峰值') >= 0, 'true');
     }
 
     /* V4 端到端：合成世界 + 真实 riskMonitor，护栏不抛异常且 status 合法 */
@@ -3129,6 +3130,78 @@ const near = (label, actual, expect, tol) => {
     }
 
     /* 还原 state（V 是最后一段，仍清干净） */
+    state.histBundle = null; state.universe = null; state.screening = null;
+    state.uniScore = null; state.composite = null; state.risk = null; state.oos = null; state.guardrail = null; state.klines = null;
+  }
+
+  console.log('===== W. 风险监测历史崩溃对照 + 护栏历史锚定（v3.29 ㉟）=====');
+  {
+    const setRiskW = (rows) => { state.risk = { rows: rows, asof: now }; };
+
+    /* W1 护栏分量②历史锚定：阈值从「5/95 尾巴」升级成「崩溃级偏离（vsCrash≥0.8）」 */
+    {
+      /* 仅有 5/95 尾巴、未达崩溃级 → 改版前会直接 RED，现在不应触发分量②危 */
+      setRiskW([
+        { cat: 'rate', zh: '利率', extreme: 'high', pct: 0.97, rc: 0.1 },
+        { cat: 'fx', zh: '外汇', extreme: 'high', pct: 0.96, rc: 0.1 },
+      ]);
+      state.histBundle = { btc: {} };
+      let G = call('guardrail', {});
+      chk('W1 仅有5/95尾巴、无崩溃级偏离 → nCrash=0', G && G.nCrash === 0, 'true');
+      chk('W1 此类情形分量②不触发危（regimeLevel=0）', G && G.regimeLevel === 0, 'true');
+      chk('W1 总状态不是 RED（改版前会是）', G && G.label !== 'RED', 'true');
+
+      /* 两类达到崩溃级偏离 → nCrash=2 → 分量②危 → RED */
+      setRiskW([
+        { cat: 'rate', zh: '利率', extreme: 'high', pct: 0.97, rc: 0.1, crash: true, vsCrash: 1.1 },
+        { cat: 'fx', zh: '外汇', extreme: 'high', pct: 0.96, rc: 0.1, crash: true, vsCrash: 0.9 },
+      ]);
+      G = call('guardrail', {});
+      chk('W1 两类崩溃级偏离 → nCrash=2', G && G.nCrash === 2, 'true');
+      chk('W1 两类崩溃级偏离 → 分量②危（regimeLevel=2）', G && G.regimeLevel === 2, 'true');
+      chk('W1 两类崩溃级偏离 → 总状态 RED', G && G.label === 'RED', 'true');
+      chk('W1 触发清单含「超历史峰值」', G && G.firing.some(f => /超历史峰值|逼近历史峰值/.test(f.kind)), 'true');
+
+      /* 单类逼近峰值（0.85×）→ 分量②警 */
+      setRiskW([
+        { cat: 'rate', zh: '利率', extreme: null, pct: 0.5, rc: 0.1, crash: true, vsCrash: 0.85 },
+      ]);
+      G = call('guardrail', {});
+      chk('W1 单类逼近峰值(0.85×) → nCrash=1', G && G.nCrash === 1, 'true');
+      chk('W1 单类逼近峰值 → 分量②警（regimeLevel=1）', G && G.regimeLevel === 1, 'true');
+    }
+
+    /* W2 风险监测真实产出：ext/med/sdAll 有限、合成世界（正弦+噪声，无真实崩盘动力学）
+     * 不触发崩溃级偏离（vsCrash 均 < 0.8 或为 null）、crash 全 false、pct∈[0,1]、无 NaN。
+     * 注：合成世界 ts 从 2016-01-01 起 2400 天（≈到 2022-08），**确实覆盖** 2020 COVID / 2022 熊市窗口，
+     * 因此 vsCrash 会被算成有限值（非 null）；但合成数据在那些窗口里没有真实崩盘尖峰，
+     * 所以 |ext| 远达不到窗口内历史峰值 → vsCrash 稳定 < 0.8 → crash=false。这正是要锁定的不误触发性质。 */
+    {
+      const W = mkWorldU(2400, true);
+      const S = call('factorScreening');
+      state.histBundle = { btc: { ts: W.ts.slice(), closes: W.cl.slice() } };
+      state.klines = null;
+      let RM = null, ok2 = true;
+      try { RM = call('riskMonitor', S); } catch (e) { ok2 = false; console.warn('W2 riskMonitor threw', e && e.message); }
+      chk('W2 风险监测不抛异常', ok2, 'true');
+      chk('W2 风险监测返回行', RM && RM.rows && RM.rows.length > 0, 'true');
+      if (RM && RM.rows) {
+        chk('W2 每行 ext 有限', RM.rows.every(r => isFinite(r.ext)), 'true');
+        chk('W2 每行 med/sdAll 有限', RM.rows.every(r => isFinite(r.med) && isFinite(r.sdAll)), 'true');
+        chk('W2 合成世界无崩溃级偏离（vsCrash 均 < 0.8 或为 null）', RM.rows.every(r => r.vsCrash === null || (isFinite(r.vsCrash) && r.vsCrash < 0.8)), 'true');
+        chk('W2 合成世界 → crash 全为 false', RM.rows.every(r => r.crash === false), 'true');
+        chk('W2 每行 pct 有限且∈[0,1]', RM.rows.every(r => isFinite(r.pct) && r.pct >= 0 && r.pct <= 1), 'true');
+      }
+      /* 护栏端到端在带新字段的 riskMonitor 上不抛异常 */
+      let G2 = null, ok2g = true;
+      try { state.risk = RM; G2 = call('guardrail', S); } catch (e) { ok2g = false; console.warn('W2 guardrail threw', e && e.message); }
+      chk('W2 护栏在 riskMonitor 新字段上端到端不抛异常', ok2g, 'true');
+      chk('W2 护栏 status 合法', G2 && [0, 1, 2].indexOf(G2.status) >= 0, 'true');
+      const h2 = call('guardrailHTML', G2) || '';
+      chk('W2 护栏面板含「vs崩溃峰值」列且无 undefined/NaN', h2.indexOf('vs崩溃峰值') >= 0 && h2.indexOf('undefined') < 0 && h2.indexOf('NaN') < 0, 'true');
+    }
+
+    /* 还原 state（W 是最后一段） */
     state.histBundle = null; state.universe = null; state.screening = null;
     state.uniScore = null; state.composite = null; state.risk = null; state.oos = null; state.guardrail = null; state.klines = null;
   }
