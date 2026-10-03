@@ -2512,8 +2512,356 @@ const near = (label, actual, expect, tol) => {
       chk('S6 有 480px 断点', html.indexOf('@media (max-width:480px)') >= 0, 'true');
       chk('S6 小屏表格可横向滚动', /\.rg-tbl\{overflow-x:auto/.test(html.replace(/\s+/g, '')), 'true');
       chk('S6 小屏 canvas 高度被压缩', /#mainCanvas\{height:230px\}/.test(html.replace(/\s+/g, '')), 'true');
-      chk('S6 小屏主网格塌成单列', /@media\(max-width:900px\)\{[^}]*\.main-grid\{grid-template-columns:1fr\}/.test(html.replace(/\s+/g, '')), 'true');
+      /* 不能用 [^}]*：900px 断点里 .main-grid 前面还有别的规则，}] 会把匹配截断。
+       * 改成按「下一个 @media 之前」整块截取再找。 */
+      const flat = html.replace(/\s+/g, '');
+      const blk900 = (function () {
+        const i = flat.indexOf('@media(max-width:900px){');
+        const j = flat.indexOf('@media(max-width:680px)', i + 1);
+        return i < 0 ? '' : flat.slice(i, j < 0 ? flat.length : j);
+      })();
+      chk('S6 小屏主网格塌成单列', blk900.indexOf('.main-grid{grid-template-columns:1fr}') >= 0, 'true');
     }
+  }
+
+
+  console.log('===== T. 分类合成 / 增量检验 / 风险监测（v3.26 ㉜）=====');
+  {
+    let s5 = 20261011;
+    const rr2 = () => { s5 = (s5 * 1103515245 + 12345) & 0x7fffffff; return s5 / 0x7fffffff; };
+    const rn2 = () => { let u = 0, v = 0; while (u === 0) u = rr2(); while (v === 0) v = rr2(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+
+    /* 造一个「共同成分 + 各自噪声」的世界：
+     *   BTC 收益 = 0.004·c_t + 噪声（c 是周期 200 天的慢波）
+     *   类 rate  ：5 个成员，每个 = c + 1.2·自身噪声 → 单看一条噪声很大
+     *   其余三类：各 5 个成员，纯噪声，与 c 无关
+     * 这个类结构正是「分类合成」声称要解决的问题：单条信噪比低，平均之后
+     * 噪声该被抵消 √5 倍。所以在这个世界上分类合成**必须**更准 ——
+     * 如果连构造出来的世界里它都测不出优势，那是代码写错了；
+     * 「真实数据上不成立」是另一回事，已经如实写进面板。
+     * 分类名取真实存在的类（含 CMP.RISK_CATS 里的），好让风险监测那一段也能被渲染到。 */
+    const CATS_T = [
+      { c: 'rate', sig: true, exo: 1 },
+      { c: 'credit', sig: false, exo: 1 },
+      { c: 'vol', sig: false, exo: 1 },
+      { c: 'altcoin', sig: false, exo: 0 },
+    ];
+    function mkWorldT(n, opt) {
+      const o = opt || {};
+      const DAY = 86400000, t0 = Date.UTC(2016, 0, 1);
+      const c = new Array(n).fill(0), cl = new Array(n).fill(0);
+      for (let i = 0; i < n; i++) c[i] = Math.sin(2 * Math.PI * i / 200);
+      let p = 100;
+      for (let i = 0; i < n; i++) { p = p * (1 + (o.k == null ? 0.004 : o.k) * c[i] + 0.004 * rn2()); cl[i] = p; }
+      const ts = new Array(n).fill(0);
+      for (let i = 0; i < n; i++) ts[i] = t0 + i * DAY;
+      const series = {}, keyCat = {}, name = {}, exo = {};
+      const NOISE = o.noise == null ? 1.2 : o.noise;
+      CATS_T.forEach(function (spec) {
+        exo[spec.c] = !!spec.exo;
+        for (let k = 0; k < 5; k++) {
+          const id = spec.c + k, arr = new Array(n);
+          for (let i = 0; i < n; i++) arr[i] = (spec.sig ? c[i] : 0) + NOISE * rn2();
+          series[id] = { ts: ts.slice(), closes: arr };
+          keyCat[id] = spec.c; name[id] = spec.c + '#' + k;
+        }
+      });
+      state.histBundle = { btc: { ts: ts.slice(), closes: cl.slice() } };
+      state.universe = { series: series, cats: {}, exo: exo, _keyCat: keyCat, _name: name, n: 20, nOk: 20 };
+      state.screening = null; state.uniScore = null; state.composite = null; state.risk = null;
+      return { n: n, ts: ts, cl: cl, c: c, series: series };
+    }
+    const N_T = 1600;
+
+    /* ---- T0 结构与降噪有效性：分类合成必须比单条更准 ---- */
+    {
+      const W = mkWorldT(N_T);
+      const S = call('factorScreening');
+      chk('T0 筛选有结果', S != null && S.rows.length >= 20, 'true');
+      const C = call('categoryComposite', S);
+      chk('T0 分类合成有结果', C != null, 'true');
+      chk('T0 四个分类都参与', C && C.nCat === 4, 'true');
+      chk('T0 因子数 = 有 z 的条数', C && C.nFactor === 20, 'true');
+
+      const sh = C.per.filter(function (p) { return p.cat === 'rate'; })[0];
+      const memIc = S.rows.filter(function (r) { return r.cat === 'rate'; }).map(function (r) { return Math.abs(r.ic); });
+      const memAvg = memIc.reduce(function (a, b) { return a + b; }, 0) / memIc.length;
+      const catIc = Math.abs(sh.icIn.ic);
+      chk('T0 【降噪】信号类合成的 |IC| 高于成员平均 |IC|', catIc > memAvg, 'true');
+      chk('T0 【降噪】且高于成员里最强的一条', catIc > Math.max.apply(null, memIc), 'true');
+      const nz = C.per.filter(function (p) { return p.cat === 'credit'; })[0];
+      chk('T0 纯噪声类的 |IC| 明显小于信号类', Math.abs(nz.icIn.ic) < catIc * 0.5, 'true');
+      chk('T0 三条对照齐全（单因子/分类/全池）', !!(C.single && C.cat && C.pool), 'true');
+      chk('T0 单因子对照用了 k1 条', C.single != null && C.top1Keys.length === C.k1, 'true');
+      chk('T0 切点落在样本中段', C.cut > C.ctx.n * 0.5 && C.cut < C.ctx.n * 0.7, 'true');
+      /* 四种方案都要有结果，不能有一个是空的 */
+      chk('T0 四种挑选方案都有结果', C.schemes.length === 4 && C.schemes.every(function (s) { return s.icOut != null; }), 'true');
+      chk('T0 每种方案都带增量残差', C.schemes.every(function (s) { return s.incr != null && s.incr.icOut != null; }), 'true');
+      chk('T0 内生/外生两分都有结果', !!(C.endoExo.endo && C.endoExo.exo), 'true');
+      chk('T0 一致性诊断有结果', C.agreeDiag != null, 'true');
+    }
+
+    /* ---- T1 无前视：改未来不许动样本内 ---- */
+    {
+      const W = mkWorldT(N_T);
+      const S1 = call('factorScreening');
+      const C1 = call('categoryComposite', S1);
+      const cl2 = W.cl.slice();
+      for (let i = 1300; i < N_T; i++) cl2[i] = cl2[1299] * (W.cl[1299] / W.cl[i]);
+      state.histBundle = { btc: { ts: W.ts.slice(), closes: cl2 } };
+      state.screening = null; state.composite = null; state.risk = null;
+      const S2 = call('factorScreening');
+      const C2 = call('categoryComposite', S2);
+      chk('T1 无前视：样本内 IC 一动不动', Math.abs(C1.per[0].icIn.ic - C2.per[0].icIn.ic) < 1e-9, 'true');
+      chk('T1 无前视：全样本 IC 必须变（证明检验有效）', Math.abs(C1.per[0].icAll.ic - C2.per[0].icAll.ic) > 1e-6, 'true');
+      chk('T1 无前视：切点不受未来影响', C1.cut === C2.cut, 'true');
+    }
+
+    /* ---- T2 权重只由样本内段决定 ---- */
+    {
+      const W = mkWorldT(N_T);
+      const S = call('factorScreening');
+      const ctx = call('btcCtx');
+      const C = call('categoryComposite', S);
+      const sh = C.per.filter(function (p) { return p.cat === 'rate'; })[0];
+      const zs = {};
+      sh.ids.forEach(function (k) { zs[k] = call('buildZ', k, ctx); });
+      const agIn = call('agreementOf', ctx, sh.ids, zs, sh.dirs, 0, C.cut);
+      const agAll = call('agreementOf', ctx, sh.ids, zs, sh.dirs, 0, ctx.n);
+      let same = true;
+      for (let i = 0; i < agIn.length; i++) {
+        if (agIn[i] == null || agAll[i] == null) continue;
+        if (Math.abs(agIn[i] - agAll[i]) > 1e-9) { same = false; break; }
+      }
+      chk('T2 一致性是「样本内段」算的（与全样本不同）', !same, 'true');
+      const agClean = agIn.filter(function (v) { return v != null; });
+      const m = agClean.reduce(function (a, b) { return a + b; }, 0) / agClean.length;
+      chk('T2 类的 agree = 成员一致性的均值', Math.abs(sh.agree - m) < 1e-9, 'true');
+      const nz = C.per.filter(function (p) { return p.cat === 'credit'; })[0];
+      /* 单个成员的 IC 符号可能被自身噪声带翻，翻正后一致性会被拉低，
+       * 所以断言取「共享成分的类 明显高于 噪声类」这个相对关系，不卡绝对值。 */
+      chk('T2 共享成分的类 一致性明显高于噪声类', sh.agree > nz.agree + 0.15, 'true');
+      chk('T2 纯噪声类 一致性≈0', Math.abs(nz.agree) < 0.1, 'true');
+      /* 一致性排名必须能选出信号类：信号类一致性最高 → lowAgree 不该选它 */
+      const byAg = C.per.slice().sort(function (a, b) { return a.agree - b.agree; });
+      chk('T2 低一致性方案挑的不是「共享成分」那一类', byAg[0].cat !== 'rate', 'true');
+    }
+
+    /* ---- T3 blendZ 加权平均的解析验算 ---- */
+    {
+      const ctx = { n: 40, closes: new Array(40).fill(100), ts: new Array(40).fill(0), map: new Map() };
+      const zs = { A: new Array(ctx.n).fill(null), B: new Array(ctx.n).fill(null) };
+      /* 数值都取在 ±2.5 以内，避免被夹紧干扰解析验算（夹紧单独测） */
+      zs.A[10] = 0.5; zs.B[10] = 1.5;
+      zs.A[11] = 0.4; zs.B[11] = 0.8;
+      const ids = ['A', 'B'];
+      near('T3 加权平均解析验算（w=1,3）', call('blendZ', ctx, ids, zs, [1, 1], [1, 3])[10], (0.5 + 3 * 1.5) / 4, 1e-12);
+      near('T3 等权平均解析验算', call('blendZ', ctx, ids, zs, [1, 1], null)[10], (0.5 + 1.5) / 2, 1e-12);
+      near('T3 方向翻正生效（B 取 -1）', call('blendZ', ctx, ids, zs, [1, -1], null)[11], (0.4 - 0.8) / 2, 1e-12);
+      zs.A[12] = 9; zs.B[12] = 9;
+      near('T3 夹紧 ±2.5 生效', call('blendZ', ctx, ids, zs, [1, 1], null)[12], 2.5, 1e-12);
+      /* 5 个成员只有 1 个有值 → 覆盖 1/5 < 60%，这天必须留空 */
+      const zs2 = {};
+      ['A', 'B', 'C', 'D', 'E'].forEach(function (k) { zs2[k] = new Array(ctx.n).fill(null); });
+      zs2.A[20] = 1;
+      chk('T3 覆盖不足的日子留空', call('blendZ', ctx, ['A', 'B', 'C', 'D', 'E'], zs2, [1, 1, 1, 1, 1], null)[20] == null, 'true');
+      /* 成员只有 1 条时，门槛不能把它自己挡在门外（v3.25 遗留的 K<3 静默空信号） */
+      near('T3 只有 1 个成员时它自己就是全部', call('blendZ', ctx, ['A'], zs2, [1], null)[20], 1, 1e-12);
+      /* minK 显式指定时按指定值判，但不能超过成员数 */
+      near('T3 minK=1 时单条也算', call('blendZ', ctx, ['A', 'B', 'C', 'D', 'E'], zs2, [1, 1, 1, 1, 1], null, 1)[20], 1, 1e-12);
+      near('T3 权重 0 的成员被排除（只剩 A）', call('blendZ', ctx, ids, zs, [1, 1], [1, 0])[11], 0.4, 1e-12);
+      chk('T3 全空的日子留空', call('blendZ', ctx, ids, zs, [1, 1], null)[30] == null, 'true');
+    }
+
+    /* ---- T4 segICs / rollICWin 的结构 ---- */
+    {
+      const W = mkWorldT(N_T);
+      const S = call('factorScreening');
+      const C = call('categoryComposite', S);
+      const ctx = C.ctx;
+      const segs = call('segICs', C.catSig, ctx, C.cut, ctx.n, 4, 10);
+      chk('T4 分段有结果', segs != null && segs.length >= 2, 'true');
+      chk('T4 段数不超过请求值', segs.length <= 4, 'true');
+      let contiguous = true, full = true;
+      for (let i = 1; i < segs.length; i++) if (segs[i].lo !== segs[i - 1].hi) contiguous = false;
+      if (segs[0].lo !== C.cut || segs[segs.length - 1].hi !== ctx.n) full = false;
+      chk('T4 分段首尾相接、不重叠', contiguous, 'true');
+      chk('T4 分段完整覆盖样本外段', full, 'true');
+      chk('T4 样本太短时不分段', call('segICs', C.catSig, ctx, C.cut, C.cut + 100, 4, 10) === null, 'true');
+      const rl = call('rollICWin', C.catSig, ctx, 10, 1, 250, 60);
+      chk('T4 滚动胜率有结果', rl != null && rl.n > 5, 'true');
+      chk('T4 滚动胜率在 [0,1]', rl.win >= 0 && rl.win <= 1, 'true');
+      chk('T4 方向取反时胜率互补', Math.abs(call('rollICWin', C.catSig, ctx, 10, -1, 250, 60).win + rl.win - 1) < 1e-12, 'true');
+    }
+
+    /* ---- T5 K 敏感性与留一法的结构 ---- */
+    {
+      const W = mkWorldT(N_T);
+      const S = call('factorScreening');
+      const C = call('categoryComposite', S);
+      chk('T5 kSens 覆盖 K=1..min(5,类数)', C.kSens.length === Math.min(5, C.nCat), 'true');
+      chk('T5 kSens 每个 K 都含四种方案', C.kSens.every(function (r) {
+        return ['equal', 'ic', 'agree', 'lowAgree'].every(function (sc) { return r.by[sc] != null; });
+      }), 'true');
+      const C1 = call('categoryComposite', S, { k: 1 });
+      chk('T5 K 可外部指定', C1.k === 1, 'true');
+      chk('T5 K=1 选的是样本内 |IC| 最大的类', C1.picked[0].cat === C.per[0].cat, 'true');
+      chk('T5 留一法条数 = K', C.perLeave.each.length === C.k, 'true');
+      chk('T5 留一法每组都有结果', C.perLeave.each.every(function (e) { return e.r != null && e.r.icOut != null; }), 'true');
+      const eq = C.schemes.filter(function (s) { return s.scheme === 'equal'; })[0];
+      chk('T5 分类合成 Top-K 与 equal 方案逐位一致', Math.abs(eq.icOut.ic - C.cat.icOut.ic) < 1e-12, 'true');
+      chk('T5 留一法全量 = lowAgree 方案', Math.abs(C.perLeave.all.icOut.ic - C.schemes.filter(function (s) { return s.scheme === 'lowAgree'; })[0].icOut.ic) < 1e-12, 'true');
+    }
+
+    /* ---- T6 单因子对照必须与 v3.25 的 universeScore 同口径 ---- */
+    {
+      const W = mkWorldT(N_T);
+      const S = call('factorScreening');
+      const US = call('universeScore', S);
+      const C = call('categoryComposite', S);
+      chk('T6 两条路用同一个切点', C.cut === US.cut, 'true');
+      chk('T6 样本内一致', Math.abs(C.single.icIn.ic - US.icIn.ic) < 1e-12, 'true');
+      chk('T6 样本外一致', Math.abs(C.single.icOut.ic - US.icOut.ic) < 1e-12, 'true');
+      chk('T6 全样本一致', Math.abs(C.single.icAll.ic - US.icAll.ic) < 1e-12, 'true');
+    }
+
+    /* ---- T7 增量检验：β 只由样本内估 ---- */
+    {
+      const W = mkWorldT(N_T);
+      const S1 = call('factorScreening');
+      const C1 = call('categoryComposite', S1);
+      const cl2 = W.cl.slice();
+      for (let i = 1300; i < N_T; i++) cl2[i] = cl2[1299] * (W.cl[1299] / W.cl[i]);
+      state.histBundle = { btc: { ts: W.ts.slice(), closes: cl2 } };
+      state.screening = null; state.composite = null; state.risk = null;
+      const S2 = call('factorScreening');
+      const C2 = call('categoryComposite', S2);
+      chk('T7 无前视：残差回归的 β 不受未来影响', Math.abs(C1.endoIncr.beta - C2.endoIncr.beta) < 1e-12, 'true');
+      chk('T7 无前视：BTC 自身信号的样本内 IC 不受未来影响', Math.abs(C1.btcOwn.icIn.ic - C2.btcOwn.icIn.ic) < 1e-12, 'true');
+      chk('T7 无前视：BTC 自身信号的样本外 IC 必须变', Math.abs(C1.btcOwn.icOut.ic - C2.btcOwn.icOut.ic) > 1e-6, 'true');
+      chk('T7 增量检验有结果', C1.endoIncr != null && C1.endoIncr.icOut != null, 'true');
+      chk('T7 BTC 自身对照有结果', C1.btcOwn != null && isFinite(C1.btcOwn.icAll.ic), 'true');
+      const C1b = call('categoryComposite', S1);
+      chk('T7 同数据重复计算逐位一致', Math.abs(C1b.endoIncr.icOut.ic - C1.endoIncr.icOut.ic) < 1e-12, 'true');
+    }
+
+    /* ---- T8 风险监测：分位是真分位、且无前视 ---- */
+    {
+      const W = mkWorldT(N_T);
+      const S = call('factorScreening');
+      const RM = call('riskMonitor', S);
+      chk('T8 风险监测有结果（默认看 RISK_CATS）', RM != null && RM.rows.length >= 3, 'true');
+      chk('T8 分位在 [0,1]', RM.rows.every(function (r) { return r.pct >= 0 && r.pct <= 1; }), 'true');
+      chk('T8 当前值取自最后一个有效日', RM.rows.every(function (r) { return Math.abs(r.sig[r.lastJ] - r.now) < 1e-12; }), 'true');
+      chk('T8 极端标记只在高低位出现', RM.rows.every(function (r) { return r.extreme == null || r.extreme === 'high' || r.extreme === 'low'; }), 'true');
+      chk('T8 只报 RISK_CATS 里的类', RM.rows.every(function (r) { return ['vol', 'credit', 'rate', 'fx'].indexOf(r.cat) >= 0; }), 'true');
+
+      /* 截断不变性 = 无前视：砍掉 60 天，新的读取必须等于原信号在同一天的值 */
+      const rm0 = RM.rows.filter(function (r) { return r.cat === 'rate'; })[0];
+      const cutN = N_T - 60;
+      const series2 = {};
+      Object.keys(W.series).forEach(function (k) {
+        series2[k] = { ts: W.ts.slice(0, cutN), closes: W.series[k].closes.slice(0, cutN) };
+      });
+      state.universe = { series: series2, cats: {}, exo: state.universe.exo, _keyCat: state.universe._keyCat, _name: state.universe._name, n: 20, nOk: 20 };
+      state.histBundle = { btc: { ts: W.ts.slice(0, cutN), closes: W.cl.slice(0, cutN) } };
+      state.screening = null; state.composite = null; state.risk = null;
+      const S2 = call('factorScreening');
+      const RM2 = call('riskMonitor', S2);
+      const rm2 = RM2.rows.filter(function (r) { return r.cat === 'rate'; })[0];
+      chk('T8 截断后读取 = 原信号在同一天的值（扩张窗口无前视）', Math.abs(rm2.now - rm0.sig[rm2.lastJ]) < 1e-9, 'true');
+
+      /* 末尾冲高的序列 → 当前分位应当接近 1 */
+      const n3 = N_T, ts3 = new Array(n3), up = new Array(n3);
+      for (let i = 0; i < n3; i++) {
+        ts3[i] = Date.UTC(2016, 0, 1) + i * 86400000;
+        up[i] = 100 + i * 0.02 + (i > n3 - 80 ? 40 : 0) + 0.05 * rn2();
+      }
+      const ser3 = {}, kc3 = {};
+      for (let k = 0; k < 5; k++) { ser3['rate' + k] = { ts: ts3.slice(), closes: up.slice() }; kc3['rate' + k] = 'rate'; }
+      state.universe = { series: ser3, cats: {}, exo: { rate: 1 }, _keyCat: kc3, _name: {}, n: 5, nOk: 5 };
+      state.histBundle = { btc: { ts: ts3.slice(), closes: up.slice() } };
+      state.screening = null; state.composite = null; state.risk = null;
+      const S3 = call('factorScreening');
+      const RM3 = call('riskMonitor', S3);
+      chk('T8 末尾冲高的序列 分位接近 1', RM3 != null && RM3.rows[0].pct > 0.8, 'true');
+      chk('T8 极端高位被标记', RM3 != null && RM3.rows[0].extreme === 'high', 'true');
+    }
+
+    /* ---- T9 边界：类太少 / 数据不足 / 空输入 不能崩 ---- */
+    {
+      const W = mkWorldT(500);
+      state.screening = null; state.composite = null; state.risk = null;
+      let ok1 = true, C = null;
+      try { C = call('categoryComposite', call('factorScreening')); } catch (e) { ok1 = false; }
+      chk('T9 样本不足时不抛异常', ok1, 'true');
+
+      const n2 = N_T, ts2 = new Array(n2), cl2 = new Array(n2);
+      for (let i = 0; i < n2; i++) { ts2[i] = Date.UTC(2016, 0, 1) + i * 86400000; cl2[i] = 100 * (1 + 0.004 * Math.sin(i / 30)) * Math.pow(1.0002, i); }
+      const ser = {}, kc = {}, nm = {}, ex2 = { big: 1, tiny: 0 };
+      /* big 要给够 10 条：分类合成要求全体至少 8 条有 z 的因子才开工 */
+      [['tiny', 2], ['big', 10]].forEach(function (x) {
+        for (let k = 0; k < x[1]; k++) {
+          const a = new Array(n2); for (let i = 0; i < n2; i++) a[i] = Math.sin(i / 30) + 0.5 * rn2();
+          const id = x[0] + k;
+          ser[id] = { ts: ts2.slice(), closes: a }; kc[id] = x[0]; nm[id] = id;
+        }
+      });
+      state.histBundle = { btc: { ts: ts2.slice(), closes: cl2 } };
+      state.universe = { series: ser, cats: {}, exo: ex2, _keyCat: kc, _name: nm, n: 12, nOk: 12 };
+      state.screening = null; state.composite = null; state.risk = null;
+      const S2 = call('factorScreening');
+      const C2 = call('categoryComposite', S2);
+      chk('T9 成员不足 MIN_MEMBER 的类被排除', C2 != null && C2.nCat === 1 && C2.per[0].cat === 'big', 'true');
+      const C3 = call('categoryComposite', S2, { minMember: 2 });
+      chk('T9 minMember 可外部指定', C3.nCat === 2, 'true');
+      chk('T9 一致性权重退化时仍有信号', C2.per[0].schemes.agree.icIn != null, 'true');
+      let ok4 = true, r4 = null;
+      try { r4 = call('categoryComposite', null); } catch (e) { ok4 = false; }
+      chk('T9 空输入安全返回 null', ok4 && r4 === null, 'true');
+      let ok5 = true, r5 = null;
+      try { r5 = call('riskMonitor', null); } catch (e) { ok5 = false; }
+      chk('T9 风险监测空输入安全返回 null', ok5 && r5 === null, 'true');
+      chk('T9 空 rows 安全返回 null', call('categoryComposite', { rows: [], ctx: null }) === null, 'true');
+    }
+
+    /* ---- T10 面板渲染 ---- */
+    {
+      const W = mkWorldT(N_T);
+      state.screening = null; state.composite = null; state.risk = null;
+      const S = call('factorScreening');
+      const C = call('categoryComposite', S);
+      const html = call('compositeHTML', C, S) || '';
+      chk('T10 面板有内容', html.length > 500, 'true');
+      chk('T10 面板不出现 undefined', html.indexOf('undefined') < 0, 'true');
+      chk('T10 面板不出现 NaN', html.indexOf('NaN') < 0, 'true');
+      chk('T10 面板报出三条对照', html.indexOf('不挑') >= 0 && html.indexOf('降维') >= 0, 'true');
+      chk('T10 面板报出关键证伪', html.indexOf('关键证伪') >= 0, 'true');
+      chk('T10 面板报出 BTC 自身对照', html.indexOf('BTC 自身位置') >= 0, 'true');
+      chk('T10 面板报出剔除后的残差', html.indexOf('剔除后残差') >= 0, 'true');
+      chk('T10 面板报出 K 敏感性', html.indexOf('卡参数') >= 0, 'true');
+      chk('T10 面板报出留一法', html.indexOf('留一法') >= 0, 'true');
+      chk('T10 面板报出风险监测', html.indexOf('风险监测读数') >= 0, 'true');
+      chk('T10 面板写明定位（参考意见，非择时）', html.indexOf('不适合当方向择时') >= 0, 'true');
+      chk('T10 面板写明低一致性规律是事后观察', html.indexOf('事后') >= 0 || html.indexOf('不是事前') >= 0, 'true');
+      /* 渲染入口：算得慢走异步，失败不能连累上面的内容 */
+      state.screening = S; state.composite = C; state.risk = null;
+      call('renderUniverseBox');
+      chk('T10 主面板渲染后挂出异步占位', ($id('uniBox').innerHTML || '').indexOf('cmpBox') >= 0, 'true');
+      let okR = true; try { call('renderCompositeInto', S); } catch (e) { okR = false; }
+      chk('T10 异步渲染不抛异常', okR, 'true');
+      /* 异常时必须给出提示，而不是留个永远转圈的占位 */
+      vmRun('window.__cc = categoryComposite; categoryComposite = function(){ throw new Error("boom"); };');
+      state.composite = null;
+      call('renderUniverseBox');
+      call('renderCompositeInto', S);
+      chk('T10 计算失败时给出提示', ($id('cmpBox').innerHTML || '').indexOf('失败') >= 0, 'true');
+      vmRun('categoryComposite = window.__cc;');
+      state.composite = null;
+    }
+
+    state.histBundle = null; state.universe = null; state.screening = null;
+    state.uniScore = null; state.composite = null; state.risk = null;
   }
 
   console.log('\n' + (fail ? `❌ 失败 ${fail} 项` : '✅ 全部断言通过'));

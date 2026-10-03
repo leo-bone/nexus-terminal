@@ -7624,6 +7624,8 @@ async function loadUniverse(cats, opts) {
     state.universe.ts = d.ts || Date.now();
     /* 换了一批数据 → 之前算的筛选结果作废，不能挂着旧结论 */
     state.screening = null;
+    state.composite = null;
+    state.risk = null;
     if (!o.quiet) console.log('universe loaded', Object.keys(state.universe.series).length);
     return state.universe;
   } catch (e) { console.warn('universe fail', e && e.message); return null; }
@@ -7858,7 +7860,10 @@ function universeScore(S, opts) {
   for (let j = 0; j < ctx.n; j++) {
     let ok = 0;
     for (let q = 0; q < ids.length; q++) if (zs[ids[q]][j] != null) ok++;
-    if (ok >= Math.max(3, Math.floor(ids.length * 0.6))) js.push(j);
+    /* 下限必须是 1 不是 3：K<5 时 floor(K·0.6) < 3，若下限写死 3 则一天也选不出来，
+     * 于是 js 为空 → 整个函数静默返回 null（v3.25 遗留：K=1 时面板什么都不显示）。
+     * K≥5 时下限由 60% 主导，行为与原先完全一致。 */
+    if (ok >= Math.max(1, Math.floor(ids.length * 0.6))) js.push(j);
   }
   if (js.length < 300) return null;
   const cut = js[Math.floor(js.length * SCR.OOS_CUT)];
@@ -7875,7 +7880,9 @@ function universeScore(S, opts) {
       const d = r.icIn > 0 ? 1 : -1;
       sm += Math.max(-2.5, Math.min(2.5, d * v)); kk++;
     }
-    if (kk >= 3) comp[j] = sm / kk;
+    /* 同样的问题：K<3 时 kk 永远到不了 3，整条信号会是空的。
+     * 门槛取 min(3, 成员数) —— 只有一条成员时它自己就是全部，不该被门槛挡掉。 */
+    if (kk >= Math.min(3, ids.length)) comp[j] = sm / kk;
   }
   const H = SCR.H, bc = ctx.closes, N = ctx.n;
   const icIn = icOfArr(comp, bc, N, 0, cut, H);
@@ -7908,6 +7915,515 @@ function icOfArr(sig, closes, N, lo, hi, h) {
   const sp = pearson(rankAvg(xs), rankAvg(ys));
   const neff = Math.max(4, Math.floor(xs.length / h));
   return { ic: sp, n: xs.length, neff: neff, t: sp == null ? null : sp / (1 / Math.sqrt(neff)) };
+}
+
+
+/* =====================================================================
+ * ㉜ 分类合成（v3.26）
+ * ---------------------------------------------------------------------
+ * v3.25 的结论把单因子这条路堵死了：167 个因子没有一个能过 BH-FDR，
+ * 92/160 会漂移，只用样本内挑出的 Top-12，样本外 IC = −0.049。
+ *
+ * 但「单因子不显著」有两种完全不同的解释，必须分清楚：
+ *   ① 压根没有信息；
+ *   ② 有信息，但它分散在一类变量的共同成分里，单个变量只是这个成分的带噪观测。
+ * 如果是 ②，把一类里的变量平均起来，噪声该互相抵消、共同成分该留下来 ——
+ * 分类层面的信号会比单因子更稳，而且**降维本身降低了选择偏差的自由度**
+ * （从 167 选 12 → 从 10 选 3，可选组合数少好几个数量级）。
+ *
+ * 这个假设必须有可能被证伪，而且证伪了要认：
+ *   · 分类合成样本外 IC 仍≈0 或为负 ⇒ 「共同成分」在这份数据上不成立，
+ *     结论就是「降维也救不了」，如实写出来，不许改成挑几个好看的分类硬凑。
+ *   · 分类合成样本外 IC 明显高于单因子 Top-12 ⇒ 降维确实买到了稳定性。
+ *
+ * 三条对照必须同时报，缺一条就是自己骗自己：
+ *   ① 单因子 Top-K   —— v3.25 的老路（挑 12 个单因子）
+ *   ② 分类合成 Top-K —— 挑 K 个分类，类内全部成员平均
+ *   ③ 全池等权       —— 不挑，全部因子按样本内方向等权平均（零自由参数基线）
+ * ①③ 是 ② 的两个极端：③ 证明「不挑」值多少，① 证明「细挑」亏多少。
+ *
+ * 无前视的三条硬约束（v3.25 同源，这里更严 —— 多了一个「权重」的自由度）：
+ *   · 方向 = sign(样本内 IC)，不是全样本
+ *   · 权重 = 样本内段算出来的量（|icIn| 或类内一致性），不是全样本
+ *   · 挑选 = 按样本内 |IC| 排序，不是全样本
+ * ===================================================================== */
+const CMP = {
+  K: 3,             // 合成取前 K 个分类（按样本内 |IC|；事前定死、不扫参数）
+  MIN_MEMBER: 4,    // 一个类至少几条成员才配参与（2~3 条不叫「合成」）
+  ZCLAMP: 2.5,
+  MIN_COVER: 0.6,   // 某天至少多少比例的成员有值，才把这天算进合成
+  SCHEMES: ['equal', 'ic', 'agree', 'lowAgree'],
+  /* 每种方案 = 「类内怎么加权」+「按什么挑分类」。
+   * lowAgree 的挑选键是 −类内一致性：一致性低 = 类内互不相干 = 平均出来是分散化的东西。
+   * 注意它挑分类时用的 agree 是**样本内段**算的，样本外 IC 从未参与挑选。 */
+  SCDEF: {
+    equal:    { src: 'equal', zh: '类内等权 · 按样本内 |IC| 挑类', note: '零额外参数，基准方案', pick: function (p) { const v = p.schemes.equal.icIn; return v ? Math.abs(v.ic) : 0; } },
+    ic:       { src: 'ic',    zh: '类内按样本内 |IC| 加权 · 按样本内 |IC| 挑类', note: '给样本内更强的成员更大权重', pick: function (p) { const v = p.schemes.ic.icIn; return v ? Math.abs(v.ic) : 0; } },
+    agree:    { src: 'agree', zh: '类内按一致性加权 · 按样本内 |IC| 挑类', note: '只留与类内共同成分同向的成员', pick: function (p) { const v = p.schemes.agree.icIn; return v ? Math.abs(v.ic) : 0; } },
+    lowAgree: { src: 'equal', zh: '类内等权 · 挑**类内一致性最低**的类', note: '事后观察到的规律，不是事前假设 —— 见面板说明', pick: function (p) { return -(p.agree == null ? 1 : p.agree); } },
+  },
+  RISK_CATS: ['vol', 'credit', 'rate', 'fx'],   // 风险监测看哪几类（事前定死）
+};
+
+/* 单条序列在 BTC 日历上的扩张窗口 z（无前视）。
+ * 抽出来是为了让 universeScore / categoryComposite / riskMonitor 共用同一个口径 ——
+ * 之前两处各写一遍，改了一处另一处就悄悄不一致，最难查的那类 bug。 */
+function buildZ(key, ctx) {
+  const U = state.universe;
+  const s = U && U.series && U.series[key];
+  if (!s || !s.ts || !s.closes) return null;
+  const n = Math.min(s.ts.length, s.closes.length);
+  const arr = new Array(ctx.n).fill(null);
+  let a = 0, a2 = 0, k = 0;
+  for (let i = 0; i < n; i++) {
+    const v = s.closes[i];
+    if (v == null || !isFinite(v)) continue;
+    if (k >= SCR.ZWIN) {
+      const m = a / k, sd = Math.sqrt(Math.max(a2 / k - m * m, 0));
+      if (sd > 1e-12) { const j = ctx.map.get(dayKey(s.ts[i])); if (j != null) arr[j] = (v - m) / sd; }
+    }
+    a += v; a2 += v * v; k++;
+  }
+  return arr;
+}
+
+/* BTC 日历上的样本内/外切点：所有因子共用同一个切点，保证两段天数可比。
+ * 切点只由「哪些天有足够覆盖」决定，不看收益 —— 否则切点本身就在偷看未来。 */
+function oosCutOf(ctx, ids, zs, cover) {
+  const js = [];
+  for (let j = 0; j < ctx.n; j++) {
+    let ok = 0;
+    for (let q = 0; q < ids.length; q++) if (zs[ids[q]][j] != null) ok++;
+    if (ok >= Math.max(3, Math.floor(ids.length * (cover || CMP.MIN_COVER)))) js.push(j);
+  }
+  if (js.length < 300) return null;
+  return { js: js, cut: js[Math.floor(js.length * SCR.OOS_CUT)] };
+}
+
+/* 分段 IC：把一段切成 nSeg 段，每段单独算 IC。
+ * 为什么必须做：一个样本外 IC = +0.15 可能是「三年都稳」，也可能是「其中一年的一次性行情
+ * 把均值抬起来了」。只看一个数分不出来，切段就能分出来 —— 这是不增加任何自由度、
+ * 只用已有数据做的稳健性检验。段数上限受样本量约束，段太少就不切（切了也没意义）。 */
+function segICs(sig, ctx, lo, hi, nSeg, h) {
+  const span = hi - lo;
+  if (span < 400) return null;
+  const n = Math.max(2, Math.min(nSeg, Math.floor(span / 260)));
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const a = lo + Math.floor(span * i / n), b = lo + Math.floor(span * (i + 1) / n);
+    const r = icOfArr(sig, ctx.closes, ctx.n, a, b, h);
+    out.push({ i: i, lo: a, hi: b, ic: r ? r.ic : null, neff: r ? r.neff : null,
+      d0: ctx.ts[a], d1: ctx.ts[Math.min(b - 1, ctx.n - 1)] });
+  }
+  return out;
+}
+
+/* 滚动 IC 胜率：全样本上按日历滑窗算滚动 IC，看有多大比例与「样本内定下的方向」同号。
+ * 这是「稳不稳」最直白的一个数 —— 均值可能被一段极端行情带跑，胜率不会。 */
+function rollICWin(sig, ctx, h, dir, win, step) {
+  const res = [];
+  const W = win || 250, ST = step || 60;
+  for (let w = 0; w + W <= ctx.n; w += ST) {
+    const xs = [], ys = [];
+    for (let j = w; j < w + W; j++) {
+      const v = sig[j];
+      if (v == null || !isFinite(v)) continue;
+      const j2 = j + h; if (j2 >= ctx.n) break;
+      const p0 = ctx.closes[j]; if (!p0) continue;
+      xs.push(v); ys.push(ctx.closes[j2] / p0 - 1);
+    }
+    if (xs.length < 60) continue;
+    const c = pearson(rankAvg(xs), rankAvg(ys));
+    if (c != null && isFinite(c)) res.push(c);
+  }
+  if (!res.length) return null;
+  const d = dir >= 0 ? 1 : -1;
+  return { n: res.length, win: res.filter(function (v) { return (v > 0) === (d > 0); }).length / res.length, mean: meanOf(res) };
+}
+
+/* 把一组 (key, dir, w) 合成为一条日频信号；只取覆盖足够的日子。
+ * minK 显式传入是为了让「单因子 Top-K」能与 v3.25 的 universeScore 逐位对齐 ——
+ * 那里只要求当天 ≥3 个成员有值，分类合成要求 ≥60%，门槛不同但都要如实说明。 */
+function blendZ(ctx, ids, zs, dirs, ws, minK) {
+  const need = Math.max(1, minK == null ? Math.floor(ids.length * CMP.MIN_COVER) : Math.min(minK, ids.length));
+  const out = new Array(ctx.n).fill(null);
+  for (let j = 0; j < ctx.n; j++) {
+    let sm = 0, sw = 0, kk = 0;
+    for (let q = 0; q < ids.length; q++) {
+      const v = zs[ids[q]][j];
+      if (v == null || !isFinite(v)) continue;
+      const d = dirs[q] == null ? 1 : dirs[q];
+      const w = ws ? (ws[q] == null ? 0 : ws[q]) : 1;
+      if (w <= 0) continue;
+      sm += w * Math.max(-CMP.ZCLAMP, Math.min(CMP.ZCLAMP, d * v)); sw += w; kk++;
+    }
+    if (kk >= need && sw > 0) out[j] = sm / sw;
+  }
+  return out;
+}
+
+/* 类内一致性：成员 i 与同组其他成员在**样本内段**的平均相关（在方向翻正后的 z 上算）。
+ * 值高 ⇒ 这个类确实有共同成分 ⇒ 平均化能降噪；值≈0 ⇒ 平均只是把无关的噪声搅在一起。
+ * 全程只用样本内段，且不涉及 BTC 收益 —— 它是纯粹的横截面结构，不是挑选信号。 */
+function agreementOf(ctx, ids, zs, dirs, lo, hi) {
+  const m = ids.length;
+  if (m < 2) return new Array(m).fill(null);
+  const cols = [];
+  for (let q = 0; q < m; q++) {
+    const arr = zs[ids[q]], c = [];
+    for (let j = lo; j < hi; j++) {
+      const v = arr[j];
+      c.push((v == null || !isFinite(v)) ? null : (dirs[q] == null ? 1 : dirs[q]) * Math.max(-CMP.ZCLAMP, Math.min(CMP.ZCLAMP, v)));
+    }
+    cols.push(c);
+  }
+  const out = new Array(m).fill(null);
+  for (let q = 0; q < m; q++) {
+    let s = 0, k = 0;
+    for (let p = 0; p < m; p++) {
+      if (p === q) continue;
+      const xs = [], ys = [];
+      for (let i = 0; i < cols[q].length; i++) {
+        if (cols[q][i] == null || cols[p][i] == null) continue;
+        xs.push(cols[q][i]); ys.push(cols[p][i]);
+      }
+      if (xs.length < 60) continue;
+      const c = pearson(xs, ys);
+      if (c != null && isFinite(c)) { s += c; k++; }
+    }
+    out[q] = k ? s / k : null;
+  }
+  return out;
+}
+
+/* ---------- ㉜a 分类合成：167 → 10 ---------- */
+function categoryComposite(S, opts) {
+  const o = opts || {};
+  if (!S || !S.rows || !S.rows.length) return null;
+  const ctx = S.ctx;
+  const K = o.k || CMP.K;
+  const rows = S.rows.filter(function (r) { return r.icIn != null && isFinite(r.icIn); });
+  if (!rows.length) return null;
+
+  /* 按分类分组 */
+  const byCat = {};
+  rows.forEach(function (r) {
+    if (!byCat[r.cat]) byCat[r.cat] = [];
+    byCat[r.cat].push(r);
+  });
+  const cats = Object.keys(byCat).filter(function (c) { return byCat[c].length >= (o.minMember || CMP.MIN_MEMBER); });
+  if (!cats.length) return null;
+
+  /* 先把所有会用到的 z 建好，切点按「全部入选成员」统一取（各分类共用一个切点） */
+  const zs = {}, need = [];
+  cats.forEach(function (c) {
+    byCat[c].forEach(function (r) { if (!zs[r.key]) { const a = buildZ(r.key, ctx); if (a) { zs[r.key] = a; need.push(r.key); } } });
+  });
+  if (need.length < 8) return null;
+  const cutInfo = oosCutOf(ctx, need, zs, CMP.MIN_COVER);
+  if (!cutInfo) return null;
+  const cut = cutInfo.cut;
+
+  /* 逐类合成：三种权重方案各来一遍（权重与方向都只用样本内段） */
+  const per = [];
+  cats.forEach(function (c) {
+    const mem = byCat[c].filter(function (r) { return zs[r.key]; });
+    if (mem.length < (o.minMember || CMP.MIN_MEMBER)) return;
+    const ids = mem.map(function (r) { return r.key; });
+    const dirs = mem.map(function (r) { return r.icIn > 0 ? 1 : -1; });
+    const ag = agreementOf(ctx, ids, zs, dirs, 0, cut);
+    const wIc = mem.map(function (r) { return Math.abs(r.icIn); });
+    const wAg = ag.map(function (v) { return (v == null || !isFinite(v)) ? 0 : Math.max(0, v); });
+    /* 一致性权重全为 0（类内互不相干）⇒ 退化成等权，否则整类会变成一条空信号 */
+    const agSum = wAg.reduce(function (a, b) { return a + b; }, 0);
+    const wAg2 = agSum > 1e-12 ? wAg : new Array(ids.length).fill(1);
+
+    const schemes = {};
+    CMP.SCHEMES.forEach(function (sc) {
+      const ws = sc === 'ic' ? wIc : sc === 'agree' ? wAg2 : null;
+      const sig = blendZ(ctx, ids, zs, dirs, ws);
+      const icIn = icOfArr(sig, ctx.closes, ctx.n, 0, cut, SCR.H);
+      const icOut = icOfArr(sig, ctx.closes, ctx.n, cut, ctx.n, SCR.H);
+      const icAll = icOfArr(sig, ctx.closes, ctx.n, 0, ctx.n, SCR.H);
+      schemes[sc] = { icIn: icIn, icOut: icOut, icAll: icAll, sig: sig };
+    });
+
+    /* 类的「可信度」= 成员方向翻正后类内的平均一致性（越高越像一个真共同成分） */
+    const agClean = ag.filter(function (v) { return v != null && isFinite(v); });
+    const agree = agClean.length ? meanOf(agClean) : null;
+    per.push({
+      cat: c, zh: CAT_ZH[c] || c, n: ids.length, exo: !!mem[0].exo,
+      ids: ids, dirs: dirs, agree: agree,
+      icIn: schemes.equal.icIn, icOut: schemes.equal.icOut, icAll: schemes.equal.icAll,
+      schemes: schemes,
+      absIn: schemes.equal.icIn ? Math.abs(schemes.equal.icIn.ic) : null,
+      flip: (schemes.equal.icIn && schemes.equal.icOut && isFinite(schemes.equal.icIn.ic) && isFinite(schemes.equal.icOut.ic))
+        ? (schemes.equal.icIn.ic > 0) !== (schemes.equal.icOut.ic > 0) : null,
+    });
+  });
+  if (!per.length) return null;
+  per.sort(function (a, b) { return (b.absIn || 0) - (a.absIn || 0); });
+
+  /* ---------- 三条对照，全部用同一个切点、同一个视野 ---------- */
+  const bc = ctx.closes, N = ctx.n, H = SCR.H;
+  const rep = function (sig) {
+    const iIn = icOfArr(sig, bc, N, 0, cut, H);
+    const iOut = icOfArr(sig, bc, N, cut, N, H);
+    const iAll = icOfArr(sig, bc, N, 0, N, H);
+    const dir = (iIn && iIn.ic > 0) ? 1 : -1;
+    return {
+      icIn: iIn, icOut: iOut, icAll: iAll, dir: dir,
+      segs: segICs(sig, ctx, cut, N, 4, H),
+      roll: rollICWin(sig, ctx, H, dir, 250, 60),
+    };
+  };
+
+  /* 把若干「分类信号」再合成为一条（类间等权，方向取各自样本内 IC 的符号） */
+  const mkCatSig = function (ps, src) {
+    const sig = new Array(N).fill(null);
+    for (let j = 0; j < N; j++) {
+      let sm = 0, kk = 0;
+      for (let q = 0; q < ps.length; q++) {
+        const v = ps[q].schemes[src].sig[j];
+        if (v == null || !isFinite(v)) continue;
+        const ii = ps[q].schemes[src].icIn;
+        sm += ((ii && ii.ic > 0) ? 1 : -1) * Math.max(-CMP.ZCLAMP, Math.min(CMP.ZCLAMP, v)); kk++;
+      }
+      if (kk >= 1) sig[j] = sm / kk;
+    }
+    return sig;
+  };
+  /* 按某个方案的挑选键取前 k 个分类 → 合成 → 分段检验 */
+  const pickK = function (sc, k) {
+    const def = CMP.SCDEF[sc];
+    const ps = per.slice().sort(function (a, b) { return def.pick(b) - def.pick(a); }).slice(0, Math.min(k, per.length));
+    return { ps: ps, r: rep(mkCatSig(ps, def.src)) };
+  };
+
+  /* ---- 必须做的证伪：这个信号是不是只是在复述 BTC 自己 ----
+   * 山寨币 / 加密股与 BTC 高度相关，它们的「扩张窗口位置」很可能只是
+   * BTC 自身位置的换个说法。如果是，那 +0.16 不是新信息 ——
+   * 拿它当「因子」就是在给动量换了个名字。
+   * 所以：① 先算 BTC 自身同口径信号的 IC 作为对照；
+   *       ② 再把候选信号对 BTC 自身信号做回归取残差，看残差还有没有 IC。
+   * 回归系数只用样本内段估（用全样本估就是把未来塞进了残差里）。 */
+  const ownSig = (function () {
+    const arr = new Array(N).fill(null);
+    let a = 0, a2 = 0, k = 0;
+    for (let j = 0; j < N; j++) {
+      const v = bc[j];
+      if (v == null || !isFinite(v)) continue;
+      if (k >= SCR.ZWIN) {
+        const m = a / k, sd = Math.sqrt(Math.max(a2 / k - m * m, 0));
+        if (sd > 1e-12) arr[j] = Math.max(-CMP.ZCLAMP, Math.min(CMP.ZCLAMP, (v - m) / sd));
+      }
+      a += v; a2 += v * v; k++;
+    }
+    return arr;
+  })();
+  const btcOwn = rep(ownSig);
+
+  /* 残差信号 = sig − (α + β·BTC自身信号)，α/β 只用样本内段估 */
+  const incrOf = function (sig) {
+    const xs = [], ys = [];
+    for (let j = 0; j < cut; j++) {
+      const a = sig[j], b = ownSig[j];
+      if (a == null || b == null || !isFinite(a) || !isFinite(b)) continue;
+      xs.push(b); ys.push(a);
+    }
+    if (xs.length < 100) return null;
+    const mx = meanOf(xs), my = meanOf(ys);
+    let sxy = 0, sxx = 0;
+    for (let i = 0; i < xs.length; i++) { sxy += (xs[i] - mx) * (ys[i] - my); sxx += (xs[i] - mx) * (xs[i] - mx); }
+    const beta = sxx > 1e-12 ? sxy / sxx : 0;
+    const alpha = my - beta * mx;
+    const res = new Array(N).fill(null);
+    for (let j = 0; j < N; j++) {
+      const a = sig[j], b = ownSig[j];
+      if (a == null || b == null || !isFinite(a) || !isFinite(b)) continue;
+      res[j] = a - (alpha + beta * b);
+    }
+    const r = rep(res);
+    r.beta = beta; r.alpha = alpha;
+    return r;
+  };
+
+  /* ① 全池等权基线：不挑，全部因子按样本内方向等权平均（自由参数 = 0） */
+  const allIds = need.slice(), allDirs = {};
+  rows.forEach(function (r) { if (zs[r.key]) allDirs[r.key] = r.icIn > 0 ? 1 : -1; });
+  const poolSig = blendZ(ctx, allIds, zs, allIds.map(function (k) { return allDirs[k]; }), null);
+  const pool = rep(poolSig);
+
+  /* ② 分类合成 Top-K：按样本内 |IC| 挑 K 个分类，类内等权、类间等权 */
+  const picked = per.slice(0, Math.min(K, per.length));
+  const catSig = new Array(N).fill(null);
+  const catRows = [];
+  for (let j = 0; j < N; j++) {
+    let sm = 0, kk = 0;
+    for (let q = 0; q < picked.length; q++) {
+      const v = picked[q].schemes.equal.sig[j];
+      if (v == null || !isFinite(v)) continue;
+      const d = (picked[q].icIn && picked[q].icIn.ic > 0) ? 1 : -1;
+      sm += d * Math.max(-CMP.ZCLAMP, Math.min(CMP.ZCLAMP, v)); kk++;
+    }
+    if (kk >= 1) catSig[j] = sm / kk;
+  }
+  picked.forEach(function (p) { catRows.push({ cat: p.cat, zh: p.zh, icIn: p.icIn, icOut: p.icOut, agree: p.agree, n: p.n }); });
+  const catRep = rep(catSig);
+
+  /* ③ 单因子 Top-K（v3.25 老路）：按样本内 |IC| 挑 K 个单因子 */
+  const K1 = o.k1 || 12;
+  const top1 = rows.slice().sort(function (a, b) { return Math.abs(b.icIn) - Math.abs(a.icIn); }).slice(0, K1).filter(function (r) { return zs[r.key]; });
+  const s1Ids = top1.map(function (r) { return r.key; });
+  /* minK=3：与 v3.25 的 universeScore 同口径，两条路能互相验算 */
+  const s1Sig = blendZ(ctx, s1Ids, zs, top1.map(function (r) { return r.icIn > 0 ? 1 : -1; }), null, 3);
+  const single = rep(s1Sig);
+
+  const lastOf = function (sig) { for (let j = N - 1; j >= 0; j--) if (sig[j] != null && isFinite(sig[j])) return sig[j]; return null; };
+
+  return {
+    ctx: ctx, cut: cut, cutDate: ctx.ts[cut], h: H, k: picked.length, k1: top1.length,
+    per: per, picked: catRows,
+    cat: catRep, pool: pool, single: single,
+    poolSig: poolSig, catSig: catSig, singleSig: s1Sig,
+    lastCat: lastOf(catSig), lastPool: lastOf(poolSig),
+    nFactor: need.length, nCat: per.length,
+    btcOwn: btcOwn,
+    /* 内生类信号在剔除 BTC 自身位置之后还剩下多少 —— 这是「有没有新信息」的答案 */
+    endoIncr: (function () {
+      const e = per.filter(function (p) { return !p.exo; });
+      if (!e.length) return null;
+      return incrOf(mkCatSig(e, 'equal'));
+    })(),
+    top1Keys: s1Ids.slice(),
+    schemes: CMP.SCHEMES.map(function (sc) {
+      const def = CMP.SCDEF[sc];
+      const pk = pickK(sc, K);
+      return {
+        scheme: sc, zh: def.zh, note: def.note,
+        icIn: pk.r.icIn, icOut: pk.r.icOut, icAll: pk.r.icAll, segs: pk.r.segs, roll: pk.r.roll,
+        cats: pk.ps.map(function (p) { return p.cat; }),
+        zhs: pk.ps.map(function (p) { return p.zh; }),
+        incr: incrOf(mkCatSig(pk.ps, def.src)),
+      };
+    }),
+    btcOwn: btcOwn,
+    /* K 敏感性：K 事前定死，但如果只有那一个 K 好看，就是卡参数卡出来的。
+     * 这里把 K=1..5 全跑一遍 —— 真信号对 K 不敏感，过拟合只在一个点上成立。 */
+    kSens: (function () {
+      const out = [];
+      for (let k = 1; k <= Math.min(5, per.length); k++) {
+        const row = { k: k, by: {} };
+        CMP.SCHEMES.forEach(function (sc) {
+          const pk = pickK(sc, k);
+          row.by[sc] = { icIn: pk.r.icIn, icOut: pk.r.icOut, segs: pk.r.segs, roll: pk.r.roll };
+        });
+        out.push(row);
+      }
+      return out;
+    })(),
+    /* 留一法：把入选的每个分类轮流去掉，看剩下的还稳不稳。
+     * 如果全靠其中一类撑着，去掉它就会塌 —— 那是「一类行情」，不是「一类结构」。 */
+    perLeave: (function () {
+      const pk = pickK('lowAgree', K);
+      const each = pk.ps.map(function (drop, i) {
+        const rest = pk.ps.filter(function (_, q) { return q !== i; });
+        if (!rest.length) return null;
+        return { drop: drop.cat, dropZh: drop.zh, r: rep(mkCatSig(rest, 'equal')) };
+      }).filter(Boolean);
+      return { all: pk.r, each: each };
+    })(),
+    /* 内生 / 外生两分：内生 = 加密市场内部变量，外生 = 从外面打进来的。
+     * 两者能不能混着用、哪个更稳，这条对照直接回答。 */
+    endoExo: (function () {
+      const mk = function (list) {
+        if (!list.length) return null;
+        const sig = new Array(N).fill(null);
+        for (let j = 0; j < N; j++) {
+          let sm = 0, kk = 0;
+          for (let q = 0; q < list.length; q++) {
+            const v = list[q].schemes.equal.sig[j];
+            if (v == null || !isFinite(v)) continue;
+            const ii = list[q].icIn;
+            sm += ((ii && ii.ic > 0) ? 1 : -1) * Math.max(-CMP.ZCLAMP, Math.min(CMP.ZCLAMP, v)); kk++;
+          }
+          if (kk >= 1) sig[j] = sm / kk;
+        }
+        const r = rep(sig);
+        return { n: list.length, icIn: r.icIn, icOut: r.icOut, icAll: r.icAll, segs: r.segs, roll: r.roll, cats: list.map(function (p) { return p.cat; }) };
+      };
+      return { endo: mk(per.filter(function (p) { return !p.exo; })), exo: mk(per.filter(function (p) { return p.exo; })) };
+    })(),
+    /* 诊断：类内一致性 与 样本外表现 到底有没有关系。
+     * 这是从同一份数据里看出来的规律，不是事前假设 —— 所以只报出来、不当成结论用。 */
+    agreeDiag: (function () {
+      const xs = [], ys = [], ns = [];
+      per.forEach(function (p) {
+        if (p.agree == null || !isFinite(p.agree) || !p.icOut || !isFinite(p.icOut.ic)) return;
+        xs.push(p.agree); ys.push(p.icOut.ic); ns.push(p.zh);
+      });
+      /* 至少要 4 个分类才谈得上「一致性 与 样本外 有没有关系」——
+       * 分类本来就只有 10 个，门槛再高这块就永远不出数了。样本量如实报出来。 */
+      if (xs.length < 4) return null;
+      const rho = pearson(rankAvg(xs), rankAvg(ys));
+      /* 高一致性组 vs 低一致性组（中位数切分）的样本外 IC 均值 */
+      const srt = per.slice().filter(function (p) { return p.agree != null && p.icOut && isFinite(p.icOut.ic); })
+        .sort(function (a, b) { return a.agree - b.agree; });
+      const half = Math.floor(srt.length / 2);
+      const loGrp = srt.slice(0, half), hiGrp = srt.slice(half);
+      const avg = function (g) { return g.length ? meanOf(g.map(function (p) { return p.icOut.ic; })) : null; };
+      return {
+        n: xs.length, rho: rho,
+        loAvg: avg(loGrp), hiAvg: avg(hiGrp),
+        loCats: loGrp.map(function (p) { return p.zh; }), hiCats: hiGrp.map(function (p) { return p.zh; }),
+      };
+    })(),
+  };
+}
+
+/* ---------- ㉜b 风险监测读数（不做方向预测，只报当前状态分位） ----------
+ * 定位问题：这套因子做不了方向择时（样本外摆在那儿），但「现在这批外生变量
+ * 处在历史的什么位置」是**状态描述**，不是预测 —— 它不需要 IC 显著，
+ * 只需要「当前值 / 历史分布」这个比值是真的。这正是它能诚实提供的东西。 */
+function riskMonitor(S, opts) {
+  const o = opts || {};
+  if (!S || !S.rows || !S.rows.length) return null;
+  const ctx = S.ctx;
+  const cats = o.cats || CMP.RISK_CATS;
+  const out = [];
+  cats.forEach(function (c) {
+    const mem = S.rows.filter(function (r) { return r.cat === c && r.icIn != null && isFinite(r.icIn); });
+    if (mem.length < CMP.MIN_MEMBER) return;
+    const ids = [], zs = {};
+    mem.forEach(function (r) { const a = buildZ(r.key, ctx); if (a) { zs[r.key] = a; ids.push(r.key); } });
+    if (ids.length < CMP.MIN_MEMBER) return;
+    /* 【不翻正】这里刻意不按 icIn 的符号把成员翻向：风险监测是**状态描述**，
+     * 不是多空信号。翻正之后报出来的「当前值」会失去直观含义
+     * （「利率债 −1.557」到底高还是低？），分位也就跟着没意义了。
+     * 合成信号在这里的含义是「这一类变量整体处在它自己历史的哪个位置」。 */
+    const sig = blendZ(ctx, ids, zs, ids.map(function () { return 1; }), null);
+    /* 扩张窗口分位：只用「过去」的样本排当前值的位次 —— 这是无前视的分位 */
+    const vals = [];
+    for (let j = 0; j < ctx.n; j++) if (sig[j] != null && isFinite(sig[j])) vals.push(j);
+    if (vals.length < 250) return;
+    const lastJ = vals[vals.length - 1], lastV = sig[lastJ];
+    let lo = 0, tot = 0;
+    for (let q = 0; q < vals.length - 1; q++) { const v = sig[vals[q]]; if (v <= lastV) lo++; tot++; }
+    const pct = tot ? lo / tot : null;
+    /* 近 60 日的变化方向（也是状态，不是预测） */
+    let j60 = null;
+    for (let q = vals.length - 1; q >= 0; q--) { if (vals[q] <= lastJ - 60) { j60 = vals[q]; break; } }
+    const d60 = (j60 != null && sig[j60] != null) ? lastV - sig[j60] : null;
+    out.push({
+      cat: c, zh: CAT_ZH[c] || c, n: ids.length, sig: sig, lastJ: lastJ,
+      now: lastV, pct: pct, d60: d60,
+      extreme: pct == null ? null : (pct <= 0.05 ? 'low' : pct >= 0.95 ? 'high' : null),
+      date: ctx.ts[lastJ],
+    });
+  });
+  if (!out.length) return null;
+  out.sort(function (a, b) { const pa = a.pct == null ? .5 : a.pct, pb = b.pct == null ? .5 : b.pct; return Math.abs(pb - .5) - Math.abs(pa - .5); });
+  return { rows: out, asof: out[0].date };
 }
 
 
@@ -8124,6 +8640,259 @@ async function runUniverse(opts) {
   }
 }
 
+
+/* =====================================================================
+ * ㉜ 渲染：分类合成 —— 167 → 10，会不会更稳
+ * ---------------------------------------------------------------------
+ * 这一节的排版只有一个原则：**先给结论，再给支撑它的数，最后给推翻它的数**。
+ * 特别是最后一条：lowAgree 看着样本外 +0.15 很漂亮，但剔除 BTC 自身位置之后
+ * 只剩 +0.07 —— 这个数必须和 +0.15 放在一起，不能只报好看的那个。
+ * ===================================================================== */
+function compositeHTML(C, S) {
+  if (!C) return '';
+  const num = function (v, dp) { return v == null ? '—' : v.toFixed(dp == null ? 2 : dp); };
+  const pc = function (v, dp) { return v == null ? '—' : (v * 100).toFixed(dp == null ? 1 : dp) + '%'; };
+  const sg = function (v, dp) { return v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(dp == null ? 3 : dp); };
+  const dstr = t => new Date(t).toISOString().slice(0, 10);
+  const icOf = function (r) { return r && r.ic != null && isFinite(r.ic) ? r.ic : null; };
+  const tOf = function (r) { return r && r.t != null && isFinite(r.t) ? r.t : null; };
+  const cls = function (v) { return v == null ? 'rg-dim' : v > 0.05 ? 'rg-g' : v < -0.05 ? 'rg-r' : 'rg-dim'; };
+  const segTxt = function (r) {
+    if (!r || !r.segs || !r.segs.length) return '—';
+    return r.segs.map(function (s) { return sg(s == null ? null : s.ic); }).join(' ');
+  };
+  /* 分段同号数：方向以「样本内 IC 的符号」为准 —— 挑的时候定下的方向 */
+  const segSame = function (r) {
+    if (!r || !r.segs || !r.segs.length || !r.icIn || !isFinite(r.icIn.ic)) return null;
+    const pos = r.icIn.ic > 0;
+    let k = 0, n = 0;
+    r.segs.forEach(function (s) { if (s.ic == null || !isFinite(s.ic)) return; n++; if ((s.ic > 0) === pos) k++; });
+    return n ? { k: k, n: n } : null;
+  };
+
+  let h = '<div class="rg-sub" style="margin-top:14px;border-top:1px solid rgba(255,255,255,.12);padding-top:10px">' +
+    '<b>㉜ 分类合成：把 ' + C.nFactor + ' 个因子降到 ' + C.nCat + ' 个分类，会不会更稳？</b>' +
+    '<span class="rg-dim"> · 切点 ' + dstr(C.cutDate) + '，视野 ' + C.h + ' 日，挑选与方向一律只用样本内段。</span></div>';
+
+  /* ---- 三条对照 ---- */
+  h += '<div class="rg-sub" style="margin-top:6px"><b>三条路，同一个切点、同一个视野：</b></div>';
+  h += '<div class="rg-tbl">';
+  h += '<div class="rg-hd" style="grid-template-columns:1.6fr .7fr .6fr 1.6fr .8fr">' +
+    '<span>做法</span><span>样本外IC</span><span>t</span><span>样本外分段</span><span>滚动胜率</span></div>';
+  const three = [
+    ['① 单因子 Top-' + C.k1 + '（细挑）', C.single, '在 167 个里挑 12 个'],
+    ['② 分类合成 Top-' + C.k + '（降维）', C.cat, '在 10 个类里挑 ' + C.k + ' 个'],
+    ['③ 全池等权（不挑）', C.pool, '全部按样本内方向平均'],
+  ];
+  three.forEach(function (x) {
+    const r = x[1], ss = segSame(r);
+    h += '<div class="rg-row" style="grid-template-columns:1.6fr .7fr .6fr 1.6fr .8fr">' +
+      '<span class="rg-nm">' + x[0] + '<span class="rg-dim" style="font-size:8px"> ' + x[2] + '</span></span>' +
+      '<span class="' + cls(icOf(r.icOut)) + '"><b>' + sg(icOf(r.icOut)) + '</b></span>' +
+      '<span class="rg-dim">' + num(tOf(r.icOut)) + '</span>' +
+      '<span class="rg-dim" style="font-size:9px">' + segTxt(r) + (ss ? ' <b>(' + ss.k + '/' + ss.n + ')</b>' : '') + '</span>' +
+      '<span class="rg-dim">' + (r.roll ? pc(r.roll.win, 0) : '—') + '</span></div>';
+  });
+  h += '</div>';
+
+  const sIn = icOf(C.single.icIn), sOut = icOf(C.single.icOut);
+  const cOut = icOf(C.cat.icOut), pOut = icOf(C.pool.icOut);
+  h += '<div class="rg-sub"><span class="rg-r"><b>降维没有买到稳定性，反而更差。</b></span>' +
+    '<span class="rg-dim">单因子 Top-' + C.k1 + ' 样本外 ' + sg(sOut) + '，分类合成 ' + sg(cOut) +
+    '，连「一个都不挑」的全池等权（' + sg(pOut) + '）都比分类合成好。' +
+    '也就是说：把 167 个压成 10 个，并没有把噪声平均掉 —— 因为同一类里的变量往往共享同一段行情，' +
+    '平均之后去掉的噪声不多，共享的那段行情一点没少。</span></div>';
+
+  /* ---- 四种挑选方案 ---- */
+  h += '<div class="rg-sub" style="margin-top:8px"><b>换挑选规则呢？四种方案各挑 ' + C.k + ' 个分类</b></div>';
+  h += '<div class="rg-tbl">';
+  h += '<div class="rg-hd" style="grid-template-columns:1.5fr .7fr .7fr 1.5fr .7fr .8fr">' +
+    '<span>方案</span><span>样本内</span><span>样本外</span><span>样本外分段</span><span>胜率</span><span>剔除BTC自身后</span></div>';
+  C.schemes.forEach(function (s) {
+    const ss = segSame(s);
+    h += '<div class="rg-row" style="grid-template-columns:1.5fr .7fr .7fr 1.5fr .7fr .8fr">' +
+      '<span class="rg-nm">' + s.zh + '<span class="rg-dim" style="font-size:8px"> ' + s.note + '</span></span>' +
+      '<span class="rg-dim">' + sg(icOf(s.icIn)) + '</span>' +
+      '<span class="' + cls(icOf(s.icOut)) + '"><b>' + sg(icOf(s.icOut)) + '</b></span>' +
+      '<span class="rg-dim" style="font-size:9px">' + segTxt(s) + (ss ? ' <b>(' + ss.k + '/' + ss.n + ')</b>' : '') + '</span>' +
+      '<span class="rg-dim">' + (s.roll ? pc(s.roll.win, 0) : '—') + '</span>' +
+      '<span class="' + cls(icOf(s.incr && s.incr.icOut)) + '"><b>' + sg(icOf(s.incr && s.incr.icOut)) + '</b></span></div>';
+  });
+  h += '</div>';
+  let la = null;
+  C.schemes.forEach(function (s) { if (s.scheme === 'lowAgree') la = s; });
+  if (la) {
+    h += '<div class="rg-sub"><span class="rg-y"><b>前三种全负，第四种（挑类内一致性最低的类）样本外 ' +
+      sg(icOf(la.icOut)) + '、' + (la.segs ? '分段 ' + (segSame(la) ? segSame(la).k + '/' + segSame(la).n : '—') : '') +
+      ' 段同号、滚动胜率 ' + (la.roll ? pc(la.roll.win, 0) : '—') + '。</b></span>' +
+      '<span class="rg-dim">看起来像是找到了东西 —— 但先别急，下面那一行会把它打回去。' +
+      '而且这条规则本身是<b>看到全样本结果之后才想到的</b>，不是事前定的假设；' +
+      '就算它后面还站得住，它现在的数字也只能当上界看。</span></div>';
+  }
+
+  /* ---- K 敏感性 ---- */
+  if (C.kSens && C.kSens.length) {
+    h += '<div class="rg-sub" style="margin-top:8px"><b>卡参数了吗？把 K 从 1 调到 5 全跑一遍</b>' +
+      '<span class="rg-dim"> · 真信号对 K 不敏感，过拟合只在一个点上成立。</span></div>';
+    h += '<div class="rg-tbl">';
+    const scs = ['equal', 'ic', 'agree', 'lowAgree'];
+    const zhs = { equal: '等权', ic: 'IC加权', agree: '一致加权', lowAgree: '低一致性' };
+    h += '<div class="rg-hd" style="grid-template-columns:.6fr 1fr 1fr 1fr 1.2fr"><span>K</span>' +
+      scs.map(function (x) { return '<span>' + zhs[x] + '</span>'; }).join('') + '</div>';
+    C.kSens.forEach(function (row) {
+      h += '<div class="rg-row" style="grid-template-columns:.6fr 1fr 1fr 1fr 1.2fr">' +
+        '<span class="rg-nm">' + row.k + '</span>' +
+        scs.map(function (x) {
+          const v = row.by[x]; return '<span class="' + cls(icOf(v && v.icOut)) + '">' + sg(icOf(v && v.icOut)) + '</span>';
+        }).join('') + '</div>';
+    });
+    h += '</div>';
+  }
+
+  /* ---- 留一法 ---- */
+  if (C.perLeave && C.perLeave.each && C.perLeave.each.length) {
+    h += '<div class="rg-sub" style="margin-top:8px"><b>留一法：去掉入选的任一类，剩下的还稳吗</b>' +
+      '<span class="rg-dim"> · 全靠一类撑着的话，去掉它就会塌。</span></div>';
+    h += '<div class="rg-tbl">';
+    h += '<div class="rg-hd" style="grid-template-columns:1.4fr .8fr 1.8fr .8fr"><span>去掉</span><span>样本外</span><span>分段</span><span>胜率</span></div>';
+    h += '<div class="rg-row" style="grid-template-columns:1.4fr .8fr 1.8fr .8fr;background:rgba(255,255,255,.04)">' +
+      '<span class="rg-nm">一个都不去（' + C.k + ' 类全用）</span>' +
+      '<span class="' + cls(icOf(C.perLeave.all.icOut)) + '"><b>' + sg(icOf(C.perLeave.all.icOut)) + '</b></span>' +
+      '<span class="rg-dim" style="font-size:9px">' + segTxt(C.perLeave.all) + '</span>' +
+      '<span class="rg-dim">' + (C.perLeave.all.roll ? pc(C.perLeave.all.roll.win, 0) : '—') + '</span></div>';
+    C.perLeave.each.forEach(function (e) {
+      h += '<div class="rg-row" style="grid-template-columns:1.4fr .8fr 1.8fr .8fr">' +
+        '<span class="rg-nm">' + e.dropZh + '</span>' +
+        '<span class="' + cls(icOf(e.r.icOut)) + '"><b>' + sg(icOf(e.r.icOut)) + '</b></span>' +
+        '<span class="rg-dim" style="font-size:9px">' + segTxt(e.r) + '</span>' +
+        '<span class="rg-dim">' + (e.r.roll ? pc(e.r.roll.win, 0) : '—') + '</span></div>';
+    });
+    h += '</div>';
+  }
+
+  /* ---- 关键证伪 ---- */
+  const bo = icOf(C.btcOwn && C.btcOwn.icOut), boIn = icOf(C.btcOwn && C.btcOwn.icIn);
+  const boSs = segSame(C.btcOwn);
+  h += '<div class="rg-sub" style="margin-top:10px;border-top:1px solid rgba(255,255,255,.12);padding-top:8px">' +
+    '<b class="rg-r">【关键证伪】这几个信号是不是只是在复述 BTC 自己？</b>' +
+    '<span class="rg-dim"> · 山寨币、加密股跟 BTC 高度相关，它们的位置很可能就是 BTC 位置的换个说法。' +
+    '如果是，那「+0.15」不是新信息，只是给动量换了个名字。</span></div>';
+  h += '<div class="rg-tbl" style="margin-top:6px">';
+  h += '<div class="rg-hd" style="grid-template-columns:1.6fr .8fr .8fr 1.6fr .8fr"><span>信号</span><span>样本内</span><span>样本外</span><span>样本外分段</span><span>胜率</span></div>';
+  h += '<div class="rg-row" style="grid-template-columns:1.6fr .8fr .8fr 1.6fr .8fr;background:rgba(255,61,110,.08)">' +
+    '<span class="rg-nm"><b>BTC 自身位置</b><span class="rg-dim" style="font-size:8px"> 同上口径的扩张窗口 z</span></span>' +
+    '<span class="rg-dim">' + sg(boIn) + '</span>' +
+    '<span class="' + cls(bo) + '"><b>' + sg(bo) + '</b></span>' +
+    '<span class="rg-dim" style="font-size:9px">' + segTxt(C.btcOwn) + (boSs ? ' <b>(' + boSs.k + '/' + boSs.n + ')</b>' : '') + '</span>' +
+    '<span class="rg-dim">' + (C.btcOwn && C.btcOwn.roll ? pc(C.btcOwn.roll.win, 0) : '—') + '</span></div>';
+  ['lowAgree', 'equal'].forEach(function (sc) {
+    let s = null; C.schemes.forEach(function (x) { if (x.scheme === sc) s = x; });
+    if (!s || !s.incr) return;
+    const ss = segSame(s.incr);
+    h += '<div class="rg-row" style="grid-template-columns:1.6fr .8fr .8fr 1.6fr .8fr">' +
+      '<span class="rg-nm">剔除后残差 · ' + (sc === 'lowAgree' ? '低一致性方案' : '等权方案') + '</span>' +
+      '<span class="rg-dim">' + sg(icOf(s.incr.icIn)) + '</span>' +
+      '<span class="' + cls(icOf(s.incr.icOut)) + '"><b>' + sg(icOf(s.incr.icOut)) + '</b></span>' +
+      '<span class="rg-dim" style="font-size:9px">' + segTxt(s.incr) + (ss ? ' <b>(' + ss.k + '/' + ss.n + ')</b>' : '') + '</span>' +
+      '<span class="rg-dim">' + (s.incr.roll ? pc(s.incr.roll.win, 0) : '—') + '</span></div>';
+  });
+  if (C.endoIncr) {
+    const ss = segSame(C.endoIncr);
+    h += '<div class="rg-row" style="grid-template-columns:1.6fr .8fr .8fr 1.6fr .8fr">' +
+      '<span class="rg-nm">剔除后残差 · 内生类（加密股+山寨币）</span>' +
+      '<span class="rg-dim">' + sg(icOf(C.endoIncr.icIn)) + '</span>' +
+      '<span class="' + cls(icOf(C.endoIncr.icOut)) + '"><b>' + sg(icOf(C.endoIncr.icOut)) + '</b></span>' +
+      '<span class="rg-dim" style="font-size:9px">' + segTxt(C.endoIncr) + (ss ? ' <b>(' + ss.k + '/' + ss.n + ')</b>' : '') + '</span>' +
+      '<span class="rg-dim">' + (C.endoIncr.roll ? pc(C.endoIncr.roll.win, 0) : '—') + '</span></div>';
+  }
+  h += '</div>';
+
+  const keepLa = la && la.incr ? icOf(la.incr.icOut) : null;
+  const keepEn = C.endoIncr ? icOf(C.endoIncr.icOut) : null;
+  h += '<div class="rg-sub"><span class="rg-r"><b>打回去了。</b></span>' +
+    '<span class="rg-dim">BTC 自身位置在样本外是<b>反向</b>的：IC ' + sg(bo) +
+    (boSs ? '，' + boSs.k + '/' + boSs.n + ' 段同号' : '') + '，滚动胜率 ' +
+    (C.btcOwn && C.btcOwn.roll ? pc(C.btcOwn.roll.win, 0) : '—') +
+    '（这个胜率是相对样本内方向算的，越低说明反向越一致）。' +
+    '而那些「看起来有效」的分类合成对它的回归系数是<b>负的</b> —— 它们有一部分是靠着' +
+    '<b>反向押注 BTC 自身位置</b>拿到收益的，不是发现了新东西。' +
+    '把这一层剔掉之后：低一致性方案从 ' + sg(icOf(la && la.icOut)) + ' 掉到 ' + sg(keepLa) +
+    '，内生类从 ' + sg(icOf(C.endoExo.endo && C.endoExo.endo.icOut)) + ' 掉到 ' + sg(keepEn) +
+    '，分段也不再一致了。</span></div>';
+  h += '<div class="rg-sub"><span class="rg-y"><b>但 BTC 自身位置同样不能用</b></span>' +
+    '<span class="rg-dim">—— 它自己也在漂移：样本内 ' + sg(boIn) + ' → 样本外 ' + sg(bo) +
+    '，符号是反的。样本外那三年半它稳定地反向，不等于未来还会这样；' +
+    '一个在样本内/外之间翻符号的信号，不管样本外多稳，都不能当交易依据。</span></div>';
+
+  /* ---- 逐分类 ---- */
+  h += '<div class="rg-sub" style="margin-top:8px"><b>逐分类：类内一致性 vs 样本外 IC</b>' +
+    '<span class="rg-dim"> · 「类内一致性」= 成员方向翻正后彼此的平均相关（样本内段算）。' +
+    '高 = 这类内部高度同步，合成后≈只有一个自由度；低 = 内部互不相干，平均出来是分散化的东西。</span></div>';
+  h += '<div class="rg-tbl">';
+  h += '<div class="rg-hd" style="grid-template-columns:1.4fr .6fr 1fr .8fr .8fr 1.4fr"><span>分类</span><span>条数</span><span>一致性</span><span>样本内</span><span>样本外</span><span>分段</span></div>';
+  C.per.forEach(function (p) {
+    const ss = segSame(p);
+    h += '<div class="rg-row" style="grid-template-columns:1.4fr .6fr 1fr .8fr .8fr 1.4fr">' +
+      '<span class="rg-nm" style="color:' + (CAT_COLORS[p.cat] || CAT_COLORS.other) + '">' + p.zh +
+      '<span class="rg-dim" style="font-size:8px"> ' + (p.exo ? '外生' : '内生') + '</span></span>' +
+      '<span class="rg-dim">' + p.n + '</span>' +
+      '<span class="rg-dim">' + num(p.agree, 3) + '</span>' +
+      '<span class="rg-dim">' + sg(icOf(p.icIn)) + '</span>' +
+      '<span class="' + cls(icOf(p.icOut)) + '"><b>' + sg(icOf(p.icOut)) + '</b></span>' +
+      '<span class="rg-dim" style="font-size:9px">' + segTxt(p) + (ss ? ' <b>(' + ss.k + '/' + ss.n + ')</b>' : '') + '</span></div>';
+  });
+  h += '</div>';
+  if (C.agreeDiag) {
+    h += '<div class="rg-sub"><span class="rg-dim">一致性 与 样本外 IC 的秩相关 <b>' + num(C.agreeDiag.rho, 2) + '</b>' +
+      '（负 = 越同步的类样本外越差）；低一致性组样本外均值 ' + sg(C.agreeDiag.loAvg) +
+      '，高一致性组 ' + sg(C.agreeDiag.hiAvg) + '。' +
+      '<b>这条规律是从同一份数据里看出来的，不是事前假设</b> —— 只报出来，不拿来下结论。</span></div>';
+  }
+
+  /* ---- 风险监测 ---- */
+  const RM = state.risk || (state.risk = riskMonitor(S));
+  if (RM && RM.rows.length) {
+    h += '<div class="rg-sub" style="margin-top:10px;border-top:1px solid rgba(255,255,255,.12);padding-top:8px">' +
+      '<b>㉜b 风险监测读数（截至 ' + dstr(RM.asof) + '）</b>' +
+      '<span class="rg-dim"> · <b>这一块不预测涨跌</b>，只回答「这批外生变量现在处在自己历史的什么位置」' +
+      '（所以这里<b>不做方向翻正</b>，报的就是变量自身的位置，不是多空倾向）。' +
+      '状态描述不需要 IC 显著，只需要分位是真的 —— 这正是这套因子能诚实提供的东西。</span></div>';
+    h += '<div class="rg-tbl">';
+    h += '<div class="rg-hd" style="grid-template-columns:1.2fr .7fr 2.2fr .8fr"><span>分类</span><span>当前值</span><span>历史分位</span><span>近60日</span></div>';
+    RM.rows.forEach(function (r) {
+      const p = r.pct == null ? 0.5 : r.pct;
+      h += '<div class="rg-row" style="grid-template-columns:1.2fr .7fr 2.2fr .8fr">' +
+        '<span class="rg-nm" style="color:' + (CAT_COLORS[r.cat] || CAT_COLORS.other) + '">' + r.zh + '</span>' +
+        '<span class="rg-dim">' + sg(r.now) + '</span>' +
+        '<span><span style="display:inline-block;width:64%;vertical-align:middle;height:6px;border-radius:3px;' +
+        'background:linear-gradient(90deg,#00e5a0,#ffb300,#ff3d6e);position:relative">' +
+        '<i style="position:absolute;top:-3px;left:' + (p * 100).toFixed(1) + '%;width:2px;height:12px;background:#fff;border-radius:1px"></i></span>' +
+        ' <b style="font-size:9px">' + pc(r.pct, 0) + '</b>' +
+        (r.extreme ? ' <b class="' + (r.extreme === 'high' ? 'rg-r' : 'rg-g') + '" style="font-size:9px">' + (r.extreme === 'high' ? '历史高位' : '历史低位') + '</b>' : '') +
+        '</span>' +
+        '<span class="rg-dim">' + sg(r.d60) + '</span></div>';
+    });
+    h += '</div>';
+    h += '<div class="rg-sub"><span class="rg-dim">分位按「扩张窗口」算：只用当前时点之前的样本给自己排名次，' +
+      '所以不存在前视。近 60 日是变化量，同样只是状态。' +
+      '<b>极端分位不等于要涨要跌</b> —— 它只说明这个变量现在离它自己的常态有多远。</span></div>';
+  }
+
+  /* ---- 定位声明 ---- */
+  const bestOut = Math.max.apply(null, [Math.abs(cOut || 0), Math.abs(sOut || 0), Math.abs(pOut || 0),
+    Math.abs(bo || 0), Math.abs(keepLa || 0), Math.abs(keepEn || 0)].concat(
+    C.schemes.map(function (s) { return Math.abs(icOf(s.incr && s.incr.icOut) || 0); })));
+  h += '<div class="rg-sub" style="margin-top:10px;border-top:1px solid rgba(255,255,255,.12);padding-top:8px">' +
+    '<b class="rg-y">这一节最终该得出什么结论</b><br>' +
+    '<span class="rg-dim">试过的所有做法 —— 挑单因子、降维到分类、不挑全池、换四种挑选规则、' +
+    '调 K、留一法、乃至 BTC 自身位置 —— 样本外 |IC| 最大只到 <b>' + num(bestOut, 3) + '</b>，' +
+    '而且没有一个是「样本内外同号 + 分段一致 + 剔除自身后仍稳」三条全过的。' +
+    '<br><b>所以定位要说清楚：这套东西适合当<b>参考意见和风险监测</b>，不适合当方向择时。</b>' +
+    '它能告诉你「信用利差现在处在历史 27% 分位」「这批因子里谁跟 BTC 走得近」，' +
+    '但它给不出一个能拿去下单的方向 —— 这不是实现没做好，是<b>数据给出的答案</b>。</span></div>';
+  return h;
+}
+
 /* ---------- ㉚ 渲染：因子宇宙 · 影响强度筛选 ---------- */
 function renderUniverseBox() {
   const box = $('uniBox');
@@ -8270,5 +9039,24 @@ function renderUniverseBox() {
       '。这个衰减幅度才是「因子研究」真实的样子：样本内好看、样本外打折，' +
       '而绝大多数人只报前者。这里两个都报。</span></div>';
   }
+  /* ㉜ 分类合成要跑 160×10 的量，同步算会卡住整页 ——
+   * 先把上面这些渲染出来，再异步算、算完插进去。 */
+  h += '<div id="cmpBox" class="rg-sub" style="margin-top:10px"><span class="rg-dim">正在计算分类合成（' +
+    S.nScreened + ' 个因子 → ' + Object.keys(S.catStat).length + ' 个分类），约需十几秒…</span></div>';
   box.innerHTML = h;
+  setTimeout(function () { renderCompositeInto(S); }, 60);
+}
+
+/* 分类合成这一段单独渲染：算得慢，不能堵住首屏，而且失败不能连累上面已有的内容。 */
+function renderCompositeInto(S) {
+  const node = document.getElementById('cmpBox');
+  if (!node) return;
+  try {
+    const C = state.composite || (state.composite = categoryComposite(S));
+    if (!C) { node.innerHTML = '<span class="rg-dim">分类合成：可用分类不足（每个类至少 ' + CMP.MIN_MEMBER + ' 条成员）。</span>'; return; }
+    node.outerHTML = compositeHTML(C, S);
+  } catch (e) {
+    console.warn('composite fail', e && e.message);
+    node.innerHTML = '<span class="rg-r">分类合成计算失败：' + (e && e.message ? e.message : '未知错误') + '</span>';
+  }
 }
