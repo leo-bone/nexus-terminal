@@ -962,7 +962,7 @@ async function buildSnapshot() {
 
 /* =====================================================================
  *  v3.25 · 因子宇宙（UNIVERSE）
- *  v3.26 · 前端分类合成（数据端点不变，仅版本号同步）
+ *  v3.27 · 前端真正样本外追踪 + 风险监测全口径（数据端点不变，仅版本号同步）
  *  ---------------------------------------------------------------------
  *  原来的因子表只有 32 项、可用序列只有 22 条 —— 这个量级没法回答
  *  「哪些因子是强影响、哪些只是噪声」。真实量化机构的因子库是几百到几千维，
@@ -1293,7 +1293,7 @@ export default {
     }
 
     if (url.pathname === '/' || url.pathname === '/health') {
-      return jsonResp({ name: 'nexus-proxy', version: '3.26', status: 'ok', source: 'yahoo+stooq+nyfed+treasury+mof+coinlore+finforexfactory+bitcoin-data+bybit+deribit+proxy', universe: Object.keys(UNIVERSE).reduce(function(a,c){return a+Object.keys(UNIVERSE[c]).length;},0), symbols: Object.keys(SIMPLE).concat(['EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'JGB10Y', 'DVOL', 'DVHV']) });
+      return jsonResp({ name: 'nexus-proxy', version: '3.27', status: 'ok', source: 'yahoo+stooq+nyfed+treasury+mof+coinlore+finforexfactory+bitcoin-data+bybit+deribit+proxy', universe: Object.keys(UNIVERSE).reduce(function(a,c){return a+Object.keys(UNIVERSE[c]).length;},0), symbols: Object.keys(SIMPLE).concat(['EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'JGB10Y', 'DVOL', 'DVHV']) });
     }
 
     return new Response('Not Found', { status: 404, headers: CORS });

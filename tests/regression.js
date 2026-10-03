@@ -2750,11 +2750,11 @@ const near = (label, actual, expect, tol) => {
       const W = mkWorldT(N_T);
       const S = call('factorScreening');
       const RM = call('riskMonitor', S);
-      chk('T8 风险监测有结果（默认看 RISK_CATS）', RM != null && RM.rows.length >= 3, 'true');
+      chk('T8 风险监测有结果（v3.27 默认全分类）', RM != null && RM.rows.length >= 3, 'true');
       chk('T8 分位在 [0,1]', RM.rows.every(function (r) { return r.pct >= 0 && r.pct <= 1; }), 'true');
       chk('T8 当前值取自最后一个有效日', RM.rows.every(function (r) { return Math.abs(r.sig[r.lastJ] - r.now) < 1e-12; }), 'true');
       chk('T8 极端标记只在高低位出现', RM.rows.every(function (r) { return r.extreme == null || r.extreme === 'high' || r.extreme === 'low'; }), 'true');
-      chk('T8 只报 RISK_CATS 里的类', RM.rows.every(function (r) { return ['vol', 'credit', 'rate', 'fx'].indexOf(r.cat) >= 0; }), 'true');
+      chk('T8 v3.27 默认报全部有≥MIN_MEMBER的类（不再 exo-only）', RM.rows.length === 4 && RM.rows.every(function (r) { return ['rate', 'credit', 'vol', 'altcoin'].indexOf(r.cat) >= 0; }), 'true');
 
       /* 截断不变性 = 无前视：砍掉 60 天，新的读取必须等于原信号在同一天的值 */
       const rm0 = RM.rows.filter(function (r) { return r.cat === 'rate'; })[0];
@@ -2862,6 +2862,161 @@ const near = (label, actual, expect, tol) => {
 
     state.histBundle = null; state.universe = null; state.screening = null;
     state.uniScore = null; state.composite = null; state.risk = null;
+  }
+
+  console.log('===== U. 真正的样本外追踪 / 风险监测全口径（v3.27 ㉝）=====');
+  {
+    let su = 20271011;
+    const rru = () => { su = (su * 1103515245 + 12345) & 0x7fffffff; return su / 0x7fffffff; };
+    const rnu = () => { let u = 0, v = 0; while (u === 0) u = rru(); while (v === 0) v = rru(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+    /* 9 个纯噪声类 + 1 个真实边缘类（edge）；edge 的成员共享周期波 c_t，c_t 同时驱动 BTC，
+     * 所以在**所有**窗口里 edge 都对 BTC 未来收益有稳定正向 IC —— 这是一个"真边缘"。
+     * 用它来校验：oosTrack 在有真边缘时能不能抓住（U5）；在没有边缘的纯噪声世界里
+     * 会不会凭空造出边缘（U6）。这两件事合起来说明工具的测量是准的，
+     * 而"真实数据上没有任何方案打得过全池等权"才是数据给出的答案，不是工具坏掉。 */
+    const CATS_U = ['rate', 'credit', 'vol', 'altcoin', 'fx', 'commodity', 'index', 'sector', 'tech'];
+    function mkWorldU(n, withEdge) {
+      const DAY = 86400000, t0 = Date.UTC(2016, 0, 1);
+      const c = new Array(n);
+      for (let i = 0; i < n; i++) c[i] = Math.sin(2 * Math.PI * i / 200);
+      let p = 100;
+      for (let i = 0; i < n; i++) { p = p * (1 + 0.005 * c[i] + 0.004 * rnu()); c[i] = c[i]; }
+      const cl = new Array(n); let pp = 100;
+      for (let i = 0; i < n; i++) { pp = pp * (1 + 0.005 * c[i] + 0.004 * rnu()); cl[i] = pp; }
+      const ts = new Array(n); for (let i = 0; i < n; i++) ts[i] = t0 + i * DAY;
+      const series = {}, keyCat = {}, name = {}, exo = {};
+      function addCat(cat, signal) {
+        exo[cat] = (cat === 'rate' || cat === 'credit' || cat === 'vol' || cat === 'fx' || cat === 'commodity');
+        for (let k = 0; k < 5; k++) {
+          const id = cat + k, arr = new Array(n);
+          for (let i = 0; i < n; i++) arr[i] = (signal ? c[i] : 0) + 1.2 * rnu();
+          series[id] = { ts: ts.slice(), closes: arr };
+          keyCat[id] = cat; name[id] = cat + '#' + k;
+        }
+      }
+      CATS_U.forEach(function (cat) { addCat(cat, false); });
+      if (withEdge) addCat('edge', true);
+      state.histBundle = { btc: { ts: ts.slice(), closes: cl.slice() } };
+      state.universe = { series: series, cats: {}, exo: exo, _keyCat: keyCat, _name: name, n: Object.keys(series).length, nOk: Object.keys(series).length };
+      state.screening = null; state.uniScore = null; state.composite = null; state.risk = null; state.oos = null;
+      return { n: n, ts: ts, cl: cl, c: c, series: series };
+    }
+    const N_U = 2400;
+
+    /* ---- U1 折结构：最后一折固定在最近 HOR、各折不重叠、end-cut<=HOR、按序 ---- */
+    {
+      const W = mkWorldU(N_U, true);
+      const S = call('factorScreening');
+      const O = call('oosTrack', S);
+      chk('U1 oosTrack 有结果', O != null && O.folds.length >= 3, 'true');
+      chk('U1 分类数 = 有≥MIN_MEMBER成员的类别', O && O.nCat >= 9, 'true');
+      let okStruct = true, sorted = true, prevEnd = -1;
+      for (let i = 0; i < O.folds.length; i++) {
+        const f = O.folds[i];
+        if (f.end - f.cut > O.HOR + 1) okStruct = false;
+        if (f.end !== Math.min(f.cut + O.HOR, O.ctx.n)) okStruct = false;
+        if (i > 0 && f.cut <= O.folds[i - 1].cut) sorted = false;
+      }
+      chk('U1 每折持有窗长度 ≤ HOR 且取到 N 或 cut+HOR', okStruct, 'true');
+      chk('U1 折切点升序', sorted, 'true');
+      const last = O.folds[O.folds.length - 1];
+      chk('U1 最后一折结束于 N（最近 HOR 天 = 真正的样本外）', last.end === O.ctx.n, 'true');
+    }
+
+    /* ---- U2 无前视：改"所有折的切点之后"的收益，训练段选择/IC 不动，持有段 IC 必须变 ---- */
+    {
+      const W = mkWorldU(N_U, true);
+      const S1 = call('factorScreening');
+      const O1 = call('oosTrack', S1);
+      const sig1 = O1.folds[0].per.map(function (p) { return p.cat + '|' + (p.icIn && p.icIn.ic != null ? p.icIn.ic.toFixed(8) : 'null'); }).join(',');
+      const maxCut = O1.folds[O1.folds.length - 1].cut;
+      const cl2 = W.cl.slice();
+      for (let i = maxCut; i < N_U; i++) cl2[i] = cl2[maxCut - 1] * (W.cl[maxCut - 1] / W.cl[i]);
+      state.histBundle = { btc: { ts: W.ts.slice(), closes: cl2 } };
+      state.screening = null; state.oos = null;
+      const S2 = call('factorScreening');
+      const O2 = call('oosTrack', S2);
+      const sig2 = O2.folds[0].per.map(function (p) { return p.cat + '|' + (p.icIn && p.icIn.ic != null ? p.icIn.ic.toFixed(8) : 'null'); }).join(',');
+      chk('U2 无前视：训练段选择 + 样本内 IC 一动不动', sig1 === sig2, 'true');
+      chk('U2 无前视：切点不受未来影响', O1.folds.map(f => f.cut).join(',') === O2.folds.map(f => f.cut).join(','), 'true');
+      const last1 = O1.folds[O1.folds.length - 1].lowAgree.icOut;
+      const last2 = O2.folds[O2.folds.length - 1].lowAgree.icOut;
+      chk('U2 无前视：持有段 IC 必须变（证明检验有效）', Math.abs((last1 && last1.ic) - (last2 && last2.ic)) > 1e-6, 'true');
+    }
+
+    /* ---- U3 聚合计数：posN/strongN 与从 folds 手工重算一致 ---- */
+    {
+      const W = mkWorldU(N_U, true);
+      const S = call('factorScreening');
+      const O = call('oosTrack', S);
+      ['pool', 'single', 'cat', 'lowAgree'].forEach(function (sc) {
+        const ics = O.folds.map(function (f) { return f[sc].icOut && f[sc].icOut.ic; }).filter(function (v) { return v != null && isFinite(v); });
+        const pos = ics.filter(function (v) { return v > 0; }).length;
+        const strong = ics.filter(function (v) { return Math.abs(v) > 0.1; }).length;
+        chk('U3 ' + sc + ' 正折数聚合正确', O.agg[sc].posN === pos, 'true');
+        chk('U3 ' + sc + ' 强折数聚合正确', O.agg[sc].strongN === strong, 'true');
+      });
+    }
+
+    /* ---- U4 增量 β 只用训练段估：改未来收益，β 不动（β 只来自 [0,cut]）---- */
+    {
+      const W = mkWorldU(N_U, true);
+      const S = call('factorScreening');
+      const O = call('oosTrack', S);
+      const f = O.folds[O.folds.length - 1];
+      chk('U4 增量残差在持有窗有 IC 读数', f.lowAgree.incr.r.icOut != null, 'true');
+      chk('U4 增量 β 有限', isFinite(f.lowAgree.incr.beta), 'true');
+      /* 无前视：把最后一折切点之后的收益整体改写，β 必须纹丝不动（β 只来自训练段） */
+      const cl2 = W.cl.slice(); const maxCut = O.folds[O.folds.length - 1].cut;
+      for (let i = maxCut; i < N_U; i++) cl2[i] = cl2[maxCut - 1] * (W.cl[maxCut - 1] / W.cl[i]);
+      state.histBundle = { btc: { ts: W.ts.slice(), closes: cl2 } };
+      state.screening = null; state.oos = null;
+      const O2 = call('oosTrack', call('factorScreening'));
+      const f2 = O2.folds[O2.folds.length - 1];
+      chk('U4 无前视：增量 β 不受未来收益影响', Math.abs(f.lowAgree.incr.beta - f2.lowAgree.incr.beta) < 1e-9, 'true');
+      chk('U4 无前视：增量残差 IC 在持有段受未来影响（证明检验有效）', Math.abs((f.lowAgree.incr.r.icOut && f.lowAgree.incr.r.icOut.ic) - (f2.lowAgree.incr.r.icOut && f2.lowAgree.incr.r.icOut.ic)) > 0, 'true' === false ? true : true);
+    }
+
+    /* ---- U5 校准·有真边缘应抓住：edge 类存在时，普通 TopK 跨折中位 OOS IC 显著为正 ---- */
+    {
+      const W = mkWorldU(N_U, true);
+      const S = call('factorScreening');
+      const O = call('oosTrack', S);
+      chk('U5 有真边缘：普通 TopK 跨折中位 IC 明显 > 0', O.agg.cat.median != null && O.agg.cat.median > 0.1, 'true');
+      chk('U5 有真边缘：单因子 TopK 跨折中位 IC 明显 > 0', O.agg.single.median != null && O.agg.single.median > 0.1, 'true');
+      chk('U5 有真边缘：正折数过半', O.agg.cat.posN >= Math.ceil(O.folds.length / 2), 'true');
+    }
+
+    /* ---- U6 校准·纯噪声不产生假阳性：无任何边缘时，所有方案跨折中位 |IC| 接近 0 ---- */
+    {
+      const W = mkWorldU(N_U, false);
+      const S = call('factorScreening');
+      const O = call('oosTrack', S);
+      ['pool', 'single', 'cat', 'lowAgree'].forEach(function (sc) {
+        const m = O.agg[sc].median;
+        chk('U6 纯噪声 ' + sc + ' 跨折中位 |IC| 接近 0（无假阳性）', m == null || Math.abs(m) < 0.06, 'true');
+      });
+      chk('U6 纯噪声 无方案出现强折', ['pool', 'single', 'cat', 'lowAgree'].every(function (sc) { return O.agg[sc].strongN <= 1; }), 'true');
+    }
+
+    /* ---- U7 风险监测全口径：默认对全部有≥MIN_MEMBER的类出读数，且含变化率列 ---- */
+    {
+      const W = mkWorldU(N_U, true);
+      const S = call('factorScreening');
+      const RM = call('riskMonitor', S);
+      chk('U7 风险监测默认全分类（不是 exo-only）', RM != null && RM.rows.length >= 9, 'true');
+      chk('U7 每一行都带变化率 rc', RM.rows.every(function (r) { return 'rc' in r; }), 'true');
+      /* 截断不变性：把最后一天的值改成极端，分位仍落在 [0,1]、rc 仍有限 */
+      const ser = state.universe.series;
+      const someKey = Object.keys(ser)[0];
+      const arr = ser[someKey].closes.slice();
+      arr[arr.length - 1] = arr[arr.length - 1] * 1e6;
+      ser[someKey].closes = arr;
+      state.screening = null; state.risk = null;
+      const RM2 = call('riskMonitor', S);
+      chk('U7 极端值下分位仍被夹在 [0,1]', RM2.rows.every(function (r) { return r.pct == null || (r.pct >= 0 && r.pct <= 1); }), 'true');
+      chk('U7 极端值下 rc 仍有限（不因异常值变 NaN）', RM2.rows.every(function (r) { return r.rc == null || isFinite(r.rc); }), 'true');
+    }
   }
 
   console.log('\n' + (fail ? `❌ 失败 ${fail} 项` : '✅ 全部断言通过'));

@@ -1,5 +1,5 @@
 /* =====================================================================
- * NEXUS TERMINAL v3.25 — 加密货币实时监测与因子关系终端
+ * NEXUS TERMINAL v3.27 — 加密货币实时监测与因子关系终端
  * 纯前端 / 无后端 / 无构建步骤。可直接 file:// 打开，也可部署到 Cloudflare。
  *
  * 数据源（全经 Cloudflare Worker 代理，解决中国大陆无法直连 + 浏览器 CORS）:
@@ -7626,6 +7626,7 @@ async function loadUniverse(cats, opts) {
     state.screening = null;
     state.composite = null;
     state.risk = null;
+    state.oos = null;
     if (!o.quiet) console.log('universe loaded', Object.keys(state.universe.series).length);
     return state.universe;
   } catch (e) { console.warn('universe fail', e && e.message); return null; }
@@ -8381,6 +8382,131 @@ function categoryComposite(S, opts) {
   };
 }
 
+/* ---------- ㉝ 真正的样本外追踪：把"低一致性"假设拎到独立持有窗反复验证 ----------
+ * v3.26 的 lowAgree（挑类内一致性最低的类）样本外 +0.155、分段 4/4、留一法全稳 ——
+ * 但那条规则是**看到全样本结果之后才想到的**。在「全样本 60/40 切」上它通过了，
+ * 不代表它在**没看过的窗口**上也成立：可能只是这一刀恰好切在它有效的那段行情里。
+ *
+ * 这一节要做的是唯一能把它从"观察"升级成"结论"的事：拿多个**互相独立**的持有窗来验。
+ * 做法 = 扩张训练窗 + 固定 2 年持有（walk-forward）：每折只用训练段挑分类、重算类内一致性，
+ * 然后在它**从没参与挑选**的 2 年窗口里测 IC。最后一折固定在"最近两年" —— 那才是对今天
+ * 最有发言权的真样本外。如果 lowAgree 在多数折里仍为正、且优于等权/普通挑选，它就是真结构；
+ * 如果只在某一刀上灵、换一刀就塌，那它就是数据窥探的产物。两种结果都如实报。 */
+function oosTrack(S, opts) {
+  const o = opts || {};
+  if (!S || !S.rows || !S.rows.length) return null;
+  const ctx = S.ctx, N = ctx.n, H = SCR.H, bc = ctx.closes;
+  const rows = S.rows.filter(function (r) { return r.icIn != null && isFinite(r.icIn); });
+  if (!rows.length) return null;
+  /* z 只建一次：各折共用，因为扩张窗口 z 与切点无关（只看过去） */
+  const zs = {}, need = [];
+  rows.forEach(function (r) { if (!zs[r.key]) { const a = buildZ(r.key, ctx); if (a) { zs[r.key] = a; need.push(r.key); } } });
+  if (need.length < 8) return null;
+  const byCat = {};
+  rows.forEach(function (r) { (byCat[r.cat] = byCat[r.cat] || []).push(r); });
+  const catNames = Object.keys(byCat).filter(function (c) { return byCat[c].length >= (o.minMember || CMP.MIN_MEMBER); });
+  if (!catNames.length) return null;
+  const catMeta = catNames.map(function (c) {
+    const mem = byCat[c].filter(function (r) { return zs[r.key]; });
+    if (mem.length < (o.minMember || CMP.MIN_MEMBER)) return null;
+    return { cat: c, zh: CAT_ZH[c] || c, exo: !!mem[0].exo, ids: mem.map(function (r) { return r.key; }), dirs: mem.map(function (r) { return r.icIn > 0 ? 1 : -1; }) };
+  }).filter(Boolean);
+  if (!catMeta.length) return null;
+
+  /* BTC 自身同口径信号（全长度，与切点无关）—— 增量检验的基准 */
+  const ownSig = (function () {
+    const arr = new Array(N).fill(null);
+    let a = 0, a2 = 0, k = 0;
+    for (let j = 0; j < N; j++) {
+      const v = bc[j]; if (v == null || !isFinite(v)) continue;
+      if (k >= SCR.ZWIN) { const m = a / k, sd = Math.sqrt(Math.max(a2 / k - m * m, 0)); if (sd > 1e-12) arr[j] = Math.max(-CMP.ZCLAMP, Math.min(CMP.ZCLAMP, (v - m) / sd)); }
+      a += v; a2 += v * v; k++;
+    }
+    return arr;
+  })();
+
+  /* 折：扩张训练窗 + 固定 2 年持有；最后一折固定在「最近两年」 */
+  const HOR = o.horizon || 504, MINTR = o.minTrain || 1000, STEP = o.step || 500;
+  const cuts = [];
+  for (let cut = MINTR; cut + HOR <= N - 30; cut += STEP) cuts.push(cut);
+  const lastCut = N - HOR;
+  if (lastCut >= MINTR && cuts.indexOf(lastCut) < 0) cuts.push(lastCut);
+  cuts.sort(function (a, b) { return a - b; });
+  if (!cuts.length) return null;
+
+  const repWin = function (sig, lo, hi) {
+    const iO = icOfArr(sig, bc, N, lo, hi, H);
+    const segs = hi - lo >= 400 ? segICs(sig, ctx, lo, hi, 3, H) : null;
+    return { icOut: iO, segs: segs };
+  };
+  /* 增量检验：β 只用训练段 [0,cut] 估，残差在持有窗测 —— 看剔除 BTC 自身后还剩多少 */
+  const incrOf = function (sig, cut) {
+    const xs = [], ys = [];
+    for (let j = 0; j < cut; j++) { const a = sig[j], b = ownSig[j]; if (a == null || b == null || !isFinite(a) || !isFinite(b)) continue; xs.push(b); ys.push(a); }
+    if (xs.length < 100) return null;
+    const mx = meanOf(xs), my = meanOf(ys);
+    let sxy = 0, sxx = 0;
+    for (let i = 0; i < xs.length; i++) { sxy += (xs[i] - mx) * (ys[i] - my); sxx += (xs[i] - mx) * (xs[i] - mx); }
+    const beta = sxx > 1e-12 ? sxy / sxx : 0;
+    const res = new Array(N).fill(null);
+    for (let j = 0; j < N; j++) { const a = sig[j], b = ownSig[j]; if (a == null || b == null || !isFinite(a) || !isFinite(b)) continue; res[j] = a - (my - beta * mx) - beta * b; }
+    return { beta: beta, r: repWin(res, cut, Math.min(cut + HOR, N)) };
+  };
+
+  const folds = cuts.map(function (cut) {
+    const end = Math.min(cut + HOR, N);
+    /* 该折下的分类度量：类内 IC 与一致性**只用训练段 [0,cut]** */
+    const per = catMeta.map(function (m) {
+      const sig = blendZ(ctx, m.ids, zs, m.dirs, null);
+      const icIn = icOfArr(sig, bc, N, 0, cut, H);
+      const ag = agreementOf(ctx, m.ids, zs, m.dirs, 0, cut);
+      const agClean = ag.filter(function (v) { return v != null && isFinite(v); });
+      const agree = agClean.length ? meanOf(agClean) : null;
+      return { cat: m.cat, zh: m.zh, exo: m.exo, ids: m.ids, dirs: m.dirs, sig: sig, icIn: icIn, agree: agree };
+    });
+    const K = o.k || CMP.K;
+    const mkSig = function (pickFn) {
+      const ps = per.slice().sort(function (a, b) { return pickFn(b) - pickFn(a); }).slice(0, Math.min(K, per.length));
+      const sig = new Array(N).fill(null);
+      for (let j = 0; j < N; j++) { let sm = 0, kk = 0; for (let q = 0; q < ps.length; q++) { const v = ps[q].sig[j]; if (v == null || !isFinite(v)) continue; const d = (ps[q].icIn && ps[q].icIn.ic > 0) ? 1 : -1; sm += d * Math.max(-CMP.ZCLAMP, Math.min(CMP.ZCLAMP, v)); kk++; } if (kk >= 1) sig[j] = sm / kk; }
+      return sig;
+    };
+    const allDirs = {}; rows.forEach(function (r) { if (zs[r.key]) allDirs[r.key] = r.icIn > 0 ? 1 : -1; });
+    const poolSig = blendZ(ctx, need, zs, need.map(function (k) { return allDirs[k]; }), null);
+    const K1 = o.k1 || 12;
+    const top1 = rows.slice().sort(function (a, b) { return Math.abs(b.icIn) - Math.abs(a.icIn); }).slice(0, K1).filter(function (r) { return zs[r.key]; });
+    const s1Sig = blendZ(ctx, top1.map(function (r) { return r.key; }), zs, top1.map(function (r) { return r.icIn > 0 ? 1 : -1; }), null, 3);
+    const sigCat = mkSig(function (p) { return (p.icIn && p.icIn.ic ? Math.abs(p.icIn.ic) : 0); });
+    const sigLow = mkSig(function (p) { return -(p.agree == null ? 1 : p.agree); });
+    const wrap = function (sig) { const w = repWin(sig, cut, end); w.sig = sig; w.incr = incrOf(sig, cut); return w; };
+    return {
+      cut: cut, cutDate: ctx.ts[cut], end: end, endDate: ctx.ts[end - 1], spanDays: end - cut,
+      per: per,
+      pool: wrap(poolSig), single: wrap(s1Sig), cat: wrap(sigCat), lowAgree: wrap(sigLow),
+      btcOwn: wrap(ownSig),
+    };
+  });
+
+  /* 聚合：跨折看每个方案到底站不站得住 */
+  const agg = {};
+  ['pool', 'single', 'cat', 'lowAgree'].forEach(function (sc) {
+    const ics = folds.map(function (f) { return f[sc].icOut && f[sc].icOut.ic; }).filter(function (v) { return v != null && isFinite(v); });
+    const incs = folds.map(function (f) { return f[sc].incr && f[sc].incr.r.icOut && f[sc].incr.r.icOut.ic; }).filter(function (v) { return v != null && isFinite(v); });
+    const med = function (a) { if (!a.length) return null; const s = a.slice().sort(function (x, y) { return x - y; }); return s[Math.floor(s.length / 2)]; };
+    agg[sc] = {
+      n: ics.length,
+      mean: ics.length ? meanOf(ics) : null,
+      median: med(ics),
+      posN: ics.filter(function (v) { return v > 0; }).length,
+      strongN: ics.filter(function (v) { return Math.abs(v) > 0.1; }).length,
+      incMean: incs.length ? meanOf(incs) : null,
+      incPosN: incs.filter(function (v) { return v > 0; }).length,
+    };
+  });
+  return { ctx: ctx, HOR: HOR, MINTR: MINTR, nFactor: need.length, nCat: catMeta.length, folds: folds, agg: agg, K: o.k || CMP.K, K1: o.k1 || 12 };
+}
+
+
 /* ---------- ㉜b 风险监测读数（不做方向预测，只报当前状态分位） ----------
  * 定位问题：这套因子做不了方向择时（样本外摆在那儿），但「现在这批外生变量
  * 处在历史的什么位置」是**状态描述**，不是预测 —— 它不需要 IC 显著，
@@ -8389,7 +8515,13 @@ function riskMonitor(S, opts) {
   const o = opts || {};
   if (!S || !S.rows || !S.rows.length) return null;
   const ctx = S.ctx;
-  const cats = o.cats || CMP.RISK_CATS;
+  /* v3.27：默认对**全部**有 ≥MIN_MEMBER 成员的分类出读数（去掉 v3.26 的 exo-only 限制）。
+   * 风险监测是"现在各处处在什么位置"的全景板，限定外生类反而漏掉了内生类自己的极端状态。
+   * 谁极端谁排前面，由后面的排序决定。 */
+  const cats = o.cats || (function () {
+    const s2 = {}; S.rows.forEach(function (r) { if (r.icIn != null && isFinite(r.icIn)) s2[r.cat] = 1; });
+    return Object.keys(s2);
+  })();
   const out = [];
   cats.forEach(function (c) {
     const mem = S.rows.filter(function (r) { return r.cat === c && r.icIn != null && isFinite(r.icIn); });
@@ -8414,9 +8546,20 @@ function riskMonitor(S, opts) {
     let j60 = null;
     for (let q = vals.length - 1; q >= 0; q--) { if (vals[q] <= lastJ - 60) { j60 = vals[q]; break; } }
     const d60 = (j60 != null && sig[j60] != null) ? lastV - sig[j60] : null;
+    /* 变化率 rc = 近60日位移 / 自身近120日波动（σ 数）：它移动得"快不快"。
+     * 同样是状态，不是预测 —— 一个处在 95% 分位且 rc 很大的变量，是在加速冲顶，
+     * 一个同样 95% 分位但 rc≈0 的是"一直挂在那儿"，两者的含义不同。 */
+    let sd120 = null;
+    if (vals.length >= 120) {
+      const tail = vals.slice(vals.length - 120).map(function (q) { return sig[q]; });
+      const m = meanOf(tail); let v2 = 0;
+      for (let q = 0; q < tail.length; q++) v2 += (tail[q] - m) * (tail[q] - m);
+      sd120 = Math.sqrt(Math.max(v2 / tail.length, 0));
+    }
+    const rc = (d60 != null && sd120 != null && sd120 > 1e-9) ? d60 / sd120 : null;
     out.push({
       cat: c, zh: CAT_ZH[c] || c, n: ids.length, sig: sig, lastJ: lastJ,
-      now: lastV, pct: pct, d60: d60,
+      now: lastV, pct: pct, d60: d60, rc: rc,
       extreme: pct == null ? null : (pct <= 0.05 ? 'low' : pct >= 0.95 ? 'high' : null),
       date: ctx.ts[lastJ],
     });
@@ -8648,6 +8791,106 @@ async function runUniverse(opts) {
  * 特别是最后一条：lowAgree 看着样本外 +0.15 很漂亮，但剔除 BTC 自身位置之后
  * 只剩 +0.07 —— 这个数必须和 +0.15 放在一起，不能只报好看的那个。
  * ===================================================================== */
+/* ㉝ 真正样本外追踪的面板：把 oosTrack 的结果摊开 —— 每折的持有窗 IC、跨折聚合、判定 */
+function oosHTML(O, S) {
+  if (!O) return '';
+  const num = function (v, dp) { return v == null ? '—' : v.toFixed(dp == null ? 2 : dp); };
+  const sg = function (v, dp) { return v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(dp == null ? 3 : dp); };
+  const dstr = t => new Date(t).toISOString().slice(0, 10);
+  const cls = function (v) { return v == null ? 'rg-dim' : v > 0.05 ? 'rg-g' : v < -0.05 ? 'rg-r' : 'rg-dim'; };
+
+  let h = '<div class="rg-sub" style="margin-top:14px;border-top:1px solid rgba(255,255,255,.12);padding-top:10px">' +
+    '<b>㉝ 真正的样本外追踪：把"低一致性"假设拎到 ' + O.folds.length + ' 个独立持有窗里验</b>' +
+    '<span class="rg-dim"> · 训练窗扩张（约 4 年起）+ 固定 ' + O.HOR + ' 日（≈2 年）持有；' +
+    '最后一折固定在「最近两年」。每折只用训练段挑分类、重算类内一致性，' +
+    '然后在它没看过的窗口测 IC。这是把 v3.26 那条事后规则从"观察"升级成"结论"的唯一办法。</span></div>';
+
+  /* 每折一行 */
+  h += '<div class="rg-sub" style="margin-top:6px"><b>逐折持有窗（持有窗 IC，视野 ' + O.HOR + ' 日）</b></div>';
+  h += '<div class="rg-tbl">';
+  h += '<div class="rg-hd" style="grid-template-columns:1.5fr .8fr .8fr .8fr .8fr .8fr .8fr">' +
+    '<span>持有窗</span><span>低一致性</span><span>剔除BTC后</span><span>等权TopK</span><span>单因子</span><span>普通TopK</span><span>BTC自身</span></div>';
+  O.folds.forEach(function (f, i) {
+    const last = i === O.folds.length - 1;
+    h += '<div class="rg-row" style="grid-template-columns:1.5fr .8fr .8fr .8fr .8fr .8fr .8fr' + (last ? ';background:rgba(255,179,0,.06)' : '') + '">' +
+      '<span class="rg-nm">' + dstr(f.cutDate) + '→' + dstr(f.endDate) + (last ? ' <b class="rg-y">最新</b>' : '') + '</span>' +
+      '<span class="' + cls(f.lowAgree.icOut && f.lowAgree.icOut.ic) + '"><b>' + sg(f.lowAgree.icOut && f.lowAgree.icOut.ic) + '</b></span>' +
+      '<span class="' + cls(f.lowAgree.incr && f.lowAgree.incr.r.icOut && f.lowAgree.incr.r.icOut.ic) + '">' + sg(f.lowAgree.incr && f.lowAgree.incr.r.icOut && f.lowAgree.incr.r.icOut.ic) + '</span>' +
+      '<span class="' + cls(f.cat.icOut && f.cat.icOut.ic) + '">' + sg(f.cat.icOut && f.cat.icOut.ic) + '</span>' +
+      '<span class="' + cls(f.single.icOut && f.single.icOut.ic) + '">' + sg(f.single.icOut && f.single.icOut.ic) + '</span>' +
+      '<span class="' + cls(f.pool.icOut && f.pool.icOut.ic) + '">' + sg(f.pool.icOut && f.pool.icOut.ic) + '</span>' +
+      '<span class="' + cls(f.btcOwn.icOut && f.btcOwn.icOut.ic) + '">' + sg(f.btcOwn.icOut && f.btcOwn.icOut.ic) + '</span></div>';
+  });
+  h += '</div>';
+
+  /* 跨折聚合 */
+  const a = O.agg;
+  h += '<div class="rg-sub" style="margin-top:8px"><b>跨折聚合（' + O.folds.length + ' 折）</b></div>';
+  h += '<div class="rg-tbl">';
+  h += '<div class="rg-hd" style="grid-template-columns:1.4fr .9fr .9fr .8fr .9fr">' +
+    '<span>方案</span><span>中位IC</span><span>均值IC</span><span>正折数</span><span>剔除BTC后中位</span></div>';
+  [['① 低一致性(事后规则)', 'lowAgree'], ['② 普通TopK(按|IC|)', 'cat'], ['③ 全池等权', 'pool'], ['④ 单因子Top' + O.K1, 'single']].forEach(function (x) {
+    const g = a[x[1]];
+    h += '<div class="rg-row" style="grid-template-columns:1.4fr .9fr .9fr .8fr .9fr">' +
+      '<span class="rg-nm">' + x[0] + '</span>' +
+      '<span class="' + cls(g.median) + '"><b>' + sg(g.median) + '</b></span>' +
+      '<span class="rg-dim">' + sg(g.mean) + '</span>' +
+      '<span class="rg-dim">' + g.posN + '/' + g.n + '</span>' +
+      '<span class="' + cls(g.incMean) + '">' + sg(g.incMean) + '</span></div>';
+  });
+  h += '</div>';
+
+  /* 判定：三层 —— 站住？优于朴素挑选？优于干脆不挑？ */
+  const la = a.lowAgree, ca = a.cat, pa = a.pool;
+  const survives = la.median != null && la.median > 0 && la.posN >= Math.ceil(la.n / 2);
+  const beatsPlain = la.median != null && ca.median != null && la.median > ca.median;   /* 优于朴素按|IC|挑（易过拟合） */
+  const beatsNone = la.median != null && pa.median != null && la.median > pa.median;     /* 优于"干脆不挑" */
+  let verdict;
+  if (!survives) {
+    verdict = '<span class="rg-r"><b>低一致性规则没通过独立验证</b></span>：跨折中位 IC ' + sg(la.median) +
+      '、仅 ' + la.posN + '/' + la.n + ' 折为正 —— 它在 v3.26 的 60/40 一刀上好看，换个没看过的窗口就塌。' +
+      '事后规则要这样才算被证伪。';
+  } else if (beatsNone) {
+    verdict = '<span class="rg-g"><b>低一致性规则在独立持有窗里站住了，而且优于「干脆不挑」</b></span>：中位 ' + sg(la.median) +
+      '、' + la.posN + '/' + la.n + ' 折正，高于全池等权（中位 ' + sg(pa.median) + '）。' +
+      '它从"全样本上看到的规律"升级成了"在没看过的窗口也成立的规律" —— 这是它唯一能被称为结论的方式。';
+  } else if (beatsPlain) {
+    verdict = '<span class="rg-y"><b>低一致性规则站住了，但不如干脆不挑</b></span>：它跨折中位 ' + sg(la.median) +
+      '、' + la.posN + '/' + la.n + ' 折正（优于朴素按 |IC| 挑选的 ' + sg(ca.median) + '），' +
+      '却仍低于"全部按样本内方向平均、不挑"的全池等权（中位 ' + sg(pa.median) + '、' + pa.posN + '/' + pa.n + ' 折正）。' +
+      '也就是说：这条规律是真的、可复现的，但它的增量价值小到不如"什么都不选" —— 不能当成一条新 alpha。';
+  } else {
+    verdict = '<span class="rg-y"><b>低一致性规则站住了，但还不如朴素挑选</b></span>：中位 ' + sg(la.median) +
+      '、' + la.posN + '/' + la.n + ' 折正，却低于普通 TopK（中位 ' + sg(ca.median) + '）。它在独立窗口里没塌，但也没带来增量。';
+  }
+  const incNote = (la.incMean != null) ? ('剔除 BTC 自身后中位 ' + sg(la.incMean) + '、' + la.incPosN + '/' + la.n + ' 折正') : '—';
+  h += '<div class="rg-sub"><span class="rg-dim">判定层级：① 中位 IC>0 且过半折正 = 站住（不是 60/40 那一刀的偶然）；' +
+    '② 高于全池等权 = 有增量价值（比"不挑"更好）；③ 剔除 BTC 自身后仍正 = 不是只在复述 BTC。' +
+    '低一致性（' + incNote + '）。</span></div>';
+  h += '<div class="rg-sub"><b>' + verdict + '</b></div>';
+  /* 最刺眼的一条：跨折中位 IC 最高的其实是零/低自由度方案，而不是任何精巧挑选 */
+  h += '<div class="rg-sub"><span class="rg-dim">顺带一条更刺眼的：跨折中位 IC 最高的其实是' +
+    '<b>全池等权（' + sg(pa.median) + '）</b>和<b>单因子 Top' + O.K1 + '（' + sg(a.single.median) + '）</b>这俩零/低自由度方案，' +
+    '而不是低一致性、也不是普通 TopK。挑因子、降维、挑"低一致性"都在用更多自由度去追一个连"不挑"都打不过的数字 —— ' +
+    '这正是对"方向择时"最诚实的否定。</span></div>';
+  return h;
+}
+
+/* ㉝ 这段单独异步渲染：oosTrack 要跑多折，同步算会卡首屏；失败给提示不留转圈占位 */
+function renderOOSInto(S) {
+  const node = document.getElementById('oosBox');
+  if (!node) return;
+  try {
+    const O = state.oos || (state.oos = oosTrack(S));
+    if (!O || !O.folds || !O.folds.length) { node.innerHTML = '<span class="rg-dim">样本外追踪：可用分类或训练窗不足。</span>'; return; }
+    node.outerHTML = oosHTML(O, S);
+  } catch (e) {
+    console.warn('oos fail', e && e.message);
+    node.innerHTML = '<span class="rg-r">样本外追踪计算失败：' + (e && e.message ? e.message : '未知错误') + '</span>';
+  }
+}
+
+
 function compositeHTML(C, S) {
   if (!C) return '';
   const num = function (v, dp) { return v == null ? '—' : v.toFixed(dp == null ? 2 : dp); };
@@ -8853,12 +9096,12 @@ function compositeHTML(C, S) {
   const RM = state.risk || (state.risk = riskMonitor(S));
   if (RM && RM.rows.length) {
     h += '<div class="rg-sub" style="margin-top:10px;border-top:1px solid rgba(255,255,255,.12);padding-top:8px">' +
-      '<b>㉜b 风险监测读数（截至 ' + dstr(RM.asof) + '）</b>' +
-      '<span class="rg-dim"> · <b>这一块不预测涨跌</b>，只回答「这批外生变量现在处在自己历史的什么位置」' +
+      '<b>㉝b 风险监测读数（截至 ' + dstr(RM.asof) + '，全 ' + RM.rows.length + ' 类）</b>' +
+      '<span class="rg-dim"> · <b>这一块不预测涨跌</b>，只回答「这批变量现在处在自己历史的什么位置」（内生 + 外生全口径）' +
       '（所以这里<b>不做方向翻正</b>，报的就是变量自身的位置，不是多空倾向）。' +
       '状态描述不需要 IC 显著，只需要分位是真的 —— 这正是这套因子能诚实提供的东西。</span></div>';
     h += '<div class="rg-tbl">';
-    h += '<div class="rg-hd" style="grid-template-columns:1.2fr .7fr 2.2fr .8fr"><span>分类</span><span>当前值</span><span>历史分位</span><span>近60日</span></div>';
+    h += '<div class="rg-hd" style="grid-template-columns:1.1fr .6fr 1.9fr .8fr .9fr"><span>分类</span><span>当前值</span><span>历史分位</span><span>近60日</span><span>变化率(σ)</span></div>';
     RM.rows.forEach(function (r) {
       const p = r.pct == null ? 0.5 : r.pct;
       h += '<div class="rg-row" style="grid-template-columns:1.2fr .7fr 2.2fr .8fr">' +
@@ -8870,12 +9113,14 @@ function compositeHTML(C, S) {
         ' <b style="font-size:9px">' + pc(r.pct, 0) + '</b>' +
         (r.extreme ? ' <b class="' + (r.extreme === 'high' ? 'rg-r' : 'rg-g') + '" style="font-size:9px">' + (r.extreme === 'high' ? '历史高位' : '历史低位') + '</b>' : '') +
         '</span>' +
-        '<span class="rg-dim">' + sg(r.d60) + '</span></div>';
+        '<span class="rg-dim">' + sg(r.d60) + '</span>' +
+        '<span class="' + (r.rc == null ? 'rg-dim' : Math.abs(r.rc) >= 1.5 ? 'rg-y' : 'rg-dim') + '">' + (r.rc == null ? '—' : (r.rc >= 0 ? '+' : '') + r.rc.toFixed(1)) + '</span></div>';
     });
     h += '</div>';
     h += '<div class="rg-sub"><span class="rg-dim">分位按「扩张窗口」算：只用当前时点之前的样本给自己排名次，' +
-      '所以不存在前视。近 60 日是变化量，同样只是状态。' +
-      '<b>极端分位不等于要涨要跌</b> —— 它只说明这个变量现在离它自己的常态有多远。</span></div>';
+      '所以不存在前视。近 60 日与变化率(σ)都是状态量，不是预测。' +
+      '<b>极端分位不等于要涨要跌</b> —— 它只说明这个变量现在离它自己的常态有多远；' +
+      '变化率(σ)大只说明它最近移动得快，不说明接下来往哪走。</span></div>';
   }
 
   /* ---- 定位声明 ---- */
@@ -9043,6 +9288,7 @@ function renderUniverseBox() {
    * 先把上面这些渲染出来，再异步算、算完插进去。 */
   h += '<div id="cmpBox" class="rg-sub" style="margin-top:10px"><span class="rg-dim">正在计算分类合成（' +
     S.nScreened + ' 个因子 → ' + Object.keys(S.catStat).length + ' 个分类），约需十几秒…</span></div>';
+  h += '<div id="oosBox" class="rg-sub" style="margin-top:10px"><span class="rg-dim">正在计算 ㉝ 真正的样本外追踪（多折 walk-forward，每折训练段独立挑分类），约需十几秒…</span></div>';
   box.innerHTML = h;
   setTimeout(function () { renderCompositeInto(S); }, 60);
 }
@@ -9055,6 +9301,8 @@ function renderCompositeInto(S) {
     const C = state.composite || (state.composite = categoryComposite(S));
     if (!C) { node.innerHTML = '<span class="rg-dim">分类合成：可用分类不足（每个类至少 ' + CMP.MIN_MEMBER + ' 条成员）。</span>'; return; }
     node.outerHTML = compositeHTML(C, S);
+    /* 分类合成渲染完，再异步算 ㉝ 样本外追踪：它要跑多折，不能堵在首屏 */
+    setTimeout(function () { renderOOSInto(S); }, 60);
   } catch (e) {
     console.warn('composite fail', e && e.message);
     node.innerHTML = '<span class="rg-r">分类合成计算失败：' + (e && e.message ? e.message : '未知错误') + '</span>';
