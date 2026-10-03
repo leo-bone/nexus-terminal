@@ -3019,6 +3019,120 @@ const near = (label, actual, expect, tol) => {
     }
   }
 
+  console.log('===== V. 风险护栏三联警报（v3.28 ㉞）=====');
+  {
+    /* 工具：用一组数值构造 histBundle.macro.DVOL（与生产口径一致：近1年百分位 + 60日z） */
+    const setDvol = (closes) => {
+      const ts = closes.map((_, i) => now - (closes.length - 1 - i) * 86400000);
+      state.histBundle = { btc: {}, macro: { DVOL: { ts: ts, closes: closes.slice() } } };
+    };
+    const lowDvol = () => setDvol(new Array(365).fill(0).map((_, i) => (i === 364 ? 100 : 200))); // 末位=最小值 → pct≈0
+    const highDvol = () => setDvol(new Array(365).fill(0).map((_, i) => (i < 350 ? 100 : 200)).concat([100])); // 350@100 + 15@200, 末位=100 → pct≈0.96
+    const midDvol = () => setDvol(new Array(365).fill(0).map((_, i) => (i < 292 ? 100 : 200)).concat([100])); // 292@100 + 73@200, 末位=100 → pct≈0.80
+
+    /* V1 dvolStatsNow：无数据返回 null；百分位与 60日z 合理；级别映射正确 */
+    {
+      state.histBundle = { btc: {} };
+      const lo = call('dvolStatsNow');
+      chk('V1 无 DVOL 数据返回 null', lo === null, 'true');
+      lowDvol();
+      const d1 = call('dvolStatsNow');
+      chk('V1 低位 DVOL 百分位接近 0', d1 && d1.pctTrailing1y < 0.02, 'true');
+      chk('V1 低位 DVOL 60日z 有限', d1 && isFinite(d1.z60), 'true');
+      highDvol();
+      const d2 = call('dvolStatsNow');
+      chk('V1 高位 DVOL 百分位 ≥ 0.92', d2 && d2.pctTrailing1y >= 0.92, 'true');
+      chk('V1 高位 DVOL 60日z 有限', d2 && isFinite(d2.z60), 'true');
+      midDvol();
+      const d3 = call('dvolStatsNow');
+      chk('V1 中位 DVOL 百分位落在 [0.75,0.92)', d3 && d3.pctTrailing1y >= 0.75 && d3.pctTrailing1y < 0.92, 'true');
+    }
+
+    /* V2 护栏聚合：三分量 → GREEN / YELLOW / RED */
+    const setRisk = (rows) => { state.risk = { rows: rows, asof: now }; };
+    const calmRow = (cat, zh) => ({ cat: cat, zh: zh, extreme: null, pct: 0.5, rc: 0.2 });
+    {
+      setRisk([calmRow('rate', '利率'), calmRow('fx', '外汇'), calmRow('vol', '波动率')]);
+      state.histBundle = { btc: {} }; // 无 DVOL
+      let G = call('guardrail', {});
+      chk('V2 全静 → GREEN', G && G.label === 'GREEN' && G.status === 0, 'true');
+
+      setRisk([
+        { cat: 'rate', zh: '利率', extreme: 'high', pct: 0.97, rc: 0.1 },
+        { cat: 'fx', zh: '外汇', extreme: null, pct: 0.5, rc: 1.8 },
+        calmRow('vol', '波动率'),
+      ]);
+      G = call('guardrail', {});
+      chk('V2 单极端 + 单加速 → YELLOW', G && G.label === 'YELLOW' && G.status === 1, 'true');
+      chk('V2 触发清单含两类', G && G.firing.length === 2, 'true');
+
+      setRisk([
+        { cat: 'rate', zh: '利率', extreme: 'high', pct: 0.97, rc: 0.1 },
+        { cat: 'fx', zh: '外汇', extreme: 'high', pct: 0.96, rc: 0.1 },
+        calmRow('vol', '波动率'),
+      ]);
+      G = call('guardrail', {});
+      chk('V2 两类极端 → RED（极端分位联动）', G && G.label === 'RED' && G.status === 2, 'true');
+
+      setRisk([
+        { cat: 'rate', zh: '利率', extreme: null, pct: 0.5, rc: 1.8 },
+        { cat: 'fx', zh: '外汇', extreme: null, pct: 0.5, rc: 1.9 },
+        { cat: 'vol', zh: '波动率', extreme: null, pct: 0.5, rc: 2.0 },
+      ]);
+      G = call('guardrail', {});
+      chk('V2 三类加速 → RED（变化率联动）', G && G.label === 'RED' && G.status === 2, 'true');
+
+      setRisk([calmRow('rate', '利率'), calmRow('fx', '外汇')]);
+      highDvol();
+      G = call('guardrail', {});
+      chk('V2 DVOL 高位单独 → RED', G && G.label === 'RED' && G.status === 2 && G.dvolLevel === 2, 'true');
+
+      setRisk([calmRow('rate', '利率'), calmRow('fx', '外汇')]);
+      midDvol();
+      G = call('guardrail', {});
+      chk('V2 DVOL 中位 → YELLOW', G && G.label === 'YELLOW' && G.status === 1 && G.dvolLevel === 1, 'true');
+    }
+
+    /* V3 护栏 HTML 渲染：无 undefined / NaN，含状态标签与三联分量 */
+    {
+      setRisk([
+        { cat: 'rate', zh: '利率', extreme: 'high', pct: 0.97, rc: 0.1 },
+        { cat: 'fx', zh: '外汇', extreme: 'high', pct: 0.96, rc: 1.8 },
+        calmRow('vol', '波动率'),
+      ]);
+      state.histBundle = { btc: {} };
+      const G = call('guardrail', {});
+      const html = call('guardrailHTML', G) || '';
+      chk('V3 面板有内容', html.length > 300, 'true');
+      chk('V3 面板不含 undefined', html.indexOf('undefined') < 0, 'true');
+      chk('V3 面板不含 NaN', html.indexOf('NaN') < 0, 'true');
+      chk('V3 面板报出 RED', html.indexOf('RED') >= 0, 'true');
+      chk('V3 面板报出「不报方向」', html.indexOf('不报方向') >= 0, 'true');
+      chk('V3 面板报出三联分量', html.indexOf('DVOL 波动率体制') >= 0 && html.indexOf('全分类极端分位联动') >= 0 && html.indexOf('变化率联动') >= 0, 'true');
+    }
+
+    /* V4 端到端：合成世界 + 真实 riskMonitor，护栏不抛异常且 status 合法 */
+    {
+      const W = mkWorldU(2400, true);
+      const S = call('factorScreening');
+      state.histBundle = { btc: { ts: W.ts.slice(), closes: W.cl.slice() } }; // 无 macro → DVOL 不可用
+      state.klines = null;
+      let G = null, ok4 = true;
+      try { G = call('guardrail', S); } catch (e) { ok4 = false; console.warn('V4 guardrail threw', e && e.message); }
+      chk('V4 端到端不抛异常', ok4, 'true');
+      chk('V4 status ∈ {0,1,2}', G && [0, 1, 2].indexOf(G.status) >= 0, 'true');
+      chk('V4 label ∈ GREEN/YELLOW/RED', G && ['GREEN', 'YELLOW', 'RED'].indexOf(G.label) >= 0, 'true');
+      chk('V4 asof 有值', G && G.asof != null, 'true');
+      chk('V4 DVOL 不可用时 dvolLevel=null 且 ready=true（其余分量仍可用）', G && G.dvolLevel === null && G.ready === true, 'true');
+      const h4 = call('guardrailHTML', G) || '';
+      chk('V4 面板无 undefined/NaN', h4.indexOf('undefined') < 0 && h4.indexOf('NaN') < 0, 'true');
+    }
+
+    /* 还原 state（V 是最后一段，仍清干净） */
+    state.histBundle = null; state.universe = null; state.screening = null;
+    state.uniScore = null; state.composite = null; state.risk = null; state.oos = null; state.guardrail = null; state.klines = null;
+  }
+
   console.log('\n' + (fail ? `❌ 失败 ${fail} 项` : '✅ 全部断言通过'));
   process.exit(fail ? 1 : 0);
 })().catch(e => { console.error('FATAL', e.stack || e.message); process.exit(1); });

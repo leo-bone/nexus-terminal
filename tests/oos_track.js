@@ -79,5 +79,19 @@ if (RM && RM.rows.length) {
   });
 } else console.log('  无读数');
 
+console.log('\n=== 风险护栏（三联警报，截至 ' + dstr(S.ctx.ts[S.ctx.n - 1]) + '）===');
+const G = call('guardrail', S);
+const lvlTxt = ['静', '警', '危'];
+console.log('  总状态: ' + G.label + '  (status=' + G.status + ', ready=' + G.ready + ')');
+console.log('  ① DVOL 体制: ' + (G.dv ? ('DVOL=' + G.dv.latest.toFixed(0) + ' 近1年百分位 ' + pc(G.dv.pctTrailing1y) + ' 60日z ' + G.dv.z60.toFixed(2)) : '不可用') + ' → ' + (G.dvolLevel == null ? '—' : lvlTxt[G.dvolLevel]));
+console.log('  ② 极端分位联动: 高位 ' + G.nHigh + ' 类 / 低位 ' + G.nLow + ' 类' + (G.volWild ? ' (叠加BTC波动极端体制)' : (G.regVol != null ? ' (BTC年化波动 ' + G.regVol.toFixed(2) + ')' : '')) + ' → ' + lvlTxt[G.regimeLevel]);
+console.log('  ③ 变化率联动: ' + G.nAccel + ' 类 |rc|≥1.5 加速 → ' + lvlTxt[G.accelLevel]);
+if (G.firing && G.firing.length) {
+  console.log('  正在触发:');
+  G.firing.forEach(f0 => console.log('    ' + f0.zh + ' · ' + f0.kind + ' · 分位 ' + pc(f0.pct) + ' · 变化率σ ' + (f0.rc == null ? '—' : (f0.rc >= 0 ? '+' : '') + f0.rc.toFixed(1))));
+} else console.log('  无分类触发');
+const GH = call('guardrailHTML', G) || '';
+console.log('  guardrailHTML 长度 ' + GH.length + ' | 含undefined: ' + (GH.indexOf('undefined') >= 0) + ' | 含NaN: ' + (GH.indexOf('NaN') >= 0));
+
 console.log('\nDONE');
 process.exit(0);

@@ -1,5 +1,5 @@
 /* =====================================================================
- * NEXUS TERMINAL v3.27 — 加密货币实时监测与因子关系终端
+ * NEXUS TERMINAL v3.28 — 加密货币实时监测与因子关系终端
  * 纯前端 / 无后端 / 无构建步骤。可直接 file:// 打开，也可部署到 Cloudflare。
  *
  * 数据源（全经 Cloudflare Worker 代理，解决中国大陆无法直连 + 浏览器 CORS）:
@@ -2392,7 +2392,7 @@ function auxRegimeIC(rep, key) {
 
 /* 实时：从 BTC 日线 K 线算当前 20 日年化已实现波动率，判定当前体制 */
 function currentRegime() {
-  const k = state.klines['BTC1d'];
+  const k = state.klines && state.klines['BTC1d'];
   if (!k || k.length < 21) return null;
   const c = k.map(x => x.c);
   const rs = [];
@@ -2403,6 +2403,29 @@ function currentRegime() {
   const vol = Math.sqrt(v) * Math.sqrt(365);
   for (const R of REGIMES) if (vol >= R.lo && vol < R.hi) return { key: R.k, label: R.label, vol: vol };
   return { key: 'wild', label: '极端', vol: vol };
+}
+
+/* v3.28: DVOL 波动率体制的当前读数（与 /api/dvol、auxRegimeIC 同口径，但直接从 histBundle 算，离线可用）。
+ * 只取最近一个非 null 值，算「近1年百分位」+「60日 z」。这是状态量，不是预测。 */
+function dvolStatsNow() {
+  const m = state.histBundle && state.histBundle.macro && state.histBundle.macro['DVOL'];
+  if (!m || !m.closes) return null;
+  const closes = m.closes;
+  let lastIdx = -1;
+  for (let i = closes.length - 1; i >= 0; i--) { const v = closes[i]; if (v != null && isFinite(v)) { lastIdx = i; break; } }
+  if (lastIdx < 0) return null;
+  const latest = closes[lastIdx];
+  const win = closes.slice(Math.max(0, lastIdx - 365 + 1), lastIdx + 1).filter(function (x) { return x != null && isFinite(x); });
+  const pct = win.length ? win.filter(function (x) { return x <= latest; }).length / win.length : null;
+  const zwin = closes.slice(Math.max(0, lastIdx - 60 + 1), lastIdx + 1).filter(function (x) { return x != null && isFinite(x); });
+  let z60 = null;
+  if (zwin.length > 2) {
+    const mean = zwin.reduce(function (a, b) { return a + b; }, 0) / zwin.length;
+    let v2 = 0; for (let i = 0; i < zwin.length; i++) v2 += (zwin[i] - mean) * (zwin[i] - mean);
+    const sd = Math.sqrt(v2 / zwin.length);
+    z60 = sd > 1e-9 ? (latest - mean) / sd : 0;
+  }
+  return { latest: latest, pctTrailing1y: pct, z60: z60, date: m.ts ? m.ts[lastIdx] : null };
 }
 
 /* ---------- v3.11 十年复盘的渲染 ---------- */
@@ -7627,6 +7650,7 @@ async function loadUniverse(cats, opts) {
     state.composite = null;
     state.risk = null;
     state.oos = null;
+    state.guardrail = null;
     if (!o.quiet) console.log('universe loaded', Object.keys(state.universe.series).length);
     return state.universe;
   } catch (e) { console.warn('universe fail', e && e.message); return null; }
@@ -8571,6 +8595,68 @@ function riskMonitor(S, opts) {
 
 
 /* =====================================================================
+ * ㉞ 风险护栏（三联警报）：DVOL 体制 + 全分类极端分位联动 + 变化率联动
+ * ---------------------------------------------------------------------
+ * 这是 v3.27 结论的落点 —— 这套终端的价值在「风险监测与护栏」，不在择时。
+ * 护栏只答一个问题：**现在各个维度的风险温度计，加起来到了什么程度**。
+ * 它不预测涨跌、不给方向指令；它只把三个已经算好的「状态量」聚合成一个
+ * GREEN / YELLOW / RED 的总状态，并明示是哪几个分量在报警。
+ *
+ * 三个分量（各自 0=静 / 1=警 / 2=危），护栏取三者最大值：
+ *   ① DVOL 波动率体制：DVOL 当前值处于自身近1年的什么百分位（隐含波动率 = crypto 原生恐惧温度计）
+ *   ② 全分类极端分位联动：风险监测里同时处于历史极端分位（≤5% 或 ≥95%）的分类有几类；
+ *      再叠加 BTC 已实现波动率的「极端体制」（vol≥0.80 年化）。多个互不相关的资产类同时到极端 = 系统性联动。
+ *   ③ 变化率联动：风险监测里「近60日位移 ≥ 1.5σ」的分类有几类（在加速）。
+ * 任何单一分量到「危」即触发 RED；RED 的含义是「降杠杆 / 减仓 / 不追高」的参考，不是「做空」指令。
+ * ===================================================================== */
+function guardrail(S, opts) {
+  const o = opts || {};
+  const RM = state.risk || (state.risk = riskMonitor(S));
+
+  /* ① DVOL 波动率体制 */
+  const dv = dvolStatsNow();
+  let dvolLevel = null;
+  if (dv && dv.pctTrailing1y != null && isFinite(dv.pctTrailing1y)) {
+    const p = dv.pctTrailing1y;
+    dvolLevel = p >= 0.92 ? 2 : p >= 0.75 ? 1 : 0;
+  }
+
+  /* ② + ③ 来自风险监测（全分类状态） */
+  let nHigh = 0, nLow = 0, nAccel = 0;
+  const firing = [];
+  if (RM && RM.rows && RM.rows.length) {
+    RM.rows.forEach(function (r) {
+      if (r.extreme === 'high') { nHigh++; firing.push({ cat: r.cat, zh: r.zh, kind: '历史高位', pct: r.pct, rc: r.rc }); }
+      else if (r.extreme === 'low') { nLow++; firing.push({ cat: r.cat, zh: r.zh, kind: '历史低位', pct: r.pct, rc: r.rc }); }
+      if (r.rc != null && isFinite(r.rc) && Math.abs(r.rc) >= 1.5) {
+        nAccel++;
+        if (!firing.some(function (f) { return f.cat === r.cat; })) firing.push({ cat: r.cat, zh: r.zh, kind: '加速(≥1.5σ)', pct: r.pct, rc: r.rc });
+      }
+    });
+  }
+  const nExtreme = nHigh + nLow;
+  const reg = currentRegime();
+  const volWild = !!(reg && reg.key === 'wild');
+  let regimeLevel = null;
+  if (nExtreme != null) regimeLevel = (nExtreme >= 2 || volWild) ? 2 : (nExtreme === 1 ? 1 : 0);
+  let accelLevel = null;
+  if (nAccel != null) accelLevel = nAccel >= 2 ? 2 : (nAccel === 1 ? 1 : 0);
+
+  const levels = [dvolLevel, regimeLevel, accelLevel].filter(function (x) { return x != null; });
+  const status = levels.length ? Math.max.apply(null, levels) : 0;
+  const label = status === 2 ? 'RED' : status === 1 ? 'YELLOW' : 'GREEN';
+
+  return {
+    dv: dv, dvolLevel: dvolLevel,
+    nHigh: nHigh, nLow: nLow, nExtreme: nExtreme, regimeLevel: regimeLevel, volWild: volWild, regVol: reg ? reg.vol : null,
+    nAccel: nAccel, accelLevel: accelLevel,
+    status: status, label: label, firing: firing,
+    asof: (RM && RM.asof) || (dv && dv.date) || null,
+    ready: levels.length > 0,
+  };
+}
+
+/* =====================================================================
  * ㉛ 径向影响星系图
  * ---------------------------------------------------------------------
  * 原来的力导向网络解决的是「因子之间怎么互相连」；这一版要回答的是另一个
@@ -8887,6 +8973,82 @@ function renderOOSInto(S) {
   } catch (e) {
     console.warn('oos fail', e && e.message);
     node.innerHTML = '<span class="rg-r">样本外追踪计算失败：' + (e && e.message ? e.message : '未知错误') + '</span>';
+  }
+}
+
+
+/* ㉞ 风险护栏面板：把 guardrail() 的三联警报摊开成可读的 GREEN/YELLOW/RED 总状态 + 分量明细 + 触发清单 */
+function guardrailHTML(G) {
+  if (!G) return '';
+  const num = function (v, dp) { return v == null ? '—' : v.toFixed(dp == null ? 2 : dp); };
+  const pc = function (v, dp) { return v == null ? '—' : (v * 100).toFixed(dp == null ? 1 : dp) + '%'; };
+  const C = {
+    0: { t: '静', c: '#00e5a0', bg: 'rgba(0,229,160,.12)', bd: '#00e5a0' },
+    1: { t: '警', c: '#ffb300', bg: 'rgba(255,179,0,.12)', bd: '#ffb300' },
+    2: { t: '危', c: '#ff3d6e', bg: 'rgba(255,61,110,.14)', bd: '#ff3d6e' },
+  };
+  const st = C[G.status] || C[0];
+  const badge = function (lv) {
+    const x = C[lv == null ? 0 : lv];
+    return '<span style="display:inline-block;min-width:18px;text-align:center;border:1px solid ' + (lv == null ? '#78909c' : x.bd) +
+      ';color:' + (lv == null ? '#78909c' : x.c) + ';border-radius:4px;font-size:9px;padding:0 4px">' + (lv == null ? '—' : x.t) + '</span>';
+  };
+
+  let h = '<div class="rg-sub" style="margin-top:14px;border-top:1px solid rgba(255,255,255,.12);padding-top:10px">';
+  h += '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">';
+  h += '<b style="font-size:13px">㉞ 风险护栏 · 三联警报</b>';
+  h += '<span style="border:1px solid ' + st.bd + ';color:' + st.c + ';background:' + st.bg + ';border-radius:6px;padding:3px 12px;font-weight:bold;letter-spacing:.5px">' + G.label + '</span>';
+  h += '</div>';
+  h += '<div class="rg-sub"><span class="rg-dim">报状态、不报方向 —— 这是<b>护栏</b>，不是择时信号。把三个已算好的状态量（DVOL 波动率体制 · 全分类极端分位联动 · 变化率联动）聚合成一个总状态；' +
+    'RED 的意思是「多个维度的风险温度计同时在抬升」，应当作为<b>降杠杆 / 减仓 / 不追高</b>的参考，而不是「做空」指令。</span></div>';
+
+  /* 三个分量 */
+  h += '<div class="rg-tbl" style="margin-top:8px">';
+  h += '<div class="rg-hd" style="grid-template-columns:1.6fr .6fr 2.4fr"><span>分量</span><span>级别</span><span>当前读数</span></div>';
+  h += '<div class="rg-row" style="grid-template-columns:1.6fr .6fr 2.4fr">' +
+    '<span class="rg-nm">① DVOL 波动率体制</span>' + badge(G.dvolLevel) +
+    '<span class="rg-dim">' + (G.dv ? ('DVOL=' + num(G.dv.latest, 0) + ' · 近1年百分位 ' + pc(G.dv.pctTrailing1y) + ' · 60日z ' + num(G.dv.z60)) : 'DVOL 数据不可用（需先跑十年回放）') + '</span></div>';
+  h += '<div class="rg-row" style="grid-template-columns:1.6fr .6fr 2.4fr">' +
+    '<span class="rg-nm">② 全分类极端分位联动</span>' + badge(G.regimeLevel) +
+    '<span class="rg-dim">历史高位 ' + G.nHigh + ' 类 · 历史低位 ' + G.nLow + ' 类' +
+    (G.volWild ? ' · 叠加 BTC 波动率极端体制(vol≥0.80)' : (G.regVol != null ? ' · BTC 年化波动 ' + num(G.regVol) : '')) + '</span></div>';
+  h += '<div class="rg-row" style="grid-template-columns:1.6fr .6fr 2.4fr">' +
+    '<span class="rg-nm">③ 变化率联动</span>' + badge(G.accelLevel) +
+    '<span class="rg-dim">近60日位移 ≥ 1.5σ 的分类 ' + G.nAccel + ' 类（在加速）</span></div>';
+  h += '</div>';
+
+  /* 触发清单 */
+  if (G.firing && G.firing.length) {
+    h += '<div class="rg-sub" style="margin-top:8px"><b>正在触发：</b></div><div class="rg-tbl">';
+    h += '<div class="rg-hd" style="grid-template-columns:1.4fr 1.4fr 1fr .8fr"><span>分类</span><span>状态</span><span>历史分位</span><span>变化率σ</span></div>';
+    G.firing.forEach(function (f) {
+      h += '<div class="rg-row" style="grid-template-columns:1.4fr 1.4fr 1fr .8fr">' +
+        '<span class="rg-nm" style="color:' + (CAT_COLORS[f.cat] || CAT_COLORS.other) + '">' + f.zh + '</span>' +
+        '<span class="rg-dim">' + f.kind + '</span>' +
+        '<span class="rg-dim">' + pc(f.pct) + '</span>' +
+        '<span class="' + (f.rc == null ? 'rg-dim' : Math.abs(f.rc) >= 1.5 ? 'rg-y' : 'rg-dim') + '">' + (f.rc == null ? '—' : (f.rc >= 0 ? '+' : '') + f.rc.toFixed(1)) + '</span></div>';
+    });
+    h += '</div>';
+  } else {
+    h += '<div class="rg-sub"><span class="rg-g">没有分类处于历史极端分位，也没有分类在加速 —— 当前没有系统性联动信号。</span></div>';
+  }
+
+  h += '<div class="rg-sub"><span class="rg-dim">截至 ' + (G.asof ? new Date(G.asof).toISOString().slice(0, 10) : '—') +
+    '。' + (G.ready ? '' : ' <b class="rg-y">部分信号源未就绪（需先跑十年回放 + 加载因子宇宙）。</b>') +
+    ' 三个分量各自独立，护栏取最高级别；任何单一分量到「危」即触发 RED。</span></div>';
+  return h;
+}
+
+/* ㉞ 这段单独异步渲染：依赖 state.risk（由分类合成段落算出），不能早于它 */
+function renderGuardrailInto(S) {
+  const node = document.getElementById('grBox');
+  if (!node) return;
+  try {
+    const G = state.guardrail || (state.guardrail = guardrail(S));
+    node.outerHTML = guardrailHTML(G);
+  } catch (e) {
+    console.warn('guardrail fail', e && e.message);
+    node.innerHTML = '<span class="rg-r">风险护栏计算失败：' + (e && e.message ? e.message : '未知错误') + '</span>';
   }
 }
 
@@ -9289,6 +9451,7 @@ function renderUniverseBox() {
   h += '<div id="cmpBox" class="rg-sub" style="margin-top:10px"><span class="rg-dim">正在计算分类合成（' +
     S.nScreened + ' 个因子 → ' + Object.keys(S.catStat).length + ' 个分类），约需十几秒…</span></div>';
   h += '<div id="oosBox" class="rg-sub" style="margin-top:10px"><span class="rg-dim">正在计算 ㉝ 真正的样本外追踪（多折 walk-forward，每折训练段独立挑分类），约需十几秒…</span></div>';
+  h += '<div id="grBox" class="rg-sub" style="margin-top:10px"><span class="rg-dim">正在计算 ㉞ 风险护栏（DVOL 体制 + 全分类极端分位联动 + 变化率联动，聚合成 GREEN/YELLOW/RED）…</span></div>';
   box.innerHTML = h;
   setTimeout(function () { renderCompositeInto(S); }, 60);
 }
@@ -9303,6 +9466,8 @@ function renderCompositeInto(S) {
     node.outerHTML = compositeHTML(C, S);
     /* 分类合成渲染完，再异步算 ㉝ 样本外追踪：它要跑多折，不能堵在首屏 */
     setTimeout(function () { renderOOSInto(S); }, 60);
+    /* ㉞ 风险护栏依赖 state.risk（compositeHTML 已算出并缓存），延迟到 OOS 之后渲染 */
+    setTimeout(function () { renderGuardrailInto(S); }, 200);
   } catch (e) {
     console.warn('composite fail', e && e.message);
     node.innerHTML = '<span class="rg-r">分类合成计算失败：' + (e && e.message ? e.message : '未知错误') + '</span>';
