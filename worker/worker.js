@@ -7,6 +7,8 @@
  *   /api/calendar  美国经济日历（非农 / 失业率 / 初请 / PCE / CPI / FOMC）
  *   /api/history   10 年+ 日频历史包（供前端回放历史 Nexus Score + IC 检验；BTC 经 v3.14 延至 ~2014）
  *   /api/dvol      Deribit DVOL 实时恐慌统计（当前值 + 近1年百分位 + 60日 z，供实时波动率警报）
+ *   /api/truths    宏观真值：WALCL 走 Fed H.4.1（实时）+ 5 个 FRED 系列（线上尝试→兜底）
+ *   /api/fred      FRED 免 key CSV 宏观真值（WALCL/UNRATE/CPIAUCSL/PAYEMS/ICSA/PCEPILFE）
  *   /api/fetch     白名单代理（浏览器所有外部请求经此，绕 GFW + CORS）
  *   /health        健康检查
  *   /api/probe     数据源可达性诊断
@@ -56,6 +58,9 @@ const PROXY_ALLOW = [
   'fapi.binance.com',       // Binance USDT 本位永续历史（资金费率/持仓量/多空比，供 /api/history 用）
   'futures-data.binance.com', // Binance 衍生品统计备用域
   'www.deribit.com',          // Deribit 期权 DVOL/IV/持仓（crypto 原生恐惧温度计）
+  'fred.stlouisfed.org',      // FRED 图表 CSV（免 API key）→ 宏观真值
+  'www.federalreserve.gov',   // 美联储 H.4.1 报表（资产负债表 WALCL 官方源）
+  'alfred.stlouisfed.org',    // ALFRED（FRED 实时子域，免 key CSV）
 ];
 
 // 简单序列：按顺序尝试多个源（yahoo 主源 / stooq 兜底）
@@ -87,6 +92,100 @@ async function proxyFetch(target, cacheTtl) {
   const resp = new Response(body, { status: r.status, headers: { ...CORS, 'Content-Type': r.headers.get('content-type') || 'application/json', 'Cache-Control': cacheTtl > 0 ? `public, max-age=${cacheTtl}` : 'no-store' } });
   if (cacheTtl > 0 && r.ok) await caches.default.put(cacheKey, resp.clone());
   return resp;
+}
+
+/* ---------- FRED 免 key CSV（v3.32）----------
+ * FRED 图表下载端点 fredgraph.csv **不需要 API key**，可直接取权威宏观序列 —— 这是
+ * 事件因子 actual 与估值因子慢变量的**根治方案**（v3.31 曾判定"根治不可行"，是因为
+ * 只测了 api.stlouisfed.org(要 key) 与 api.bls.gov(限流)，漏掉了这个端点 —— 已纠正）。
+ *   WALCL 美联储总资产(周) | UNRATE 失业率(月) | CPIAUCSL 定基CPI(月)
+ *   PAYEMS 非农总数(月,千) | ICSA 初请(周)     | PCEPILFE 核心PCE指数(月)
+ * 注意：FRED 缺测值写作 '.'，parseFloat → NaN，必须过滤。 */
+function parseFredCsv(text, n) {
+  const lines = String(text || '').trim().split(/\r?\n/);
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const p = lines[i].split(',');
+    if (p.length < 2) continue;
+    const v = parseFloat(p[1]);
+    if (!isFinite(v)) continue;
+    rows.push({ d: p[0].trim(), v: v });
+  }
+  const take = Math.max(1, Math.min(60, n || 3));
+  const last = rows.length ? rows[rows.length - 1] : null;
+  const prev = rows.length > 1 ? rows[rows.length - 2] : null;
+  return { asof: last ? last.d : null, v: last ? last.v : null, prev: prev ? prev.v : null, n: rows.length, rows: rows.slice(-take) };
+}
+
+async function fetchFred(id, n) {
+  const url = 'https://fred.stlouisfed.org/graph/fredgraph.csv?id=' + encodeURIComponent(id);
+  const cacheKey = new Request(url);
+  const hit = await caches.default.match(cacheKey);
+  if (hit) return parseFredCsv(await hit.text(), n);
+  const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NexusTerminal/3.4)' } });
+  if (!r.ok) throw new Error('fred ' + r.status);
+  const text = await r.text();
+  const parsed = parseFredCsv(text, n);
+  if (parsed.rows.length) await caches.default.put(cacheKey, new Response(text, { headers: { 'Cache-Control': 'public, max-age=1800' } }));
+  return parsed;
+}
+
+/* ---------- 宏观真值（v3.32）----------
+ * 病灶：事件因子（核心PCE / CPI / 非农 / 失业率 / 初请）的 actual 在 FF 免费周历里长期为空，
+ *       于是 v3.31 只能诚实标注「FF未回填」+ 手填锚定表 —— 那是止血，不是根治。
+ * 根治路线（全部经 CF 边缘实测，结论写在注释里，不猜）：
+ *   · WALCL 美联储总资产 → Fed H.4.1 官方报表 www.federalreserve.gov（实测 **200**，
+ *     可解析出 Total assets = 6,743,031 百万美元，与 FRED WALCL 完全一致）→ **真·自动实时**
+ *   · UNRATE / CPIAUCSL / PAYEMS / ICSA / PCEPILFE → ALFRED + FRED 免 key CSV，
+ *     这两个域**本机可直连**（实测 200），但在 CF 边缘实测 **520（被挡）** →
+ *     线上先尝试，失败回退 FRED_FALLBACK（由 tools/refresh_truths.py 从本机拉取后写入）。
+ * 诚实原则：每个值都带 src + asof，前端原样展示 —— 兜底值绝不冒充实时。 */
+/* 由 tools/refresh_truths.py 于 2026-10-04 生成 */
+const FRED_FALLBACK = {
+/* FRED_FALLBACK_BEGIN */
+  UNRATE: { asof: '2026-09-01', v: 4.2, prev: 4.1 },
+  CPIAUCSL: { asof: '2026-08-01', v: 334.131, prev: 332.813 },
+  PAYEMS: { asof: '2026-09-01', v: 159044.0, prev: 159015.0 },
+  ICSA: { asof: '2026-09-26', v: 197000.0, prev: 198000.0 },
+  PCEPILFE: { asof: '2026-08-01', v: 130.455, prev: 130.133 }
+/* FRED_FALLBACK_END */
+};
+
+/* H.4.1 表 5「Consolidated Statement of Condition of All Federal Reserve Banks」的 Total assets。
+ * 页面单位是百万美元，转成 USD（6,743,031 → 6.743e12），与 FRED WALCL 口径一致。 */
+function parseH41TotalAssets(html) {
+  const txt = String(html || '').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ');
+  const i = txt.indexOf('Total assets');
+  if (i < 0) throw new Error('h41: no Total assets');
+  const m = txt.slice(i, i + 3000).match(/\d{1,3}(,\d{3})+/);
+  if (!m) throw new Error('h41: no value');
+  const dm = txt.match(/[A-Z][a-z]+ \d{1,2}, \d{4}/);
+  return { asof: dm ? dm[0] : null, v: parseFloat(m[0].replace(/,/g, '')) * 1e6, prev: null, src: 'H.4.1实时' };
+}
+
+async function fetchFedH41() {
+  const url = 'https://www.federalreserve.gov/releases/h41/current/h41.htm';
+  const cacheKey = new Request(url);
+  const hit = await caches.default.match(cacheKey);
+  let html = hit ? await hit.text() : null;
+  if (!html) {
+    const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NexusTerminal/3.4)' } });
+    if (!r.ok) throw new Error('h41 ' + r.status);
+    html = await r.text();
+    if (html && html.length > 10000) {
+      await caches.default.put(cacheKey, new Response(html, { headers: { 'Cache-Control': 'public, max-age=3600' } }));
+    }
+  }
+  return parseH41TotalAssets(html);
+}
+
+/* FRED/ALFRED 在 CF 边缘实测 520，别每次都浪费一次往返：同一 isolate 内失败后退避 30 分钟 */
+let _fredDeadUntil = 0;
+async function fredReachable() {
+  const now = Date.now();
+  if (now < _fredDeadUntil) return false;
+  try { const r = await fetchFred('UNRATE', 1); return r.v != null; }
+  catch (e) { _fredDeadUntil = now + 30 * 60 * 1000; return false; }
 }
 
 /* ---------- Stooq 日线 CSV → {ts,closes} ---------- */
@@ -1293,6 +1392,43 @@ export default {
       catch (e) { return jsonResp({ error: e.message }, 502); }
     }
 
+    /* v3.32 FRED 真值：/api/fred?ids=WALCL,UNRATE&n=6 —— 免 key 权威宏观序列，
+     * 供事件因子回填真实 actual、估值因子慢变量取真值（不再靠手填锚定表）。 */
+    if (url.pathname === '/api/fred') {
+      const ids = String(url.searchParams.get('ids') || '')
+        .split(',').map(function (x) { return String(x).trim().toUpperCase(); })
+        .filter(function (x) { return /^[A-Z0-9_]{1,24}$/.test(x); }).slice(0, 12);
+      const n = Math.min(24, Math.max(1, parseInt(url.searchParams.get('n') || '6', 10) || 6));
+      if (!ids.length) return jsonResp({ ok: false, error: 'missing ids' }, 400);
+      const out = {}; const errs = {};
+      await Promise.all(ids.map(async function (id) {
+        try { out[id] = await fetchFred(id, n); } catch (e) { errs[id] = e.message; }
+      }));
+      return jsonResp({ ok: Object.keys(out).length > 0, series: out, errors: errs, ts: Date.now() }, 200,
+        { 'Cache-Control': 'public, max-age=1800' });
+    }
+
+    /* v3.32 宏观真值：一次拿全 WALCL(H.4.1实时) + 5 个 FRED 系列(线上尝试→兜底) */
+    if (url.pathname === '/api/truths') {
+      const out = {}; const errs = {};
+      try { out.WALCL = await fetchFedH41(); } catch (e) { errs.WALCL = e.message; }
+      const ids = ['UNRATE', 'CPIAUCSL', 'PAYEMS', 'ICSA', 'PCEPILFE'];
+      const live = await fredReachable();
+      await Promise.all(ids.map(async function (id) {
+        if (live) {
+          try {
+            const r = await fetchFred(id, 3);
+            if (r.v != null) { out[id] = { asof: r.asof, v: r.v, prev: r.prev, src: 'FRED实时' }; return; }
+          } catch (e) { errs[id] = e.message; }
+        }
+        const f = FRED_FALLBACK[id];
+        if (f) out[id] = { asof: f.asof, v: f.v, prev: f.prev, src: 'FRED兜底(CF不可达)' };
+        else errs[id] = 'no fallback';
+      }));
+      return jsonResp({ ok: Object.keys(out).length > 0, fredLive: live, series: out, errors: errs, ts: Date.now() }, 200,
+        { 'Cache-Control': 'public, max-age=1800' });
+    }
+
     /* v3.30 护栏 RED 通知：前端把告警文本发到这里，Worker 转发到群机器人 Webhook。
      * Webhook URL 与校验 TOKEN 存于 env（wrangler secret），不进源码；
      * 按 host 自动识别企业微信 / 飞书 / 钉钉 / 自建 的 payload 格式。 */
@@ -1320,7 +1456,7 @@ export default {
     }
 
     if (url.pathname === '/' || url.pathname === '/health') {
-      return jsonResp({ name: 'nexus-proxy', version: '3.31', status: 'ok', source: 'yahoo+stooq+nyfed+treasury+mof+coinlore+finforexfactory+bitcoin-data+bybit+deribit+proxy', universe: Object.keys(UNIVERSE).reduce(function(a,c){return a+Object.keys(UNIVERSE[c]).length;},0), symbols: Object.keys(SIMPLE).concat(['EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'JGB10Y', 'DVOL', 'DVHV']) });
+      return jsonResp({ name: 'nexus-proxy', version: '3.32', status: 'ok', source: 'yahoo+stooq+nyfed+treasury+mof+coinlore+finforexfactory+bitcoin-data+bybit+deribit+fred+proxy', universe: Object.keys(UNIVERSE).reduce(function(a,c){return a+Object.keys(UNIVERSE[c]).length;},0), symbols: Object.keys(SIMPLE).concat(['EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'JGB10Y', 'DVOL', 'DVHV']) });
     }
 
     return new Response('Not Found', { status: 404, headers: CORS });

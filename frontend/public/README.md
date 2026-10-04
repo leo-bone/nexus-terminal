@@ -1,4 +1,4 @@
-# Nexus Terminal v3.31
+# Nexus Terminal v3.32
 
 加密货币 **实时监测 + 因子关系终端**。纯前端单页应用，无后端、无构建步骤。整站托管在 **Cloudflare**（前端 Workers Assets + 数据代理 Worker），并绑定自定义域名。
 
@@ -58,7 +58,75 @@
 
 ---
 
-## v3.31 变更（本次）
+## v3.32 变更（本次）
+
+**主题：事件因子 actual 从「止血」走向「根治」—— 接权威宏观真值；并纠正 v3.31 的一个错误结论。**
+
+### 1. 纠正：v3.31 说「根治不可行」是错的
+
+v3.31 判定"找不到能拿实际值的权威源"，据此只做了止血。**这个结论是错的** —— 当时只测了 `api.stlouisfed.org`（要 API key）与 `api.bls.gov`（限流），**漏掉了 FRED 免 key 的图表 CSV 端点** `fredgraph.csv` 与 ALFRED 子域。这两个端点本机可直连，6 个系列全部拿到真值。已纠正。
+
+### 2. 宏观真值接入（Worker `/api/truths`）
+
+CF 边缘可达性是独立变量（**本机可达 ≠ CF 可达**），全部经实测：
+
+| 系列 | 用途 | 源 | CF 边缘实测 | 落地方式 |
+|---|---|---|---|---|
+| `WALCL` 美联储总资产 | 估值因子 fedbs | Fed H.4.1 官方报表 | **200** ✓ | **真·自动实时**（周频，页面解析） |
+| `UNRATE` 失业率 | 事件因子 | FRED/ALFRED | 520 ✗ | 线上尝试 → 兜底 |
+| `CPIAUCSL` 定基 CPI | 估值因子 + CPI | FRED/ALFRED | 520 ✗ | 线上尝试 → 兜底 |
+| `PAYEMS` 非农总数 | 事件因子 NFP | FRED/ALFRED | 520 ✗ | 线上尝试 → 兜底 |
+| `ICSA` 初请（周） | 事件因子 | FRED/ALFRED | 520/403 ✗ | 线上尝试 → 兜底 |
+| `PCEPILFE` 核心 PCE 指数 | 事件因子 PCE | FRED/ALFRED | 520 ✗ | 线上尝试 → 兜底 |
+
+兜底值由 **`tools/refresh_truths.py`** 从本机（可直连 FRED）拉取后写入 Worker 的 `FRED_FALLBACK`，**带观测期**，随时可重跑：
+
+```bash
+python3 tools/refresh_truths.py --write
+```
+
+当前真值：美联储表 **$6.743 万亿**（2026-10-01，H.4.1）、失业率 **4.2%**、CPI 定基 **334.131**、非农 **+29 千**、初请 **197 千**、核心 PCE **+0.247% MoM**。
+
+### 3. 诚实性约束（比"拿到数"更重要）
+
+- **来源一路传到展示层**：每个值带 `src` + `asof`。实时源标「H.4.1实时」，兜底源标观测期（如 `FRED兜底(CF不可达) 2026-08-01`），**绝不冒充实时**。
+- **匹配窗口 `truthCovers()`**：月频事件发布的是**上一个月**的数据（初请是周频）。FRED 观测期未覆盖该期时，**宁可如实标「FF未回填」，也不拿旧值冒充当期 actual** —— 否则就是把 8 月的值当成 9 月发布值，比不显示更有害。
+- **修掉一处反向不诚实**：美联储表因子原本写死标「非实时」，但它现在接的是 H.4.1 自动实时源 —— 真源来了就不能再标非实时。
+
+---
+
+## 配置群机器人 Webhook（护栏 RED 通知）
+
+护栏进入 RED 时，前端把告警发到 Worker `/api/notify`，由 Worker 转发到你配置的群机器人。**Webhook URL 存在 Worker 密钥里，不进源码。**
+
+### 第 1 步：拿到 Webhook URL
+
+| 平台 | 获取路径 | URL 形如 |
+|---|---|---|
+| **企业微信** | 群设置 → 群机器人 → 添加 | `https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxx` |
+| **飞书** | 群设置 → 群机器人 → 添加自定义机器人 | `https://open.feishu.cn/open-apis/bot/v2/hook/xxxx` |
+| **钉钉** | 群设置 → 智能群助手 → 添加机器人 → 自定义 | `https://oapi.dingtalk.com/robot/send?access_token=xxxx` |
+
+Worker **按 host 自动识别**这三种的 payload 格式（text 型），无需你改代码；其他 host 走通用 `{ text: ... }`。
+
+### 第 2 步：写入 Worker 密钥
+
+```bash
+cd worker
+npx wrangler secret put NOTIFY_WEBHOOK      # 粘贴第 1 步的 URL
+# 可选：再加一层校验 TOKEN（前端已内置 nexus-rg-v330，留空则不校验）
+npx wrangler secret put NOTIFY_TOKEN
+```
+
+### 第 3 步：验证
+
+打开 nexus.uichain.org，勾选顶部 **🔔 RED 通知**，点旁边的 **🔔 测试** 按钮 —— 群里收到「【NEXUS 测试】Webhook 配置验证」即链路已通。状态文字会显示 `✅ 测试已送达` 或具体错误（如 `notify not configured` = 第 2 步没配）。
+
+> 未配置时 `/api/notify` 返回 503 `notify not configured`，页面「已开启」只是本地开关，不代表能送达 —— 所以**必须用测试按钮验证**。
+
+---
+
+## v3.31 变更（上一版）
 
 **主题：让因子真正"起作用"——① 事件因子止血（PCE 不再谎报"数据未到"）② 情景推演引擎 ③ 新增 4 个估值因子。**
 

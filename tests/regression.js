@@ -3287,9 +3287,10 @@ const near = (label, actual, expect, tol) => {
     const r1 = run('econFactor')({ key: 'core_pce_mm', re: /^Core PCE Price Index m\/m$/i, std: 0.08 });
     chk('Y2 FF未回填时标注「FF未回填」', r1.note.indexOf('FF未回填') >= 0, 'true');
     chk('Y2 FF未回填时 stale=true', r1.stale === true, 'true');
-    run('RECENT_ACTUALS')['core_pce_mm'] = { v: 0.4, asof: '2026-09' };
+    run('RECENT_ACTUALS')['core_pce_mm'] = { v: 0.4, asof: '2026-09', src: 'FRED兜底(CF不可达)' };
     const r2 = run('econFactor')({ key: 'core_pce_mm', re: /^Core PCE Price Index m\/m$/i, std: 0.08 });
-    chk('Y2 锚定后标注含「锚定」', r2.note.indexOf('锚定') >= 0, 'true');
+    chk('Y2 真值回填后标注带来源', r2.note.indexOf('FRED兜底') >= 0, 'true');
+    chk('Y2 真值回填后标注带观测期', r2.note.indexOf('2026-09') >= 0, 'true');
     chk('Y2 锚定后 stale=false', r2.stale === false, 'true');
     near('Y2 锚定后 surprise z=(0.4-0.3)/0.08=1.25', r2.z, 1.25, 1e-6);
     delete run('RECENT_ACTUALS')['core_pce_mm'];
@@ -3366,6 +3367,64 @@ const near = (label, actual, expect, tol) => {
     const vIds = run("FACTORS.filter(f => f.anchored).map(f => f.id)");
     chk('Z5 4 个估值因子都带 anchored 标记', vIds.length, 4);
     chk('Z5 估值因子仍在 out 里（要能显示）', run('computeNexusScore')().out.erp != null, 'true');
+  }
+
+
+  console.log('\n===== AA. v3.32 宏观真值接入（根治事件因子 actual）=====');
+  {
+    /* AA1 派生：MoM 与「口径与 FF 一致」 */
+    near('AA1 PCE MoM = (130.455/130.133−1)×100 = 0.2475', run('truthMoM')({ v: 130.455, prev: 130.133 }), 0.2475, 1e-3);
+    near('AA1 CPI MoM = (334.131/332.813−1)×100 = 0.3961', run('truthMoM')({ v: 334.131, prev: 332.813 }), 0.3961, 1e-3);
+    chk('AA1 缺 prev 时 MoM = null（不拿不完整数据算）', run('truthMoM')({ v: 1 }) === null, 'true');
+
+    /* AA2 匹配窗口 truthCovers：月频事件发布的是「上一个月」的数据，
+     *     观测期没覆盖到数据期时，宁可如实标 FF未回填，也不拿旧值冒充 actual。 */
+    chk('AA2 月频·观测=数据期 → 覆盖', run('truthCovers')('2026-10-01', '2026-09-01', false), 'true');
+    chk('AA2 月频·观测晚于数据期 → 覆盖', run('truthCovers')('2026-10-01', '2026-09-15', false), 'true');
+    chk('AA2 月频·观测早于数据期 → 不覆盖（禁止拿旧值冒充）', run('truthCovers')('2026-10-01', '2026-08-01', false), 'false');
+    const ev = Date.parse('2026-10-01T12:00:00Z');
+    chk('AA2 周频·观测在事件前 3 周内 → 覆盖', run('truthCovers')(ev, new Date(ev - 7 * 864e5).toISOString().slice(0, 10), true), 'true');
+    chk('AA2 周频·观测早于 3 周 → 不覆盖', run('truthCovers')(ev, new Date(ev - 40 * 864e5).toISOString().slice(0, 10), true), 'false');
+
+    /* AA3 applyTruths 口径：PCE/CPI 百分数、非农/初请 千、失业率 百分数（与 FF 一致） */
+    run('applyTruths')({
+      fredLive: false,
+      series: {
+        WALCL:    { asof: 'October 01, 2026', v: 6743031000000, src: 'H.4.1实时' },
+        UNRATE:   { asof: '2026-09-01', v: 4.2,     prev: 4.1,     src: 'FRED兜底(CF不可达)' },
+        CPIAUCSL: { asof: '2026-08-01', v: 334.131, prev: 332.813, src: 'FRED兜底(CF不可达)' },
+        PAYEMS:   { asof: '2026-09-01', v: 159044,  prev: 159015,  src: 'FRED兜底(CF不可达)' },
+        ICSA:     { asof: '2026-09-26', v: 197000,  prev: 198000,  src: 'FRED兜底(CF不可达)' },
+        PCEPILFE: { asof: '2026-08-01', v: 130.455, prev: 130.133, src: 'FRED兜底(CF不可达)' },
+      }
+    });
+    near('AA3 失业率 = 4.2（百分数）', run('RECENT_ACTUALS').urate.v, 4.2, 1e-9);
+    near('AA3 初请 = 197（千）', run('RECENT_ACTUALS').claims.v, 197, 1e-9);
+    near('AA3 核心PCE MoM = 0.2475（百分数）', run('RECENT_ACTUALS').core_pce_mm.v, 0.2475, 1e-3);
+    near('AA3 CPI MoM = 0.3961（百分数）', run('RECENT_ACTUALS').cpi_mm.v, 0.3961, 1e-3);
+    near('AA3 非农 = 29（千）', run('RECENT_ACTUALS').nfp.v, 29, 1e-9);
+    chk('AA3 初请标为周频（匹配窗口与月频不同）', run('RECENT_ACTUALS').claims.weekly === true, 'true');
+    near('AA3 美联储表 = 6.743031e12 USD', run('VALUE_ANCHORS').fed_total.v, 6743031000000, 1);
+    chk('AA3 美联储表来源标为 H.4.1实时', run('VALUE_ANCHORS').fed_total.src.indexOf('H.4.1') >= 0, 'true');
+    near('AA3 定基CPI = 334.131', run('VALUE_ANCHORS').cpi_idx.v, 334.131, 1e-9);
+
+    /* AA4 关键约束：真值也必须过匹配窗口，不许拿旧观测冒充当期 actual */
+    run('state').econ = [{ title: 'Core PCE Price Index m/m', t: '2026-10-01T12:00:00Z', f: '0.3%', p: '0.2%', a: '' }];
+    const pceF = run("FACTORS.filter(f => f.id === 'pce')[0]");
+    const r1 = pceF.calc();
+    chk('AA4 观测 2026-08 < 数据期 2026-09 → 不用，仍如实标 FF未回填', r1.note.indexOf('FF未回填') >= 0, 'true');
+    run('RECENT_ACTUALS').core_pce_mm.asof = '2026-09-01';
+    const r2 = pceF.calc();
+    chk('AA4 观测覆盖后 → 用真值算真实 surprise', r2.note.indexOf('实际(') >= 0, 'true');
+    chk('AA4 备注带来源（不冒充实时）', r2.note.indexOf('FRED兜底') >= 0, 'true');
+    near('AA4 z = (0.2475−0.3)/0.08 = −0.656', r2.z, -0.656, 1e-2);
+
+    /* AA5 真源不该被标成「非实时」（诚实性）：H.4.1 是自动实时源 */
+    const fFed = run("FACTORS.filter(f => f.id === 'fedbs')[0]");
+    const fb = fFed.calc();
+    near('AA5 美联储表 z = (6.743031−8)/1 = −1.25697', fb.z, (6743031000000 - 8e12) / 1e12, 1e-5);
+    chk('AA5 备注标 H.4.1（真源）', fb.note.indexOf('H.4.1') >= 0, 'true');
+    chk('AA5 H.4.1 实时源不再被误标「非实时」', fb.note.indexOf('非实时') < 0, 'true');
   }
 
   console.log('\n' + (fail ? `❌ 失败 ${fail} 项` : '✅ 全部断言通过'));

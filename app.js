@@ -1,5 +1,5 @@
 /* =====================================================================
- * NEXUS TERMINAL v3.31 — 加密货币实时监测与因子关系终端
+ * NEXUS TERMINAL v3.32 — 加密货币实时监测与因子关系终端
  * 纯前端 / 无后端 / 无构建步骤。可直接 file:// 打开，也可部署到 Cloudflare。
  *
  * 数据源（全经 Cloudflare Worker 代理，解决中国大陆无法直连 + 浏览器 CORS）:
@@ -34,6 +34,19 @@
  *   3) 原油因子升级为 WTI + 布伦特 双源合成; 宏观卡片新增布伦特
  *   4) 数据源主备调换: Yahoo 升为主源 (Stooq 自 2026-10 起在 CF 边缘频繁 522/反爬)
  *   5) 快照新增 _src 数据源诊断字段
+ *
+ * v3.32 变更:
+ *   1) 事件因子 actual **根治**（v3.31 只做了止血）：新增 Worker /api/truths，接权威宏观真值。
+ *      · WALCL 美联储总资产 ← Fed H.4.1 官方报表（CF 边缘实测 200）→ **真·自动实时**
+ *      · UNRATE/CPIAUCSL/PAYEMS/ICSA/PCEPILFE ← FRED/ALFRED 免 key CSV；这两个域
+ *        **本机可直连**但 CF 边缘实测 **520**，故 Worker 线上尝试后回退 FRED_FALLBACK
+ *        （由 tools/refresh_truths.py 从本机拉取写入，带观测期）。
+ *      修正 v3.31 的错误结论：当时只测了 api.stlouisfed.org(要key) 与 api.bls.gov(限流)，
+ *      据此判定「根治不可行」—— 漏掉了免 key 的 fredgraph.csv / ALFRED 端点，已纠正。
+ *   2) 真值全程带 src + asof 传到展示层：实时源标「实时」，兜底源标观测期，绝不冒充实时。
+ *      并加匹配窗口 truthCovers()：月频事件发布的是上月数据，FRED 观测期未覆盖该期时
+ *      宁可如实标「FF未回填」，也不拿旧值冒充。
+ *   3) 估值因子慢变量 fed_total / cpi_idx 同步接入真值（此前是空锚定表，走默认兜底）。
  *
  * v3.31 变更:
  *   1) 事件因子止血：FF 免费周历长期不回填 actual（实测 PCE/NFP/失业率/初请 的 actual 全为空），
@@ -368,9 +381,9 @@ function econOverdue(e) {
   if (!isFinite(ms)) return false;
   return (Date.now() - ms) > ECON_GRACE_MS;
 }
-/* v3.31 事件因子「最近已知实际值」手动锚定表（止血用）。
- * FF 免费周历不回填 actual（实测 PCE/NFP/失业率 actual 长期为空），根治走新增的实际值源；
- * 在此之前，发布后把真值填进这里，因子即算真实 surprise，不再永久「未回填」。
+/* 事件因子「实际值」表。FF 免费周历不回填 actual（实测 PCE/NFP/失业率 长期为空）。
+ * v3.32 起由 /api/truths **自动填充**（FRED/ALFRED 真值，带观测期），本表仅作
+ * 手动兜底/覆盖用：在这里写死的值不会被自动覆盖之外的逻辑清掉，但优先级低于自动真值。
  * v 与 FF 同口径：PCE/CPI 用小数(0.3=0.3%)、NFP 用千(142=142K)、失业率用百分数(4.1=4.1%)。asof='YYYY-MM'。 */
 const RECENT_ACTUALS = {
   // core_pce_mm: { v: 0.3, asof: '2026-09', src: '手动锚定' },
@@ -384,7 +397,10 @@ const RECENT_ACTUALS = {
  * 在数据 Worker 里被主机白名单 + CF WAF 挡住（实测：host not allowed / 403 / 520），
  * 纯前端也拿不到。所以走与事件因子同一套诚实做法：
  *   慢变量（月级）放这里锚定，快变量（金价 / 10Y / 市值 / 链上笔数）走实时，
- *   两者合成出一个真实的估值读数，并在备注里标「锚定·非实时」，绝不冒充实时。 */
+ *   两者合成出一个真实的估值读数，并在备注里标「锚定·非实时」，绝不冒充实时。
+ * v3.32：fed_total(美联储总资产) 与 cpi_idx(定基CPI) 已由 /api/truths **自动填充**真值 ——
+ *   fed_total 走 Fed H.4.1 官方报表（CF 边缘实测可达，周频自动更新，真·实时）；
+ *   cpi_idx 走 FRED CPIAUCSL（CF 边缘不可达 → 本机脚本兜底，带观测期）。 */
 const VALUE_ANCHORS = {
   // spx_fpe:    { v: 21.0,   asof: '2026-09', src: '手动锚定·待接入盈利数据' },  // S&P500 远期 P/E
   // cpi_idx:    { v: 320.0,  asof: '2026-09', src: '手动锚定·待接入CPI' },       // CPI 定基指数(1982-84=100)
@@ -397,15 +413,90 @@ function vAnchor(k, dflt) {
   const has = !!(a && a.v != null);
   return { v: has ? a.v : dflt, asof: (a && a.asof) || null, src: (a && a.src) || '', anchored: has };
 }
+/* =====================================================================
+ *  v3.32 宏观真值接入（根治事件因子 actual + 估值因子慢变量）
+ *  Worker /api/truths 给出权威值：
+ *    · WALCL 美联储总资产 ← Fed H.4.1 官方报表（CF 边缘实测 200，周频自动更新）→ 真·实时
+ *    · UNRATE / CPIAUCSL / PAYEMS / ICSA / PCEPILFE ← FRED/ALFRED 免 key CSV，
+ *      但这两个域在 CF 边缘实测 **520（被挡）**，Worker 回退 FRED_FALLBACK
+ *      （由 tools/refresh_truths.py 从本机可直连处拉取写入，带观测期）。
+ *  诚实原则：每个值都带 src + asof 一路传到展示层 —— 兜底值标明观测期，绝不冒充实时。
+ * ===================================================================== */
+const TRUTH_REFRESH_MS = 30 * 60 * 1000;
+let _truthTs = 0, _truthMeta = null;
+
+function truthMoM(x) { return (x && x.v != null && x.prev) ? (x.v / x.prev - 1) * 100 : null; }
+
+/* 月频宏观事件发布的是「上一个月」的数据：FRED 观测期 >= 数据期，才说明该期确实已发布。
+ * 周频（初请）则要求观测不早于事件前 3 周。不满足 → 宁可如实标「FF未回填」，也不拿旧值冒充。 */
+function truthCovers(evTs, asof, weekly) {
+  if (!asof || evTs == null) return false;
+  const a = Date.parse(asof);
+  const e = typeof evTs === 'number' ? evTs : Date.parse(evTs);
+  if (!isFinite(a) || !isFinite(e)) return false;
+  if (weekly) return a >= e - 21 * 864e5;
+  const ad = new Date(a), ed = new Date(e);
+  const obsYM = ad.getUTCFullYear() * 12 + ad.getUTCMonth();
+  const dataYM = ed.getUTCFullYear() * 12 + ed.getUTCMonth() - 1;
+  return obsYM >= dataYM;
+}
+
+function applyTruths(data) {
+  const S = data && data.series;
+  if (!S) return;
+  const mk = function (v, s) { return { v: v, asof: s.asof, src: s.src }; };
+  /* —— 事件因子 actual（口径与 FF 一致：PCE/CPI 百分数、非农/初请 千、失业率 百分数）—— */
+  if (S.UNRATE && S.UNRATE.v != null) RECENT_ACTUALS.urate = mk(S.UNRATE.v, S.UNRATE);
+  if (S.ICSA && S.ICSA.v != null) RECENT_ACTUALS.claims = mk(S.ICSA.v / 1000, S.ICSA);
+  const pce = truthMoM(S.PCEPILFE); if (pce != null) RECENT_ACTUALS.core_pce_mm = mk(pce, S.PCEPILFE);
+  const cpi = truthMoM(S.CPIAUCSL); if (cpi != null) RECENT_ACTUALS.cpi_mm = mk(cpi, S.CPIAUCSL);
+  if (S.PAYEMS && S.PAYEMS.v != null && S.PAYEMS.prev != null) {
+    RECENT_ACTUALS.nfp = mk(S.PAYEMS.v - S.PAYEMS.prev, S.PAYEMS);
+  }
+  RECENT_ACTUALS.claims && (RECENT_ACTUALS.claims.weekly = true);   // 初请是周频，匹配窗口不同
+  /* —— 估值因子慢变量 —— */
+  if (S.WALCL && S.WALCL.v != null) VALUE_ANCHORS.fed_total = mk(S.WALCL.v, S.WALCL);
+  if (S.CPIAUCSL && S.CPIAUCSL.v != null) VALUE_ANCHORS.cpi_idx = mk(S.CPIAUCSL.v, S.CPIAUCSL);
+  _truthMeta = { ts: Date.now(), fredLive: !!data.fredLive, series: S };
+}
+
+async function fetchTruths(force) {
+  if (!force && Date.now() - _truthTs < TRUTH_REFRESH_MS) return;
+  _truthTs = Date.now();
+  try {
+    const r = await fetch(CONFIG.PROXY + '/api/truths', { cache: 'no-store' });
+    if (!r.ok) return;
+    applyTruths(await r.json());
+  } catch (e) { console.warn('truths fail', e && e.message); }
+}
+/* refreshAll 里调用：慢变量 30 分钟拉一次，拉到后主动重渲染受影响的面板 */
+function maybeFetchTruths() {
+  if (Date.now() - _truthTs < TRUTH_REFRESH_MS) return;
+  fetchTruths(true).then(function () {
+    try { renderValueFactors(); renderEcon(); renderFactors(); renderTruthStat(); } catch (e) {}
+  });
+}
+function renderTruthStat() {
+  const el = $('truthStat'); if (!el) return;
+  const m = _truthMeta;
+  if (!m) { el.textContent = '宏观真值：加载中…'; return; }
+  const S = m.series || {};
+  const w = S.WALCL ? '美联储表 ' + (S.WALCL.v / 1e12).toFixed(2) + '万亿（' + S.WALCL.src + ' ' + S.WALCL.asof + '）' : '美联储表 —';
+  const f = S.UNRATE ? '失业率 ' + S.UNRATE.v + '%（' + S.UNRATE.asof + '）' : '失业率 —';
+  el.textContent = '真源 · ' + w + ' · ' + f + ' · FRED 线上' + (m.fredLive ? '可用' : '不可达（走本机兜底）');
+}
+
 function econFactor(cfg) {
   const e = econFind(cfg.re);
   if (!e) return { z: 0, note: '本周无发布' };
   let a = parseEconVal(e.a), f = parseEconVal(e.f), p = parseEconVal(e.p);
   let ov = false;
+  let ovTag = '';
   if (a == null && cfg.key && RECENT_ACTUALS[cfg.key] && RECENT_ACTUALS[cfg.key].v != null) {
-    a = RECENT_ACTUALS[cfg.key].v; ov = true;
+    const t = RECENT_ACTUALS[cfg.key];
+    if (truthCovers(e.t, t.asof, t.weekly)) { a = t.v; ov = true; ovTag = t.src || '真源'; }
   }
-  if (a != null && f != null) return { z: clampZ((a - f) / cfg.std), note: (ov ? `实际(锚定${RECENT_ACTUALS[cfg.key].asof}) ${a} / 预期 ${e.f}` : `实际 ${e.a} / 预期 ${e.f}`), stale: false, ev: e.t };
+  if (a != null && f != null) return { z: clampZ((a - f) / cfg.std), note: (ov ? `实际(${ovTag} ${RECENT_ACTUALS[cfg.key].asof}) ${a} / 预期 ${e.f}` : `实际 ${e.a} / 预期 ${e.f}`), stale: false, ev: e.t };
   const late = econOverdue(e);
   if (f != null && p != null) return {
     z: clampZ((f - p) / cfg.std * 0.5),
@@ -659,12 +750,16 @@ const FACTORS = [
       const A = vAnchor('cpi_idx', 320.0);
       const real = g / (A.v / 100);                    // 定基 CPI 折算 → 实际金价
       const z = mChgZ('GOLD', 60);                     // CPI 是慢变量，实际金价动能≈名义动能（实时）
-      return { z, note: '实际金价 $' + real.toFixed(0) + ' · 定基CPI ' + A.v + (A.anchored ? '锚定' + A.asof : '默认320') + ' · 60日动能实时' };
+      const tg = (A.src || '锚定') + (A.asof || '');     // v3.32：真源来了就显示真源，不写死「锚定」
+      return { z, note: '实际金价 $' + real.toFixed(0) + ' · 定基CPI ' + A.v + (A.anchored ? tg : '默认320') + ' · 60日动能实时' };
     } },
   { id: 'fedbs', name: '🏛 美联储表', group: 'value', w: 0.5, dir: 1, anchored: true, calc: () => {
       const A = vAnchor('fed_total', 6.7e12);
       const z = clampZ((A.v - 8.0e12) / 1.0e12);       // 锚定正常带：缩表前 ~8 万亿
-      return { z, note: '总资产 $' + (A.v / 1e12).toFixed(2) + '万亿 · ' + (A.anchored ? '锚定' + A.asof + '·非实时' : '默认6.7万亿·待接入WALCL') + ' · 缩表=流动性收紧' };
+      /* v3.32：源本身是实时（Fed H.4.1）时就别再标「非实时」—— 那是不诚实 */
+      const s0 = A.src || '锚定', liveSrc = /实时/.test(s0);
+      const tg = s0 + (A.asof ? '' + A.asof : '') + (liveSrc ? '' : '·非实时');
+      return { z, note: '总资产 $' + (A.v / 1e12).toFixed(2) + '万亿 · ' + (A.anchored ? tg : '默认6.7万亿·待接入WALCL') + ' · 缩表=流动性收紧' };
     } },
   { id: 'nvt', name: '⛓ BTC链上估值', group: 'value', w: 0.7, dir: -1, anchored: true, calc: () => {
       const G = state.global;
@@ -3349,7 +3444,7 @@ async function refreshAll() {
   if (!state.klines['BTC1d']) await fetchKlines('BTC', '1d');
   buildSeries();
   renderTicker(); renderChart(); renderTA(); renderFG(); renderMacro(); renderEcon(); renderOnChain(); renderDeriv(); renderFactors();
-  try { renderValueFactors(); } catch (e) { console.warn('value panel fail', e && e.message); }
+  try { renderValueFactors(); renderTruthStat(); maybeFetchTruths(); } catch (e) { console.warn('value panel fail', e && e.message); }
   renderPaper();
   initNetwork(); renderHeatmap();
   try { renderNetStats(); renderCorrPanels(); renderSystemic(); } catch (e) { console.warn('net v2 fail', e && e.message); }
@@ -3432,6 +3527,25 @@ function bindUI() {
   if (nchk) {
     if (!state.notify) state.notify = loadNotifyCfg();
     nchk.checked = !!state.notify.enabled;
+    /* v3.32：一键验证 Webhook 是否真的配通（否则「已开启」只是自欺欺人） */
+    const ntb = $('notifyTestBtn');
+    if (ntb) ntb.addEventListener('click', async function () {
+      const old = ntb.textContent; ntb.disabled = true; ntb.textContent = '发送中…';
+      try {
+        if (!state.notify) state.notify = loadNotifyCfg();
+        const r = await fetch(NOTIFY.ENDPOINT, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: NOTIFY.TOKEN, text: '【NEXUS 测试】Webhook 配置验证 —— 收到这条说明链路已通。\n时间：' + new Date().toISOString().slice(0, 19).replace('T', ' ') + '\n（nexus.uichain.org）' })
+        });
+        const d = await r.json().catch(function () { return {}; });
+        state.notify.lastResult = (r.ok && d.ok) ? '✅ 测试已送达' : ('❌ ' + (d.error || ('HTTP ' + r.status)));
+      } catch (e) {
+        if (!state.notify) state.notify = loadNotifyCfg();
+        state.notify.lastResult = '❌ ' + (e && e.message || '网络失败');
+      }
+      saveNotifyCfg(); updateNotifyUI();
+      ntb.disabled = false; ntb.textContent = old;
+    });
     nchk.addEventListener('change', function () {
       if (!state.notify) state.notify = loadNotifyCfg();
       state.notify.enabled = nchk.checked;
