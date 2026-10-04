@@ -34,8 +34,10 @@ function payload(rawu) {
   if (u.includes('mempool.space'))
     return { hashrates: Array.from({ length: 365 }, (_, i) => ({ timestamp: now - i * 86400000, avgHashrate: 5e20 + i * 1e18 })) };
   if (u.includes('/api/snapshot')) {
-    const keys = ['DXY', 'US10Y', 'GOLD', 'SPX', 'VIX', 'OIL', 'BRENT', 'AGRI', 'EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'USDJPY', 'JGB10Y'];
-    const base = { DXY: 101, US10Y: 5.2, GOLD: 4190, SPX: 7650, VIX: 16, OIL: 89, BRENT: 97, AGRI: 28, EFFR: 3.88, UST2Y: 4.88, T10Y2Y: 0.41, REAL10Y: 2.93, BEI10: 2.36, USDJPY: 158, JGB10Y: 3.06 };
+    /* v3.34：补 CREDIT/EMRS —— 二者是 Worker 用 alignRatio 派生的（HYG/LQD、EEM/SPX），
+     * 不补进模拟快照的话 credit/em 两个因子会合法地成为死因子，冒烟测试就会误报失败。 */
+    const keys = ['DXY', 'US10Y', 'GOLD', 'SPX', 'VIX', 'OIL', 'BRENT', 'AGRI', 'EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'USDJPY', 'JGB10Y', 'CREDIT', 'EMRS'];
+    const base = { DXY: 101, US10Y: 5.2, GOLD: 4190, SPX: 7650, VIX: 16, OIL: 89, BRENT: 97, AGRI: 28, EFFR: 3.88, UST2Y: 4.88, T10Y2Y: 0.41, REAL10Y: 2.93, BEI10: 2.36, USDJPY: 158, JGB10Y: 3.06, CREDIT: 0.755, EMRS: 0.00876 };
     const S = {}, D = {}, M = {}, SRC = {};
     keys.forEach(k => { const n = k === 'EFFR' ? 300 : 160; S[k] = series(n, base[k], base[k] * 0.02); D[k] = ts.slice(-n); M[k] = S[k][S[k].length - 1]; SRC[k] = k === 'EFFR' ? 'nyfed' : 'yahoo:TEST'; });
     return { macro: M, series: S, dates: D, _prev: M, _src: SRC, ts: now };
