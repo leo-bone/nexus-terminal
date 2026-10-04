@@ -161,6 +161,11 @@ const FRED_FALLBACK = {
 /* FRED_FALLBACK_END */
 };
 
+/* 兜底刷新日期：tools/refresh_truths.py --write 时同步更新（见该脚本末尾的日期替换）。
+ * 前端据此判断是否「许久未刷新」—— 仅反映操作员刷新节奏，不替发布节奏做判断
+ * （月频宏观系列 asof 是数据月，比发布日早约一个月，朴素「天数」会误报，故只信此字段）。 */
+const FALLBACK_GENERATED_ON = '2026-10-04';
+
 /* H.4.1 表 5「Consolidated Statement of Condition of All Federal Reserve Banks」的 Total assets。
  * 页面单位是百万美元，转成 USD（6,743,031 → 6.743e12），与 FRED WALCL 口径一致。 */
 function parseH41TotalAssets(html) {
@@ -1504,24 +1509,24 @@ export default {
     /* v3.32 宏观真值：一次拿全 WALCL(H.4.1实时) + 5 个 FRED 系列(线上尝试→兜底) */
     if (url.pathname === '/api/truths') {
       const out = {}; const errs = {};
-      try { out.WALCL = await fetchFedH41(); } catch (e) { errs.WALCL = e.message; }
+      try { out.WALCL = await fetchFedH41(); out.WALCL.live = true; } catch (e) { errs.WALCL = e.message; }
       /* v3.33：这两个源在 CF 边缘实测 200（与 FRED 的 520 不同），直接取真值 */
-      try { out.ONCHAIN_USD = await fetchOnChainUsd(); } catch (e) { errs.ONCHAIN_USD = e.message; }
-      try { out.SPX_EY = await fetchMultplEY(); } catch (e) { errs.SPX_EY = e.message; }
+      try { out.ONCHAIN_USD = await fetchOnChainUsd(); out.ONCHAIN_USD.live = true; } catch (e) { errs.ONCHAIN_USD = e.message; }
+      try { out.SPX_EY = await fetchMultplEY(); out.SPX_EY.live = true; } catch (e) { errs.SPX_EY = e.message; }
       const ids = ['UNRATE', 'CPIAUCSL', 'PAYEMS', 'ICSA', 'PCEPILFE'];
       const live = await fredReachable();
       await Promise.all(ids.map(async function (id) {
         if (live) {
           try {
             const r = await fetchFred(id, 3);
-            if (r.v != null) { out[id] = { asof: r.asof, v: r.v, prev: r.prev, src: 'FRED实时' }; return; }
+            if (r.v != null) { out[id] = { asof: r.asof, v: r.v, prev: r.prev, src: 'FRED实时', live: true }; return; }
           } catch (e) { errs[id] = e.message; }
         }
         const f = FRED_FALLBACK[id];
-        if (f) out[id] = { asof: f.asof, v: f.v, prev: f.prev, src: 'FRED兜底(CF不可达)' };
+        if (f) out[id] = { asof: f.asof, v: f.v, prev: f.prev, src: 'FRED兜底(CF不可达)', live: false };
         else errs[id] = 'no fallback';
       }));
-      return jsonResp({ ok: Object.keys(out).length > 0, fredLive: live, series: out, errors: errs, ts: Date.now() }, 200,
+      return jsonResp({ ok: Object.keys(out).length > 0, fredLive: live, fallbackGeneratedOn: FALLBACK_GENERATED_ON, series: out, errors: errs, ts: Date.now() }, 200,
         { 'Cache-Control': 'public, max-age=1800' });
     }
 

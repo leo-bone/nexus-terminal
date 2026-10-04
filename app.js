@@ -1,5 +1,5 @@
 /* =====================================================================
- * NEXUS TERMINAL v3.34 — 加密货币实时监测与因子关系终端
+ * NEXUS TERMINAL v3.35 — 加密货币实时监测与因子关系终端
  * 纯前端 / 无后端 / 无构建步骤。可直接 file:// 打开，也可部署到 Cloudflare。
  *
  * 数据源（全经 Cloudflare Worker 代理，解决中国大陆无法直连 + 浏览器 CORS）:
@@ -34,6 +34,13 @@
  *   3) 原油因子升级为 WTI + 布伦特 双源合成; 宏观卡片新增布伦特
  *   4) 数据源主备调换: Yahoo 升为主源 (Stooq 自 2026-10 起在 CF 边缘频繁 522/反爬)
  *   5) 快照新增 _src 数据源诊断字段
+ *
+ * v3.35 变更:
+ *   1) 数据新鲜度透明化：宏观真值面板从一行摘要升级为「宏观真值新鲜度」表，
+ *      逐项列出 值 / 数据期 / 来源 / 状态（实时·绿 ｜ 兜底·新鲜·琥珀 ｜ 兜底·许久未刷新·红）。
+ *   2) Worker /api/truths 新增 fallbackGeneratedOn（兜底刷新日期）+ 每系列 live 标志；
+ *      FRED 5 项兜底若超过 45 天未刷新才标红，绝不因「月频数据月比发布日早一个月」而误报陈旧。
+ *   3) tools/refresh_truths.py --write 同步刷新 FALLBACK_GENERATED_ON，使刷新操作幂等且可追溯。
  *
  * v3.34 变更:
  *   1) 提醒方式换轨：v3.30~v3.33 的「群机器人 Webhook」需要企业/组织建群 + 加机器人 +
@@ -486,7 +493,7 @@ function applyTruths(data) {
   /* v3.33：这两个源在 CF 边缘实测 200 —— 根治「链上美元结算额」与「盈利收益率」两个慢变量 */
   if (S.ONCHAIN_USD && S.ONCHAIN_USD.v != null) VALUE_ANCHORS.onchain_usd = mk(S.ONCHAIN_USD.v, S.ONCHAIN_USD);
   if (S.SPX_EY && S.SPX_EY.v != null) VALUE_ANCHORS.spx_ey = mk(S.SPX_EY.v, S.SPX_EY);
-  _truthMeta = { ts: Date.now(), fredLive: !!data.fredLive, series: S };
+  _truthMeta = { ts: Date.now(), fredLive: !!data.fredLive, fallbackGeneratedOn: (data && data.fallbackGeneratedOn) || null, series: S };
 }
 
 async function fetchTruths(force) {
@@ -505,14 +512,48 @@ function maybeFetchTruths() {
     try { renderValueFactors(); renderEcon(); renderFactors(); renderTruthStat(); } catch (e) {}
   });
 }
+/* v3.35 数据新鲜度状态：只判「实时 / 兜底·新鲜 / 兜底·许久未刷新」。
+ * 关键诚实点：月频宏观系列 asof 是「数据月」（比发布日早约一个月），朴素按天数算会误报陈旧；
+ * 所以兜底项只用操作员刷新日期 fallbackGeneratedOn 判断，绝不替发布节奏下结论。 */
+function truthStatus(s, genOn) {
+  if (!s) return { status: 'na', label: '—', cls: 'fz-na' };
+  if (s.live) return { status: 'live', label: '实时', cls: 'fz-live' };
+  const ageDays = genOn ? Math.floor((Date.now() - Date.parse(genOn)) / 864e5) : null;
+  if (ageDays == null || ageDays < 45) return { status: 'fresh', label: '兜底·新鲜', cls: 'fz-fresh' };
+  return { status: 'stale', label: '兜底·许久未刷新', cls: 'fz-stale' };
+}
+
 function renderTruthStat() {
   const el = $('truthStat'); if (!el) return;
   const m = _truthMeta;
-  if (!m) { el.textContent = '宏观真值：加载中…'; return; }
+  if (!m || !m.series) { el.innerHTML = '宏观真值：加载中…'; return; }
   const S = m.series || {};
-  const w = S.WALCL ? '美联储表 ' + (S.WALCL.v / 1e12).toFixed(2) + '万亿（' + S.WALCL.src + ' ' + S.WALCL.asof + '）' : '美联储表 —';
-  const f = S.UNRATE ? '失业率 ' + S.UNRATE.v + '%（' + S.UNRATE.asof + '）' : '失业率 —';
-  el.textContent = '真源 · ' + w + ' · ' + f + ' · FRED 线上' + (m.fredLive ? '可用' : '不可达（走本机兜底）');
+  const genOn = m.fallbackGeneratedOn || null;
+  const ageDays = genOn ? Math.floor((Date.now() - Date.parse(genOn)) / 864e5) : null;
+  const stStyle = { live: '#2e9e5b', fresh: '#c08a2e', stale: '#d23b3b', na: '#888' };
+  const rows = [];
+  const add = function (label, s, disp) {
+    if (!s) return;
+    const st = truthStatus(s, genOn);
+    rows.push('<div style="display:flex;justify-content:space-between;font-size:11px;line-height:1.5;border-bottom:1px dotted #ddd;padding:1px 0">'
+      + '<span style="flex:1;color:#555">' + label + '</span>'
+      + '<b style="width:96px;text-align:right;font-weight:600">' + disp + '</b>'
+      + '<span style="width:84px;text-align:right;color:#888">' + (s.asof || '—') + '</span>'
+      + '<em style="width:96px;text-align:right;font-style:normal;color:' + stStyle[st.status] + '">' + st.label + '</em></div>');
+  };
+  add('美联储表', S.WALCL, (S.WALCL.v / 1e12).toFixed(2) + '万亿');
+  add('链上日结算', S.ONCHAIN_USD, (S.ONCHAIN_USD.v / 1e9).toFixed(1) + '亿·30d');
+  add('标普盈利率', S.SPX_EY, (S.SPX_EY.v * 100).toFixed(2) + '%');
+  add('失业率', S.UNRATE, S.UNRATE.v + '%');
+  add('CPI定基', S.CPIAUCSL, S.CPIAUCSL.v.toFixed(1));
+  add('非农', S.PAYEMS, (S.PAYEMS.v / 1000).toFixed(0) + 'K');
+  add('初请', S.ICSA, (S.ICSA.v / 1000).toFixed(0) + 'K');
+  add('核心PCE', S.PCEPILFE, S.PCEPILFE.v.toFixed(1));
+  const foot = 'FRED 线上' + (m.fredLive ? '可用·实时' : '不可达 → 5 项走本机兜底'
+    + (ageDays != null ? '（更新于 ' + genOn + '·' + ageDays + '天前）' : ''))
+    + '。每个值带 src+asof，绝不冒充实时。';
+  el.innerHTML = '<div style="font-weight:600;font-size:12px;margin-bottom:2px">宏观真值新鲜度</div>'
+    + rows.join('') + '<div style="font-size:10px;color:#999;margin-top:3px">' + foot + '</div>';
 }
 
 function econFactor(cfg) {

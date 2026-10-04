@@ -64,11 +64,12 @@ def main():
         assert s.count(a) == 1 and s.count(b) == 1, 'FRED_FALLBACK 标记缺失或不唯一'
         i, j = s.index(a) + len(a), s.index(b)
         s = s[:i] + '\n' + frag + '\n' + s[j:]
-        s = s.replace("/* FALLBACK_ASOF_PLACEHOLDER */",
-                      "/* 由 tools/refresh_truths.py 于 %s 生成 */" %
-                      datetime.datetime.now().strftime('%Y-%m-%d'))
+        today = datetime.datetime.now().strftime('%Y-%m-%d')
+        # 同步更新兜底刷新日期（前端据其判断「许久未刷新」）
+        s = __import__('re').sub(r"const FALLBACK_GENERATED_ON = '[^']*';",
+                                "const FALLBACK_GENERATED_ON = '%s';" % today, s)
         io.open(P, 'w', encoding='utf-8').write(s)
-        print('\nwritten to worker/worker.js')
+        print('\nwritten to worker/worker.js (FRED_FALLBACK + FALLBACK_GENERATED_ON 已更新为 %s)' % today)
 
 
 if __name__ == '__main__':

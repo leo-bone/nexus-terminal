@@ -3587,6 +3587,46 @@ const near = (label, actual, expect, tol) => {
     chk('CC10 冷却 60 分钟', run('ALERT').COOLDOWN_MS, 3600000);
     chk('CC10 历史上限 50 条', run('ALERT').MAX_LOG, 50);
     run('saveAlertLog')([]);
+
+    /* ============ DD. v3.35 数据新鲜度透明化 ============ */
+    console.log('\n===== DD. v3.35 数据新鲜度透明化（truthStatus + renderTruthStat）=====');
+    const genNew = '2026-10-04';
+    const genOld = (function () { const d = new Date(); d.setUTCDate(d.getUTCDate() - 60); return d.toISOString().slice(0, 10); })();
+    const mkSeries = function () {
+      return {
+        WALCL: { asof: '2026-10-01', v: 6743031000000, src: 'H.4.1实时', live: true },
+        ONCHAIN_USD: { asof: '2026-10-03', v: 7702951467, src: '区块链实时(30日均)', live: true },
+        SPX_EY: { asof: 'Oct 2, 2026', v: 0.038, src: 'multpl(TTM盈利收益率)', live: true },
+        UNRATE: { asof: '2026-09-01', v: 4.2, src: 'FRED兜底(CF不可达)', live: false },
+        CPIAUCSL: { asof: '2026-08-01', v: 334.131, src: 'FRED兜底(CF不可达)', live: false },
+        PAYEMS: { asof: '2026-09-01', v: 159044, src: 'FRED兜底(CF不可达)', live: false },
+        ICSA: { asof: '2026-09-26', v: 197000, src: 'FRED兜底(CF不可达)', live: false },
+        PCEPILFE: { asof: '2026-08-01', v: 130.455, src: 'FRED兜底(CF不可达)', live: false },
+      };
+    };
+    chk('DD1 实时源 → live', run('truthStatus')({ live: true }, genNew).status, 'live');
+    chk('DD1 兜底+新刷新(<45d) → fresh', run('truthStatus')({ live: false }, genNew).status, 'fresh');
+    chk('DD1 兜底+旧刷新(>45d) → stale', run('truthStatus')({ live: false }, genOld).status, 'stale');
+    chk('DD1 无 genOn 不误报 stale', run('truthStatus')({ live: false }, null).status, 'fresh');
+
+    const mockTruths = { fredLive: false, fallbackGeneratedOn: genNew, series: mkSeries() };
+    run('applyTruths')(mockTruths);
+    chk('DD2 _truthMeta.fallbackGeneratedOn 已捕获', run('_truthMeta').fallbackGeneratedOn, genNew);
+    chk('DD2 RECENT_ACTUALS.urate 已填（既往行为未破）', run('RECENT_ACTUALS').urate.v, 4.2);
+    chk('DD2 VALUE_ANCHORS.fed_total 已填（既往行为未破）', (run('VALUE_ANCHORS').fed_total || {}).v, 6743031000000);
+
+    let tD = false, html = '';
+    try { run('renderTruthStat')(); html = $id('truthStat').innerHTML; tD = true; } catch (e) { console.warn('DD3 threw', e && e.message); }
+    chk('DD3 renderTruthStat 不抛', tD, 'true');
+    chk('DD3 渲染含「宏观真值新鲜度」标题', html.indexOf('宏观真值新鲜度') >= 0, 'true');
+    chk('DD3 实时源渲染「实时」', html.indexOf('实时') >= 0, 'true');
+    chk('DD3 兜底源渲染「兜底」', html.indexOf('兜底') >= 0, 'true');
+
+    run('applyTruths')({ fredLive: false, fallbackGeneratedOn: genOld, series: mkSeries() });
+    run('renderTruthStat')();
+    const htmlStale = $id('truthStat').innerHTML;
+    chk('DD4 陈旧兜底渲染「许久未刷新」', htmlStale.indexOf('许久未刷新') >= 0, 'true');
+    chk('DD4 陈旧兜底下 3 个实时源仍如实标「实时」', htmlStale.indexOf('实时') >= 0, 'true');
   }
 
   console.log('\n' + (fail ? `❌ 失败 ${fail} 项` : '✅ 全部断言通过'));
