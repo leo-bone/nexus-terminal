@@ -184,12 +184,15 @@ const near = (label, actual, expect, tol) => {
 
   console.log('\n===== D. 因子方向一致性（v3.6 核心修复）=====');
   const F = run('FACTORS');
-  chk('因子总数（含 5 个回放专用 + 4 个估值标尺）', F.length, 37);
+  chk('因子总数（含 5 个回放专用 + 4 个估值标尺 + 4 个 v3.33 新增实时因子）', F.length, 41);
   chk('回放专用因子 5 个且实时不参与', F.filter(f => f.replayOnly).map(f => f.id).join(','), 'mrv,adr,fee,prem,oih');
   chk('每个因子都有合法 dir', F.every(f => [1, -1, 0].includes(f.dir)), 'true');
-  chk('仅 1 项为「仅展示」(dir=0)', F.filter(f => f.dir === 0).length, 1);
-  chk('参与评分的因子数', run('computeNexusScore().nScored'), 27);
-  const expectDir = { fng: -1, fund: -1, ls: -1, oi: -1, dom: -1, stable: 1, hr: 1, tx: 1, mrv: -1, adr: 1, fee: 1, prem: -1, oih: -1, dxy: -1, us10y: -1, spx: 1, vix: -1, gold: -1, oil: -1, agri: 0, geo: -1, fed: -1, bei: -1, curve: 1, jpy: 1, jgb: -1, nfp: -1, urate: 1, claims: 1, pce: -1, cpi: -1, tech: 1, mom: 1, erp: 1, rgold: -1, fedbs: 1, nvt: -1 };
+  chk('2 项为「仅展示」(dir=0)：农业 + 全球流动性代理', F.filter(f => f.dir === 0).length, 2);
+  /* v3.33 新增的 credit / em 依赖 CREDIT / EMRS 序列；这里补上数据，否则它们是「死因子」
+   * （拿不到数据就退出评分 —— 这是设计行为），会让这句断言失去意义。 */
+  run("state.macroSeries.CREDIT = Array.from({length:120},(_,i)=>0.75+i*0.0004); state.macroSeries.EMRS = Array.from({length:120},(_,i)=>0.0087+i*1e-6);");
+  chk('参与评分的因子数（含 v3.33 新增的 credit/real/em）', run('computeNexusScore().nScored'), 30);
+  const expectDir = { fng: -1, fund: -1, ls: -1, oi: -1, dom: -1, stable: 1, hr: 1, tx: 1, mrv: -1, adr: 1, fee: 1, prem: -1, oih: -1, dxy: -1, us10y: -1, spx: 1, vix: -1, gold: -1, oil: -1, agri: 0, geo: -1, fed: -1, bei: -1, curve: 1, jpy: 1, jgb: -1, nfp: -1, urate: 1, claims: 1, pce: -1, cpi: -1, tech: 1, mom: 1, erp: 1, rgold: -1, fedbs: 1, nvt: -1, credit: 1, real: -1, em: 1, gliq: 0 };
   const bad = Object.entries(expectDir).filter(([k, v]) => (F.find(f => f.id === k) || {}).dir !== v).map(([k]) => k);
   chk('方向表与设计一致', bad.length ? bad.join(',') : 'ok', 'ok');
   chk('因子 id 无遗漏', F.filter(f => !(f.id in expectDir)).length, 0);
@@ -218,7 +221,7 @@ const near = (label, actual, expect, tol) => {
   console.log('\n===== F. 无数据因子不稀释评分（v3.7 核心修复）=====');
   const full = call('computeNexusScore');
   chk('数据齐全时无死因子 (nDead=0)', full.nDead, 0);
-  chk('数据齐全时参与评分 27', full.nScored, 27);
+  chk('数据齐全时参与评分 30（+credit/real/em）', full.nScored, 30);
 
   // 拿掉 global / 稳定币 / 算力 → 三个因子应标记无数据并退出分母
   run("state.global = null; state.stableMcap = null; state.chainSeries.hashrate = null;");
@@ -228,7 +231,7 @@ const near = (label, actual, expect, tol) => {
   chk('stable 缺失 → 标记无数据', dk.out.stable.ok, false);
   chk('hashrate 缺失 → hr 标记无数据', dk.out.hr.ok, false);
   chk('nDead 正确计数为 3', dk.nDead, 3);
-  chk('参与评分从 27 降到 24', dk.nScored, 24);
+  chk('参与评分从 30 降到 27', dk.nScored, 27);
   chk('死因子的贡献为 0', dk.out.dom.contribution, 0);
 
   // 关键：活因子全部 +2 时，评分必须只由活因子决定（不被死权重拉向 50）
@@ -617,7 +620,7 @@ const near = (label, actual, expect, tol) => {
   const liveAfter = call('computeNexusScore');
   chk('回放后游标已复位', run('state.asof'), null);
   chk('回放不污染实时评分', liveAfter.score, liveBefore.score);
-  chk('回放后实时评分仍为 32 维（+4 估值标尺，只显示不评分）', Object.keys(liveAfter.out).length, 32);
+  chk('回放后实时评分仍为 36 维（+4 估值标尺只显示不评分，+4 v3.33 实时因子）', Object.keys(liveAfter.out).length, 36);
   run('state.histBundle = null;');
 
   /* —— 渲染兜底：renderReview 必须不抛错且 ⑦ 极端子评分块渲染出来（防「reg 未定义」类 bug 被 catch 静默吞掉）—— */
@@ -3309,17 +3312,18 @@ const near = (label, actual, expect, tol) => {
     run('state').macroSeries.US10Y = [4.5];
     const VA = run('VALUE_ANCHORS');
 
-    /* —— Z1 ERP：EY = 1/FPE，ERP = EY − 10Y；z 对着锚定正常带 3% ± 1.5% —— */
+    /* —— Z1 ERP：v3.33 盈利端直取真源 spx_ey（盈利收益率），ERP = EY − 10Y —— */
     const fErp = run("FACTORS.filter(f => f.id === 'erp')[0]");
     const e1 = fErp.calc();
     chk('Z1 ERP 备注含 ERP', e1.note.indexOf('ERP ') >= 0, 'true');
-    chk('Z1 未锚定时如实标「默认21」', e1.note.indexOf('默认21') >= 0, 'true');
+    chk('Z1 未接真源时如实标「默认EY…待接入」', e1.note.indexOf('待接入') >= 0, 'true');
     near('Z1 ERP z = (1/21−4.5%−3%)/1.5% = −1.8254', e1.z, -1.8254, 1e-3);
-    VA['spx_fpe'] = { v: 20, asof: '2026-09' };
+    VA['spx_ey'] = { v: 0.05, asof: '2026-10', src: 'multpl(TTM盈利收益率)' };
     const e2 = fErp.calc();
-    near('Z1 锚定 FPE=20 → z = (5%−4.5%−3%)/1.5% = −1.6667', e2.z, -1.6667, 1e-3);
-    chk('Z1 锚定后备注标「锚定2026-09」', e2.note.indexOf('锚定2026-09') >= 0, 'true');
-    delete VA['spx_fpe'];
+    near('Z1 真源 EY=5% → z = (5%−4.5%−3%)/1.5% = −1.6667', e2.z, -1.6667, 1e-3);
+    chk('Z1 备注带真源来源', e2.note.indexOf('multpl') >= 0, 'true');
+    chk('Z1 诚实口径：写明 TTM 非远期（不冒充远期 P/E）', e2.note.indexOf('TTM非远期') >= 0, 'true');
+    delete VA['spx_ey'];
 
     /* —— Z2 黄金实际价格：快变量 GOLD 实时，慢变量 CPI 锚定 —— */
     run('state').macroSeries.GOLD = Array.from({ length: 120 }, (_, i) => 4000 + i);
@@ -3343,20 +3347,20 @@ const near = (label, actual, expect, tol) => {
     chk('Z3 锚定后备注标「锚定2026-09·非实时」', b2.note.indexOf('锚定2026-09·非实时') >= 0, 'true');
     delete VA['fed_total'];
 
-    /* —— Z4 BTC 链上估值 NVT：市值/笔数实时，单笔美元额锚定 —— */
+    /* —— Z4 BTC 链上估值 NVT：v3.33 分母优先用真源 onchain_usd（链上日结算额） —— */
     run('state').global = { total_market_cap: { usd: 3.0e12 }, market_cap_percentage: { btc: 55 } };
     run('state').chainSeries = run('state').chainSeries || {};
     run('state').chainSeries.n_tx = [400000];
     const fNvt = run("FACTORS.filter(f => f.id === 'nvt')[0]");
     const n1 = fNvt.calc();
     chk('Z4 备注含 NVT', n1.note.indexOf('NVT') >= 0, 'true');
-    chk('Z4 未锚定时如实标「默认」', n1.note.indexOf('默认') >= 0, 'true');
-    near('Z4 NVT = 1.65e12/(4e5×4.5e4) = 91.67 → z = (91.67−75)/30 = 0.5556', n1.z, 0.5556, 1e-3);
-    VA['avg_tx_usd'] = { v: 50000, asof: '2026-09' };
+    chk('Z4 无真源时回退粗代理并如实标明', n1.note.indexOf('粗代理') >= 0, 'true');
+    near('Z4 回退 NVT = 1.65e12/(4e5×4.5e4) = 91.67 → z = 0.5556', n1.z, 0.5556, 1e-3);
+    VA['onchain_usd'] = { v: 2.0e10, asof: '2026-10-03', src: '区块链实时(30日均)' };
     const n2 = fNvt.calc();
-    near('Z4 锚定 5e4 → NVT = 82.5 → z = 0.25', n2.z, 0.25, 1e-3);
-    chk('Z4 锚定后备注标「锚定2026-09」', n2.note.indexOf('锚定2026-09') >= 0, 'true');
-    delete VA['avg_tx_usd'];
+    near('Z4 真源 2e10 → NVT = 1.65e12/2e10 = 82.5 → z = 0.25', n2.z, 0.25, 1e-3);
+    chk('Z4 备注带真源（不再用粗代理）', n2.note.indexOf('区块链实时') >= 0, 'true');
+    delete VA['onchain_usd'];
 
     /* —— Z5 关键：估值因子是「估值标尺」，不能混进实时评分（否则实时评分不再纯实时）—— */
     const nA = run('computeNexusScore')().nScored;
@@ -3425,6 +3429,72 @@ const near = (label, actual, expect, tol) => {
     near('AA5 美联储表 z = (6.743031−8)/1 = −1.25697', fb.z, (6743031000000 - 8e12) / 1e12, 1e-5);
     chk('AA5 备注标 H.4.1（真源）', fb.note.indexOf('H.4.1') >= 0, 'true');
     chk('AA5 H.4.1 实时源不再被误标「非实时」', fb.note.indexOf('非实时') < 0, 'true');
+  }
+
+
+  console.log('\n===== BB. v3.33 自定义冲击 + 4 个新因子 + 慢变量真源 =====');
+  {
+    /* BB1 自定义情景：与内置情景共用同一个传导模型，只是换「种子冲击」 */
+    run('state').scenarioCustom = [{ k: 'BTC', toZ: -2 }];
+    const cs = run('scnCustomScenario')();
+    chk('BB1 自定义情景 shocks 取自 state.scenarioCustom', cs.shocks.length, 1);
+    chk('BB1 desc 含资产名与强度', cs.desc.indexOf('BTC') >= 0 && cs.desc.indexOf('-2.0') >= 0, 'true');
+    run('state').scenarioCustom = [];
+    chk('BB1 清空后 desc 标「未设置冲击」', run('scnCustomScenario')().desc.indexOf('未设置冲击') >= 0, 'true');
+    /* 等价性：自定义 {BTC:-2} 与内置 btc_break 的传导结果必须完全一致 */
+    const A2 = { keys: ['BTC', 'DXY', 'VIX'], R: [[1, 0.3, -0.5], [0.3, 1, 0.2], [-0.5, 0.2, 1]] };
+    const rCustom = run('scenarioPropagate')(A2, { shocks: [{ k: 'BTC', toZ: -2 }] });
+    const rBuilt = run('scenarioPropagate')(A2, run("SCENARIOS.filter(s => s.id === 'btc_break')[0]"));
+    near('BB1 自定义与内置 btc_break 传导结果一致（VIX）', rCustom.rows.filter(r => r.k === 'VIX')[0].dz,
+         rBuilt.rows.filter(r => r.k === 'VIX')[0].dz, 1e-12);
+
+    /* BB2 信用利差：HYG/LQD 上行 = 利差收窄 = 风险偏好升 → dir +1 */
+    run('state').macroSeries.CREDIT = Array.from({ length: 120 }, (_, i) => 0.75 + i * 0.0004);
+    const fCr = run("FACTORS.filter(f => f.id === 'credit')[0]");
+    chk('BB2 信用利差 dir=+1（利差收窄看多）', fCr.dir, 1);
+    chk('BB2 备注含「利差收窄」', fCr.calc().note.indexOf('利差收窄') >= 0, 'true');
+    chk('BB2 备注如实标「市场侧代理」（不冒充官方 OAS 口径）', fCr.calc().note.indexOf('市场侧代理') >= 0, 'true');
+    chk('BB2 是实时因子（不带 anchored）', !fCr.anchored, 'true');
+    run('state').macroSeries.CREDIT = [0.75];
+    chk('BB2 序列不足 60 点 → ok=false（不拿残缺数据算）', fCr.calc().ok, false);
+
+    /* BB3 实际利率：REAL10Y 水平 z，dir=-1（实际利率升=折现压力） */
+    run('state').macroSeries.REAL10Y = Array.from({ length: 130 }, (_, i) => 2 + Math.sin(i / 9));
+    const fRl = run("FACTORS.filter(f => f.id === 'real')[0]");
+    chk('BB3 实际利率 dir=-1', fRl.dir, -1);
+    chk('BB3 z 有限且备注含实际收益率', isFinite(fRl.calc().z) && fRl.calc().note.indexOf('实际收益率') >= 0, 'true');
+
+    /* BB4 新兴市场强弱：EEM/SPX 60 日动能 */
+    run('state').macroSeries.EMRS = Array.from({ length: 130 }, (_, i) => 0.0087 + i * 1e-6);
+    const fEm = run("FACTORS.filter(f => f.id === 'em')[0]");
+    chk('BB4 新兴市场强弱 dir=+1', fEm.dir, 1);
+    chk('BB4 备注含 EEM/SPX', fEm.calc().note.indexOf('EEM/SPX') >= 0, 'true');
+
+    /* BB5 全球流动性：只展示、不参与评分（否则与已评分因子重复计数） */
+    const fGl = run("FACTORS.filter(f => f.id === 'gliq')[0]");
+    chk('BB5 全球流动性 dir=0（只展示，不重复计分）', fGl.dir, 0);
+    const gl = fGl.calc();
+    chk('BB5 备注如实说明 ECB/BOJ 源不可达', gl.note.indexOf('ECB/BOJ源CF不可达') >= 0, 'true');
+    chk('BB5 备注标「只展示」', gl.note.indexOf('只展示') >= 0, 'true');
+    chk('BB5 合成值有限', isFinite(gl.z), 'true');
+
+    /* BB6 v3.33 真源接入：链上美元结算额 + 标普盈利收益率 */
+    run('applyTruths')({
+      fredLive: false,
+      series: {
+        ONCHAIN_USD: { asof: '2026-10-03', v: 7702951467.58, src: '区块链实时(30日均)' },
+        SPX_EY: { asof: 'Oct 2, 2026', v: 0.038, prev: 0.0384, src: 'multpl(TTM盈利收益率)' },
+      }
+    });
+    near('BB6 链上日结算额入锚定表', run('VALUE_ANCHORS').onchain_usd.v, 7702951467.58, 1);
+    chk('BB6 链上源标为区块链实时', run('VALUE_ANCHORS').onchain_usd.src.indexOf('区块链实时') >= 0, 'true');
+    near('BB6 盈利收益率入锚定表', run('VALUE_ANCHORS').spx_ey.v, 0.038, 1e-9);
+    chk('BB6 盈利收益率源标为 multpl', run('VALUE_ANCHORS').spx_ey.src.indexOf('multpl') >= 0, 'true');
+    /* 接了真源后，ERP/NVT 必须改用真值、不再走粗代理 */
+    run('state').macroSeries.US10Y = [4.5];
+    chk('BB6 ERP 改用真源（备注含 multpl）', run("FACTORS.filter(f => f.id === 'erp')[0]").calc().note.indexOf('multpl') >= 0, 'true');
+    chk('BB6 NVT 改用真源（备注含区块链实时）', run("FACTORS.filter(f => f.id === 'nvt')[0]").calc().note.indexOf('区块链实时') >= 0, 'true');
+    delete run('VALUE_ANCHORS').onchain_usd; delete run('VALUE_ANCHORS').spx_ey;
   }
 
   console.log('\n' + (fail ? `❌ 失败 ${fail} 项` : '✅ 全部断言通过'));

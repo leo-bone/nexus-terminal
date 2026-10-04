@@ -8,6 +8,7 @@
  *   /api/history   10 年+ 日频历史包（供前端回放历史 Nexus Score + IC 检验；BTC 经 v3.14 延至 ~2014）
  *   /api/dvol      Deribit DVOL 实时恐慌统计（当前值 + 近1年百分位 + 60日 z，供实时波动率警报）
  *   /api/truths    宏观真值：WALCL 走 Fed H.4.1（实时）+ 5 个 FRED 系列（线上尝试→兜底）
+ *                v3.33 起再加 ONCHAIN_USD（链上美元结算额，区块链实时）与 SPX_EY（标盈利收益率）
  *   /api/fred      FRED 免 key CSV 宏观真值（WALCL/UNRATE/CPIAUCSL/PAYEMS/ICSA/PCEPILFE）
  *   /api/fetch     白名单代理（浏览器所有外部请求经此，绕 GFW + CORS）
  *   /health        健康检查
@@ -61,6 +62,10 @@ const PROXY_ALLOW = [
   'fred.stlouisfed.org',      // FRED 图表 CSV（免 API key）→ 宏观真值
   'www.federalreserve.gov',   // 美联储 H.4.1 报表（资产负债表 WALCL 官方源）
   'alfred.stlouisfed.org',    // ALFRED（FRED 实时子域，免 key CSV）
+  'data-api.ecb.europa.eu',  // ECB Data API（免 key JSON）—— 实测 CF 504，未采用
+  'sdw-wsrest.ecb.europa.eu', // ECB SDW REST —— 实测 CF 530，未采用
+  'www.multpl.com',          // S&P500 盈利收益率 / PE（免 key 表格，供 ERP 的盈利端）
+  'www.boj.or.jp',           // 日本央行（全球流动性）—— 实测 CF 404，未采用，保留以备复查
 ];
 
 // 简单序列：按顺序尝试多个源（yahoo 主源 / stooq 兜底）
@@ -74,6 +79,11 @@ const SIMPLE = {
   BRENT: ['yahoo:BZ=F',     'stooq:brn.f'],    // 布伦特原油
   AGRI:  ['yahoo:DBA',      'stooq:dba.us'],   // 农业 ETF
   USDJPY:['yahoo:JPY=X',    'stooq:usdjpy'],   // 美元/日元（套息交易风向标）
+  /* v3.33：以下 3 个**不单独出因子**，只用于派生比值序列（见 buildSnapshot 的 CREDIT / EMRS）。
+   * 它们是 ETF 价格、不是独立宏观变量，直接塞进因子宇宙会与 SPX 高度共线。 */
+  HYG:   ['yahoo:HYG'],      // iShares 高收益公司债 ETF（信用利差分子）
+  LQD:   ['yahoo:LQD'],      // iShares 投资级公司债 ETF（信用利差分母）
+  EEM:   ['yahoo:EEM'],      // 新兴市场 ETF（全球风险偏好 / 资金流向）
 };
 
 function jsonResp(obj, status = 200, extra = {}) {
@@ -177,6 +187,62 @@ async function fetchFedH41() {
     }
   }
   return parseH41TotalAssets(html);
+}
+
+/* ---------- v3.33 链上美元结算额（blockchain.info，CF 边缘实测 200）----------
+ * NVT = 市值 / 链上日结算额。此前 avg_tx_usd 只能靠手填锚定（单笔美元额 × 笔数），
+ * 现在直接拿官方估算的日结算额（USD），**真·日频实时**，根治这个慢变量。
+ * 单日值噪声极大（实测 3.7e9 ~ 9.8e9 区间跳），所以取 30 日均值 —— 与 NVT 的
+ * 「平滑分母」惯例一致（NVT 常用 90 日均值，这里 30 日更敏感，备注里说明）。 */
+async function fetchOnChainUsd() {
+  const url = 'https://api.blockchain.info/charts/estimated-transaction-volume-usd?timespan=180d&sampled=false&format=json';
+  const cacheKey = new Request(url);
+  const hit = await caches.default.match(cacheKey);
+  let vals = hit ? JSON.parse(await hit.text()) : null;
+  if (!vals) {
+    const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NexusTerminal/3.33)' } });
+    if (!r.ok) throw new Error('onchain ' + r.status);
+    const j = await r.json();
+    vals = j.values || [];
+    if (vals.length >= 30) await caches.default.put(cacheKey, new Response(JSON.stringify(vals), { headers: { 'Cache-Control': 'public, max-age=3600' } }));
+  }
+  const rows = vals.map(x => ({ t: x.x * 1000, v: x.y })).filter(x => isFinite(x.t) && isFinite(x.v)).sort((a, b) => a.t - b.t);
+  if (rows.length < 30) throw new Error('onchain short: ' + rows.length);
+  const tail = rows.slice(-30);
+  const mean = tail.reduce((a, b) => a + b.v, 0) / tail.length;
+  return { asof: new Date(tail[tail.length - 1].t).toISOString().slice(0, 10), v: mean,
+           latest: rows[rows.length - 1].v, src: '区块链实时(30日均)' };
+}
+
+/* ---------- v3.33 标普 500 盈利收益率（multpl.com，CF 边缘实测 200）----------
+ * ERP = 盈利收益率 − 10Y。此前盈利端（远期 P/E）只能手填锚定，现在直接取 multpl 的
+ * 标普 500 盈利收益率（月频，页面为 TTM 口径、最新值带 † 标注）。**不是远期**，
+ * 这点在前端备注里如实写明 —— 用 TTM 冒充远期是不诚实。 */
+async function fetchMultplEY() {
+  const url = 'https://www.multpl.com/s-p-500-earnings-yield/table/by-month';
+  const cacheKey = new Request(url);
+  let html = null;
+  const hit = await caches.default.match(cacheKey);
+  if (hit) html = await hit.text();
+  if (!html) {
+    const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NexusTerminal/3.33)' } });
+    if (!r.ok) throw new Error('multpl ' + r.status);
+    html = await r.text();
+    if (html.length > 20000) await caches.default.put(cacheKey, new Response(html, { headers: { 'Cache-Control': 'public, max-age=21600' } }));
+  }
+  const rows = html.split('<tr').slice(1).map(function (chunk) {
+    const tds = chunk.split('</tr>')[0].match(/<td[^>]*>([\s\S]*?)<\/td>/g) || [];
+    if (tds.length < 2) return null;
+    const cell = function (x) { return x.replace(/<[^>]+>/g, '').replace(/[\u2020\u00a0]/g, '').trim(); };
+    const d = cell(tds[0]), p = cell(tds[1]).replace('%', '');
+    const v = parseFloat(p);
+    if (!isFinite(v)) return null;
+    const dt = Date.parse(d);
+    return { d: d, ts: isFinite(dt) ? dt : 0, ey: v / 100 };
+  }).filter(Boolean);
+  if (!rows.length) throw new Error('multpl: no rows');
+  const last = rows[0];
+  return { asof: last.d, v: last.ey, prev: rows.length > 1 ? rows[1].ey : null, src: 'multpl(TTM盈利收益率)' };
 }
 
 /* FRED/ALFRED 在 CF 边缘实测 520，别每次都浪费一次往返：同一 isolate 内失败后退避 30 分钟 */
@@ -374,6 +440,15 @@ function alignSubtract(aTs, aV, bTs, bV) {
   const m = new Map(); bTs.forEach((t, i) => m.set(t, bV[i]));
   const ts = [], v = [];
   aTs.forEach((t, i) => { if (m.has(t)) { ts.push(t); v.push(aV[i] - m.get(t)); } });
+  return { ts, v };
+}
+
+/* v3.33 派生比值序列：按时间戳对齐后逐点相除（与 alignSubtract 同款对齐逻辑）。
+ * 用于 HYG/LQD（信用利差代理）与 EEM/SPX（新兴市场相对强弱）。 */
+function alignRatio(aTs, aV, bTs, bV) {
+  const m = new Map(); bTs.forEach((t, i) => { if (bV[i]) m.set(t, bV[i]); });
+  const ts = [], v = [];
+  aTs.forEach((t, i) => { const d = m.get(t); if (d && isFinite(aV[i])) { ts.push(t); v.push(aV[i] / d); } });
   return { ts, v };
 }
 
@@ -1037,6 +1112,24 @@ async function buildSnapshot() {
     catch (e) { put(k, null); console.warn('simple fail', k, e.message); }
   }));
 
+  /* v3.33 派生序列（由 SIMPLE 拉取的 ETF 现算，不新增外部请求口径）：
+   *   CREDIT = HYG/LQD —— 高收益/投资级 ETF 比值。上行 = 高收益跑赢 = **信用利差收窄** = 风险偏好升。
+   *   EMRS   = EEM/SPX —— 新兴市场相对强弱。上行 = 资金流向风险更高的新兴市场 = 全球风险偏好升。
+   * 二者均为**真·实时**（Yahoo 日频），是「信用利差 / 全球流动性偏好」的**市场侧代理**：
+   * 官方口径的信用利差（ICE BofA OAS）与全球流动性（ECB/BOJ 资产负债表）权威源
+   * 在 CF 边缘实测均不可达（FRED 520 / ECB 504·530 / BOJ 404），故不冒充官方口径。 */
+  {
+    const drv = function (ka, kb, out) {
+      const a = series[ka], b = series[kb], ta = dates[ka], tb = dates[kb];
+      if (!a || !b || !ta || !tb) { put(out, null); return; }
+      const r = alignRatio(ta, a, tb, b);
+      if (r.v.length < 30) { put(out, null); return; }
+      put(out, { ts: r.ts, closes: r.v }, 'yahoo:' + ka + '/' + kb);
+    };
+    drv('HYG', 'LQD', 'CREDIT');
+    drv('EEM', 'SPX', 'EMRS');
+  }
+
   /* v3.11: Treasury now uses the same 12h cache as /api/history (taking the tail
    * ~800 trading days = 3.2y). Two wins: the live snapshot no longer issues its own
    * subrequests, and both endpoints read the same data instead of disagreeing. */
@@ -1412,6 +1505,9 @@ export default {
     if (url.pathname === '/api/truths') {
       const out = {}; const errs = {};
       try { out.WALCL = await fetchFedH41(); } catch (e) { errs.WALCL = e.message; }
+      /* v3.33：这两个源在 CF 边缘实测 200（与 FRED 的 520 不同），直接取真值 */
+      try { out.ONCHAIN_USD = await fetchOnChainUsd(); } catch (e) { errs.ONCHAIN_USD = e.message; }
+      try { out.SPX_EY = await fetchMultplEY(); } catch (e) { errs.SPX_EY = e.message; }
       const ids = ['UNRATE', 'CPIAUCSL', 'PAYEMS', 'ICSA', 'PCEPILFE'];
       const live = await fredReachable();
       await Promise.all(ids.map(async function (id) {
@@ -1456,7 +1552,7 @@ export default {
     }
 
     if (url.pathname === '/' || url.pathname === '/health') {
-      return jsonResp({ name: 'nexus-proxy', version: '3.32', status: 'ok', source: 'yahoo+stooq+nyfed+treasury+mof+coinlore+finforexfactory+bitcoin-data+bybit+deribit+fred+proxy', universe: Object.keys(UNIVERSE).reduce(function(a,c){return a+Object.keys(UNIVERSE[c]).length;},0), symbols: Object.keys(SIMPLE).concat(['EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'JGB10Y', 'DVOL', 'DVHV']) });
+      return jsonResp({ name: 'nexus-proxy', version: '3.33', status: 'ok', source: 'yahoo+stooq+nyfed+treasury+mof+coinlore+finforexfactory+bitcoin-data+bybit+deribit+fred+proxy', universe: Object.keys(UNIVERSE).reduce(function(a,c){return a+Object.keys(UNIVERSE[c]).length;},0), symbols: Object.keys(SIMPLE).concat(['EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'JGB10Y', 'DVOL', 'DVHV']) });
     }
 
     return new Response('Not Found', { status: 404, headers: CORS });

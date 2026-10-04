@@ -1,5 +1,5 @@
 /* =====================================================================
- * NEXUS TERMINAL v3.32 — 加密货币实时监测与因子关系终端
+ * NEXUS TERMINAL v3.33 — 加密货币实时监测与因子关系终端
  * 纯前端 / 无后端 / 无构建步骤。可直接 file:// 打开，也可部署到 Cloudflare。
  *
  * 数据源（全经 Cloudflare Worker 代理，解决中国大陆无法直连 + 浏览器 CORS）:
@@ -34,6 +34,17 @@
  *   3) 原油因子升级为 WTI + 布伦特 双源合成; 宏观卡片新增布伦特
  *   4) 数据源主备调换: Yahoo 升为主源 (Stooq 自 2026-10 起在 CF 边缘频繁 522/反爬)
  *   5) 快照新增 _src 数据源诊断字段
+ *
+ * v3.33 变更:
+ *   1) 情景推演引擎支持**自定义冲击**：自选资产 + 拖强度（−3σ~+3σ），可叠加多个冲击、
+ *      点标签移除。用的是同一个 scenarioPropagate —— 只换「种子冲击」，不换模型。
+ *   2) 估值因子剩余两个慢变量接真源（CF 边缘实测均 200）：
+ *      · 链上美元结算额 ← blockchain.info（日频实时，取 30 日均；单日噪声大）
+ *      · 标普盈利收益率 ← multpl.com（月频）；ERP 备注写死「TTM非远期」，不冒充远期。
+ *   3) 新增 4 个因子：信用利差 HYG/LQD、实际利率 REAL10Y、新兴市场强弱 EEM/SPX、
+ *      全球流动性（合成代理，只展示不评分 —— 否则与已评分因子重复计数）。
+ *      官方口径的信用利差(ICE BofA OAS)与全球流动性(ECB/BOJ 表)在 CF 边缘实测
+ *      全部不可达（FRED 520 / ECB 504·530 / BOJ 404），故一律标「市场侧代理」，不冒充官方口径。
  *
  * v3.32 变更:
  *   1) 事件因子 actual **根治**（v3.31 只做了止血）：新增 Worker /api/truths，接权威宏观真值。
@@ -457,6 +468,9 @@ function applyTruths(data) {
   /* —— 估值因子慢变量 —— */
   if (S.WALCL && S.WALCL.v != null) VALUE_ANCHORS.fed_total = mk(S.WALCL.v, S.WALCL);
   if (S.CPIAUCSL && S.CPIAUCSL.v != null) VALUE_ANCHORS.cpi_idx = mk(S.CPIAUCSL.v, S.CPIAUCSL);
+  /* v3.33：这两个源在 CF 边缘实测 200 —— 根治「链上美元结算额」与「盈利收益率」两个慢变量 */
+  if (S.ONCHAIN_USD && S.ONCHAIN_USD.v != null) VALUE_ANCHORS.onchain_usd = mk(S.ONCHAIN_USD.v, S.ONCHAIN_USD);
+  if (S.SPX_EY && S.SPX_EY.v != null) VALUE_ANCHORS.spx_ey = mk(S.SPX_EY.v, S.SPX_EY);
   _truthMeta = { ts: Date.now(), fredLive: !!data.fredLive, series: S };
 }
 
@@ -739,11 +753,14 @@ const FACTORS = [
    * 之所以不塞进 META/相关性：它们是派生量、没有独立价格序列，塞进相关矩阵会污染跨资产统计。 */
   { id: 'erp', name: '🧮 股债风险溢价', group: 'value', w: 0.6, dir: 1, anchored: true, calc: () => {
       const y10 = mV('US10Y'); if (y10 == null) return { z: 0, note: '—' };
-      const A = vAnchor('spx_fpe', 21.0);
-      const ey = 1 / A.v;                              // 盈利收益率 = 1 / 远期 P/E
+      const A = vAnchor('spx_ey', 1 / 21);             // v3.33：盈利收益率直取真源（默认 1/21 兜底）
+      const ey = A.v;                                  // 盈利收益率（小数）
       const erp = ey - y10 / 100;                      // 口径统一成小数
       const z = clampZ((erp - 0.03) / 0.015);          // 锚定正常带：ERP≈3%，σ≈1.5%
-      return { z, note: 'ERP ' + (erp * 100).toFixed(2) + '% = EY ' + (ey * 100).toFixed(2) + '% − 10Y ' + y10.toFixed(2) + '% · FPE' + (A.anchored ? '锚定' + A.asof : '默认21') + ' · 10Y实时' };
+      /* 诚实口径：multpl 给的是 **TTM 盈利收益率**，不是远期。用 TTM 冒充远期是不诚实，
+       * 所以备注里写死「TTM非远期」；远期 P/E 的权威源需要付费数据，本项目不接。 */
+      const tag = A.anchored ? ((A.src || '真源') + ' ' + (A.asof || '') + '·TTM非远期') : '默认EY 4.76%·待接入';
+      return { z, note: 'ERP ' + (erp * 100).toFixed(2) + '% = EY ' + (ey * 100).toFixed(2) + '%(PE ' + (1 / ey).toFixed(1) + ') − 10Y ' + y10.toFixed(2) + '% · ' + tag + ' · 10Y实时' };
     } },
   { id: 'rgold', name: '🥇 黄金(实际)', group: 'value', w: 0.5, dir: -1, anchored: true, calc: () => {
       const g = mV('GOLD'); if (g == null) return { z: 0, note: '—' };
@@ -766,13 +783,47 @@ const FACTORS = [
       const tot = G && G.total_market_cap && G.total_market_cap.usd;
       const dom = G && G.market_cap_percentage && G.market_cap_percentage.btc;
       const ntx = mV('TX');
-      if (!tot || !dom || !ntx) return { z: 0, note: '—' };
-      const A = vAnchor('avg_tx_usd', 45000);
+      /* v3.33：分母优先用真源 ONCHAIN_USD（blockchain.info 估算日结算额，30 日均，日频实时）。
+       * 只有真源缺失时才回退「笔数 × 单笔美元均值」这个粗代理，并在备注里如实标明。 */
+      const A = vAnchor('onchain_usd', null);
+      let dailyUsd = null, how = '';
+      if (A.v != null) { dailyUsd = A.v; how = '链上日结算额' + ((A.src || '真源') + ' ' + (A.asof || '')); }
+      if (dailyUsd == null && ntx) {
+        const B = vAnchor('avg_tx_usd', 45000);
+        dailyUsd = ntx * B.v; how = '笔数×单笔$' + fmtBig(B.v) + (B.anchored ? '·锚定' : '·粗代理');
+      }
+      if (!tot || !dom || !dailyUsd) return { z: 0, note: '—' };
       const btcMcap = tot * dom / 100;                 // BTC 市值（实时）
-      const dailyUsd = ntx * A.v;                      // 链上日结算额（代理）
       const nvt = btcMcap / dailyUsd;
       const z = clampZ((nvt - 75) / 30);               // 锚定正常带：NVT≈75，σ≈30
-      return { z, note: 'NVT ' + nvt.toFixed(0) + ' · 市值实时 / 链上额(' + fmtBig(ntx) + '笔×$' + fmtBig(A.v) + (A.anchored ? '锚定' + A.asof : '默认') + ')' };
+      return { z, note: 'NVT ' + nvt.toFixed(0) + ' · BTC市值实时 / ' + how + ' · 链上额 $' + fmtBig(dailyUsd) };
+    } },
+  /* —— v3.33 新增实时因子（全部走已有白名单源，真·实时；不是估值标尺，参与评分）—— */
+  { id: 'credit', name: '💳 信用利差', group: 'macro', w: 0.9, dir: 1, calc: () => {
+      const v = mV('CREDIT'); if (v == null || mLen('CREDIT') < 60) return { z: 0, ok: false, note: '无数据' };
+      /* HYG/LQD 上行 = 高收益债跑赢投资级 = 利差收窄 = 风险偏好回升 */
+      return { z: mChgZ('CREDIT', 30), note: 'HYG/LQD ' + v.toFixed(3) + ' · 30日动能 · 上行=利差收窄 · 市场侧代理' };
+    } },
+  { id: 'real', name: '📐 实际利率', group: 'policy', w: 1.0, dir: -1, calc: () => {
+      const v = mV('REAL10Y'); if (v == null || mLen('REAL10Y') < 60) return { z: 0, ok: false, note: '无数据' };
+      return { z: mZ('REAL10Y', 120), note: v.toFixed(2) + '% · 10Y实际收益率(财政署TIPS实时) · 实际利率升=折现压力' };
+    } },
+  { id: 'em', name: '🌏 新兴市场强弱', group: 'macro', w: 0.6, dir: 1, calc: () => {
+      const v = mV('EMRS'); if (v == null || mLen('EMRS') < 60) return { z: 0, ok: false, note: '无数据' };
+      return { z: mChgZ('EMRS', 60), note: 'EEM/SPX ' + v.toFixed(4) + ' · 60日动能 · 上行=资金流向风险资产' };
+    } },
+  /* 全球流动性：**只展示、不参与评分**（dir=0）。原因是它本质上是下面几个已评分因子的
+   * 合成，再计一次就是重复计数。央行侧（Fed）已有独立估值因子 fedbs；ECB / BOJ 的资产
+   * 负债表权威源在 CF 边缘实测均不可达（504 / 530 / 404），所以这里**不冒充全球口径**。 */
+  { id: 'gliq', name: '🌊 全球流动性(代理)', group: 'macro', w: 0, dir: 0, calc: () => {
+      const zs = [];
+      if (mV('CREDIT') != null && mLen('CREDIT') >= 60) zs.push(mChgZ('CREDIT', 30));
+      if (mV('EMRS') != null && mLen('EMRS') >= 60) zs.push(mChgZ('EMRS', 60));
+      if (mV('DXY') != null) zs.push(-mZ('DXY', 120));
+      if (mV('VIX') != null) zs.push(-mZ('VIX', 120));
+      if (!zs.length) return { z: 0, ok: false, note: '无数据' };
+      const g = zs.reduce(function (a, b) { return a + b; }, 0) / zs.length;
+      return { z: g, note: '合成 ' + (g >= 0 ? '+' : '') + g.toFixed(2) + ' · 信用+新兴市场+美元反向+VIX反向 · 央行侧仅Fed(ECB/BOJ源CF不可达) · 只展示' };
     } },
 ];
 
@@ -987,6 +1038,8 @@ const SCENARIOS = [
   { id: 'risk_on',    name: '风险偏好回暖', desc: '标普 +1.5σ + 油价回升',      shocks: [{ k: 'SPX', toZ: 1.5 }, { k: 'OIL', toZ: 1.2 }] },
   { id: 'safe_haven', name: '避险扩散',     desc: '美元走强 + 金价避险',        shocks: [{ k: 'DXY', toZ: 1.5 }, { k: 'GOLD', toZ: 1.0 }] },
   { id: 'yen_carry',  name: '日元套息平仓', desc: '美元/日元急升（日元升值）',  shocks: [{ k: 'USDJPY', toZ: 1.8 }] },
+  /* v3.33 自定义：冲击键 + 强度都由使用者自己指定（shocks 走 state.scenarioCustom） */
+  { id: 'custom',     name: '自定义冲击',   desc: '自选资产 + 自定冲击强度',      shocks: [] },
 ];
 /* 护栏风险-off 驱动键：被冲击/传导上行→护栏趋向 RED（值=+1 表示「上行=风险-off」） */
 const SCN_GUARD = { VIX: 1, US10Y: 1, DXY: 1, OIL: 1, USDJPY: 1, BEI10: 1, T10Y2Y: -1, GOLD: -1, SPX: -1 };
@@ -1013,11 +1066,47 @@ function scenarioPropagate(A, scenario) {
   rows.forEach(function (rw) { const g = SCN_GUARD[rw.k]; if (g != null) guard += g * rw.dz; });
   return { rows: rows, guard: guard, dom: sh.map(function (s) { return s.k; }).join('+'), missing: [] };
 }
+/* v3.33 自定义情景：冲击键 + 强度由使用者指定，其余传导逻辑与内置情景完全一致
+ * （同一个 scenarioPropagate —— 自定义只是换了「种子冲击」，没有换模型）。 */
+function scnCustomScenario() {
+  if (!state.scenarioCustom) state.scenarioCustom = [{ k: 'BTC', toZ: -2 }];
+  const parts = state.scenarioCustom.map(function (s) {
+    return ((META[s.k] && META[s.k].name) || s.k) + ' → ' + (s.toZ >= 0 ? '+' : '') + s.toZ.toFixed(1) + 'σ';
+  });
+  return { id: 'custom', name: '自定义冲击', desc: parts.join('；') || '未设置冲击', shocks: state.scenarioCustom.slice() };
+}
+function scnAssetOptions() {
+  const A = corrAnalyzed();
+  const keys = (A && A.keys && A.keys.length) ? A.keys : Object.keys(META);
+  return keys.map(function (k) { return '<option value="' + k + '">' + ((META[k] && META[k].name) || k) + '</option>'; }).join('');
+}
+function renderCustomShocks() {
+  const box = $('scnList'); if (!box) return;
+  const list = state.scenarioCustom || [];
+  box.innerHTML = list.length ? list.map(function (s, i) {
+    const nm = (META[s.k] && META[s.k].name) || s.k;
+    return '<span class="ttab scn-chip" data-i="' + i + '" title="点击移除该冲击" style="cursor:pointer">' + nm + ' ' + (s.toZ >= 0 ? '+' : '') + s.toZ.toFixed(1) + 'σ ✕</span>';
+  }).join('') : '<span style="color:#6b8299;font-size:11px">未设置冲击 —— 选资产、拖强度、点「添加」</span>';
+  Array.prototype.forEach.call(box.querySelectorAll('.scn-chip'), function (el) {
+    el.addEventListener('click', function () {
+      state.scenarioCustom.splice(parseInt(el.getAttribute('data-i'), 10), 1);
+      renderCustomShocks(); renderScenario('custom');
+    });
+  });
+}
+function toggleCustomPanel(id) {
+  const p = $('scnCustom'); if (!p) return;
+  p.style.display = (id === 'custom') ? 'block' : 'none';
+  if (id !== 'custom') return;
+  const sel = $('scnAsset'); if (sel && !sel.options.length) sel.innerHTML = scnAssetOptions();
+  renderCustomShocks();
+}
 function renderScenario(id) {
   const box = $('scenarioBox'); if (!box) return;
-  const scn = SCENARIOS.filter(function (s) { return s.id === id; })[0] || SCENARIOS[0];
+  const scn = (id === 'custom') ? scnCustomScenario() : (SCENARIOS.filter(function (s) { return s.id === id; })[0] || SCENARIOS[0]);
   const A = corrAnalyzed();
   if (!A || !A.keys || !A.keys.length) { box.innerHTML = '<div class="rg-sub">相关系数未就绪（需先加载宇宙数据）。</div>'; return; }
+  if (!scn.shocks.length) { box.innerHTML = '<div class="rg-sub">自定义冲击：还没设置任何冲击 —— 在下方选资产、拖强度、点「添加」。</div>'; return; }
   const res = scenarioPropagate(A, scn);
   if (!res.rows.length) { box.innerHTML = '<div class="rg-sub">该情景的冲击键不在当前宇宙（' + (res.missing || []).join('/') + '），无法传导。</div>'; return; }
   const top = res.rows.slice(0, 12);
@@ -3558,8 +3647,27 @@ function bindUI() {
     document.querySelectorAll('.scn-btn').forEach(x => x.classList.remove('on'));
     b.classList.add('on');
     state.scenarioSel = b.getAttribute('data-scn');
-    try { renderScenario(state.scenarioSel); } catch (e) { console.warn('scn click fail', e && e.message); }
+    try { toggleCustomPanel(state.scenarioSel); renderScenario(state.scenarioSel); } catch (e) { console.warn('scn click fail', e && e.message); }
   }));
+  /* v3.33 自定义冲击控件：选资产 → 拖强度 → 添加（可叠加多个冲击，点标签移除） */
+  const scnZ = $('scnZ'), scnZv = $('scnZVal'), scnAdd = $('scnAddBtn'), scnAs = $('scnAsset');
+  if (scnZ && scnZv) scnZ.addEventListener('input', () => {
+    const v = parseFloat(scnZ.value);
+    scnZv.textContent = (v >= 0 ? '+' : '') + v.toFixed(1) + 'σ';
+  });
+  if (scnAdd && scnAs && scnZ) scnAdd.addEventListener('click', () => {
+    const k = scnAs.value, v = parseFloat(scnZ.value);
+    if (!k || !isFinite(v)) return;
+    if (!state.scenarioCustom) state.scenarioCustom = [];
+    const ex = state.scenarioCustom.filter(function (x) { return x.k === k; })[0];
+    if (ex) ex.toZ = v; else state.scenarioCustom.push({ k: k, toZ: v });
+    renderCustomShocks(); renderScenario('custom');
+  });
+  const scnClr = $('scnClearBtn');
+  if (scnClr) scnClr.addEventListener('click', () => {
+    state.scenarioCustom = []; renderCustomShocks(); renderScenario('custom');
+  });
+  if (state.scenarioSel === 'custom') toggleCustomPanel('custom');
 }
 
 /* =====================================================================

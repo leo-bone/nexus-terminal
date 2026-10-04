@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Nexus Terminal · 加密货币因子关系终端 v3.32</title>
+<title>Nexus Terminal · 加密货币因子关系终端 v3.33</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -308,7 +308,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
   <div class="header">
     <div class="logo">NEXUS <em>TERMINAL</em></div>
     <div class="tagline">CRYPTO FACTOR TERMINAL</div>
-    <div class="live-badge"><span class="live-dot"></span> LIVE · v3.32</div>
+    <div class="live-badge"><span class="live-dot"></span> LIVE · v3.33</div>
     <div class="hdr-right">
       <span class="net-lbl">数据源</span><span id="netDot" class="net-dot"></span>
       <span id="lastUpd" class="last-upd">—</span>
@@ -541,15 +541,27 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
       <button class="ttab scn-btn" data-scn="risk_on">风险偏好回暖</button>
       <button class="ttab scn-btn" data-scn="safe_haven">避险扩散</button>
       <button class="ttab scn-btn" data-scn="yen_carry">日元套息平仓</button>
+      <button class="ttab scn-btn" data-scn="custom">自定义冲击</button>
     </div>
     <div id="scenarioBox" class="scn-box" style="padding:0 14px 12px"></div>
+    <div id="scnCustom" style="display:none;padding:0 14px 12px">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <select id="scnAsset" class="ttab" style="background:#0d1626;color:#c8d6e5;border:1px solid #1b2a3f;border-radius:4px;padding:3px 6px;font-size:12px"></select>
+        <input id="scnZ" type="range" min="-3" max="3" step="0.1" value="-2" style="width:150px;accent-color:#00b4ff">
+        <span id="scnZVal" style="font-size:12px;color:#00b4ff;min-width:46px">-2.0σ</span>
+        <button id="scnAddBtn" class="refresh-btn">添加冲击</button>
+        <button id="scnClearBtn" class="refresh-btn">清空</button>
+      </div>
+      <div id="scnList" style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap"></div>
+      <div class="rg-sub" style="border-top:none;margin-top:4px;padding:0">自定义与内置情景用的是<b>同一个传导模型</b>（跨资产日收益相关性线性传播），只是换了「种子冲击」。可叠加多个资产同时冲击，点标签移除。仍是<b>确定性推演，不是概率预测</b>。</div>
+    </div>
   </div>
 
   <div class="panel">
     <div class="phdr"><span class="icon">💎</span><span class="lbl">估值因子 · 价值维度（v3.31）</span><span class="hint">慢变量锚定 + 快变量实时 · 不进实时评分</span></div>
     <div id="valueGrid" class="fgrid"></div>
     <div id="truthStat" class="rg-sub" style="border-top:none;margin-top:2px;padding:0 14px 4px">宏观真值：加载中…</div>
-    <div class="rg-sub" style="border-top:none;margin-top:2px;padding:0 14px 12px">ERP / 实际金价 / 美联储表 / BTC链上估值。<b>v3.32 起慢变量已接真源</b>：美联储总资产走 Fed H.4.1 官方报表（CF 边缘实测可达，周频<b>自动实时</b>），定基 CPI 走 FRED CPIAUCSL（CF 边缘不可达 → 由 <code>tools/refresh_truths.py</code> 从本机拉取，带观测期）；尚未接真源的（远期P/E、链上美元结算额）仍走默认值，备注如实标「默认」。快变量（10Y、金价、市值、链上笔数）始终实时。</div>
+    <div class="rg-sub" style="border-top:none;margin-top:2px;padding:0 14px 12px">ERP / 实际金价 / 美联储表 / BTC链上估值。<b>v3.32 起慢变量已接真源</b>：美联储总资产走 Fed H.4.1 官方报表（CF 边缘实测可达，周频<b>自动实时</b>），定基 CPI 走 FRED CPIAUCSL（CF 边缘不可达 → 由 <code>tools/refresh_truths.py</code> 从本机拉取，带观测期）；v3.33 起<b>全部四个慢变量都已接真源</b>：链上美元结算额走 blockchain.info（日频<b>实时</b>，30 日均），盈利收益率走 multpl（月频，<b>TTM 口径非远期</b>，备注如实标明）。快变量（10Y、金价、市值、链上笔数）始终实时。</div>
   </div>
 
   <div class="panel">
@@ -658,7 +670,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
   </div>
 
   <div class="footer">
-    NEXUS TERMINAL v3.32 · 32 维实时评分 + 167 维因子宇宙（全球股指 / 板块 / 利率 / 信用 / 外汇 / 商品 / 波动率 / 加密概念股 / 山寨币 / 科技股，全部 Yahoo 真实日频）· 影响强度由 IC / ICIR / BH-FDR / 样本外漂移统一裁定 · ㉜ 分类合成（4 种挑选规则 × K 敏感性 × 留一法 × 剔除 BTC 自身的增量检验）· 风险监测全口径（10 类 + 变化率 σ）报状态不报方向 · v3.27 真正样本外追踪（walk-forward 多折，最后一折锚定最近两年）· ㉞ 风险护栏（三联警报：DVOL 体制 + 全分类极端分位联动 + 变化率联动 → GREEN/YELLOW/RED）· ㉟ 风险监测历史崩溃对照（vsCrash：相对 2020 COVID / 2022 熊市峰值的偏离比，给护栏分量②的「极端」阈值做历史锚点）· ㊱ 护栏 RED 通知（进入 RED 时经数据 Worker 转发到群机器人 Webhook，带外提醒，不必 24h 盯盘；默认关闭，需主动开启）· 数据源: Bybit / CoinLore / DefiLlama / blockchain.info / alternative.me / mempool.space / CoinMetrics / Yahoo Finance / NY Fed / U.S. Treasury / Japan MOF / Forex Factory<br>
+    NEXUS TERMINAL v3.33 · 36 维实时评分 + 167 维因子宇宙（全球股指 / 板块 / 利率 / 信用 / 外汇 / 商品 / 波动率 / 加密概念股 / 山寨币 / 科技股，全部 Yahoo 真实日频）· 影响强度由 IC / ICIR / BH-FDR / 样本外漂移统一裁定 · ㉜ 分类合成（4 种挑选规则 × K 敏感性 × 留一法 × 剔除 BTC 自身的增量检验）· 风险监测全口径（10 类 + 变化率 σ）报状态不报方向 · v3.27 真正样本外追踪（walk-forward 多折，最后一折锚定最近两年）· ㉞ 风险护栏（三联警报：DVOL 体制 + 全分类极端分位联动 + 变化率联动 → GREEN/YELLOW/RED）· ㉟ 风险监测历史崩溃对照（vsCrash：相对 2020 COVID / 2022 熊市峰值的偏离比，给护栏分量②的「极端」阈值做历史锚点）· ㊱ 护栏 RED 通知（进入 RED 时经数据 Worker 转发到群机器人 Webhook，带外提醒，不必 24h 盯盘；默认关闭，需主动开启）· 数据源: Bybit / CoinLore / DefiLlama / blockchain.info / alternative.me / mempool.space / CoinMetrics / Yahoo Finance / NY Fed / U.S. Treasury / Japan MOF / Forex Factory<br>
     仅供研究与教育，不构成投资建议。加密资产风险极高，请独立判断。
   </div>
 </div>
