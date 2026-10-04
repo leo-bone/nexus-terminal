@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Nexus Terminal · 加密货币因子关系终端 v3.33</title>
+<title>Nexus Terminal · 加密货币因子关系终端 v3.34</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -21,6 +21,31 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
 .net-lbl{font-size:10px;color:var(--dim)}.last-upd{font-size:11px;color:var(--dim)}
 .refresh-btn{background:rgba(0,180,255,.08);border:1px solid rgba(0,180,255,.25);color:var(--blue);padding:4px 12px;border-radius:6px;font-size:11px;font-weight:700;cursor:pointer}
 .refresh-btn:hover{background:rgba(0,180,255,.18)}
+/* v3.34 提醒中心抽屉 */
+.al-mask{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:880;display:none}
+.al-mask.on{display:block}
+.al-drawer{position:fixed;top:0;right:0;width:430px;max-width:94vw;height:100vh;background:rgba(6,12,24,.985);border-left:1px solid var(--border2);z-index:890;overflow-y:auto;transform:translateX(102%);transition:transform .22s ease;padding:14px 16px 30px;box-shadow:-10px 0 34px rgba(0,0,0,.55)}
+.al-drawer.on{transform:translateX(0)}
+.al-hd{display:flex;align-items:center;gap:8px;margin-bottom:11px}
+.al-hd .t{font-size:13px;font-weight:700;color:var(--text4);flex:1}
+.al-x{background:transparent;border:1px solid var(--border2);color:var(--text2);border-radius:6px;padding:2px 9px;cursor:pointer;font-size:10px;font-family:inherit}
+.al-x:hover{border-color:var(--blue);color:var(--blue)}
+.al-card{background:var(--bg1);border:1px solid var(--border);border-radius:8px;padding:11px 12px;margin-bottom:9px}
+.al-ttl{font-size:11px;font-weight:700;color:var(--text2);margin-bottom:7px;letter-spacing:.4px}
+.al-line{display:flex;justify-content:space-between;gap:10px;padding:3px 0;font-size:11px;color:var(--text);font-family:'JetBrains Mono',monospace}
+.al-line b{color:var(--text3);font-weight:600}
+.al-dim{font-size:11px;color:var(--dim);line-height:1.6}
+.al-note{font-size:10px;color:var(--dim);line-height:1.6;margin-top:8px;border-top:1px dashed var(--border);padding-top:7px}
+.al-note b{color:var(--text2)}
+.al-sw{display:flex;align-items:center;justify-content:space-between;padding:4px 0;font-size:11px;color:var(--text2)}
+.al-log{max-height:300px;overflow-y:auto;margin-top:2px}
+.al-item{border-left:2px solid var(--border2);padding:5px 0 5px 9px;margin-bottom:7px}
+.al-item.lv2{border-left-color:var(--red)}
+.al-item.lv1{border-left-color:var(--yellow)}
+.al-item.lv0{border-left-color:var(--blue)}
+.al-it{font-size:9px;color:var(--dim);font-family:'JetBrains Mono',monospace;letter-spacing:.3px}
+.al-ib{font-size:10.5px;color:var(--text2);line-height:1.55;white-space:pre-wrap;margin-top:2px;font-family:'JetBrains Mono',monospace}
+
 .ticker-strip{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin-bottom:10px}
 .ticker{background:var(--bg1);border:1px solid var(--border);border-radius:8px;padding:11px 14px;transition:border-color .2s,box-shadow .2s}
 .ticker:hover{border-color:var(--border2);box-shadow:0 0 16px rgba(0,180,255,.08)}
@@ -308,13 +333,14 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
   <div class="header">
     <div class="logo">NEXUS <em>TERMINAL</em></div>
     <div class="tagline">CRYPTO FACTOR TERMINAL</div>
-    <div class="live-badge"><span class="live-dot"></span> LIVE · v3.33</div>
+    <div class="live-badge"><span class="live-dot"></span> LIVE · v3.34</div>
     <div class="hdr-right">
       <span class="net-lbl">数据源</span><span id="netDot" class="net-dot"></span>
       <span id="lastUpd" class="last-upd">—</span>
       <button id="refreshBtn" class="refresh-btn">⟳ 刷新</button>
-      <label class="notify-toggle" style="display:inline-flex;align-items:center;gap:4px;font-size:12px;color:#9fb3c8;cursor:pointer;margin-left:8px"><input type="checkbox" id="notifyChk" style="cursor:pointer"> 🔔 RED 通知</label>
-      <button id="notifyTestBtn" class="refresh-btn" style="margin-left:6px" title="发一条测试消息到群机器人，验证 Webhook 是否配置成功">🔔 测试</button>
+      <label class="notify-toggle" style="display:inline-flex;align-items:center;gap:4px;font-size:12px;color:#9fb3c8;cursor:pointer;margin-left:8px" title="护栏进入 RED 时本地提醒：桌面通知 + 提示音 + 标题闪烁 + 告警时间轴。零配置、不出本机"><input type="checkbox" id="notifyChk" style="cursor:pointer"> 🔔 RED 提醒</label>
+      <button id="notifyTestBtn" class="refresh-btn" style="margin-left:6px" title="立刻发一条本地提醒，验证桌面通知/提示音/标题闪烁是否可用">🔔 测试</button>
+      <button id="alertLogBtn" class="refresh-btn" style="margin-left:6px" title="提醒中心：上次看到 vs 现在 + 告警时间轴 + 提醒设置">📋 提醒中心</button>
       <span id="notifyStat" style="font-size:11px;color:#6b8299;margin-left:6px"></span>
     </div>
   </div>
@@ -670,10 +696,14 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
   </div>
 
   <div class="footer">
-    NEXUS TERMINAL v3.33 · 36 维实时评分 + 167 维因子宇宙（全球股指 / 板块 / 利率 / 信用 / 外汇 / 商品 / 波动率 / 加密概念股 / 山寨币 / 科技股，全部 Yahoo 真实日频）· 影响强度由 IC / ICIR / BH-FDR / 样本外漂移统一裁定 · ㉜ 分类合成（4 种挑选规则 × K 敏感性 × 留一法 × 剔除 BTC 自身的增量检验）· 风险监测全口径（10 类 + 变化率 σ）报状态不报方向 · v3.27 真正样本外追踪（walk-forward 多折，最后一折锚定最近两年）· ㉞ 风险护栏（三联警报：DVOL 体制 + 全分类极端分位联动 + 变化率联动 → GREEN/YELLOW/RED）· ㉟ 风险监测历史崩溃对照（vsCrash：相对 2020 COVID / 2022 熊市峰值的偏离比，给护栏分量②的「极端」阈值做历史锚点）· ㊱ 护栏 RED 通知（进入 RED 时经数据 Worker 转发到群机器人 Webhook，带外提醒，不必 24h 盯盘；默认关闭，需主动开启）· 数据源: Bybit / CoinLore / DefiLlama / blockchain.info / alternative.me / mempool.space / CoinMetrics / Yahoo Finance / NY Fed / U.S. Treasury / Japan MOF / Forex Factory<br>
+    NEXUS TERMINAL v3.34 · 36 维实时评分 + 167 维因子宇宙（全球股指 / 板块 / 利率 / 信用 / 外汇 / 商品 / 波动率 / 加密概念股 / 山寨币 / 科技股，全部 Yahoo 真实日频）· 影响强度由 IC / ICIR / BH-FDR / 样本外漂移统一裁定 · ㉜ 分类合成（4 种挑选规则 × K 敏感性 × 留一法 × 剔除 BTC 自身的增量检验）· 风险监测全口径（10 类 + 变化率 σ）报状态不报方向 · v3.27 真正样本外追踪（walk-forward 多折，最后一折锚定最近两年）· ㉞ 风险护栏（三联警报：DVOL 体制 + 全分类极端分位联动 + 变化率联动 → GREEN/YELLOW/RED）· ㉟ 风险监测历史崩溃对照（vsCrash：相对 2020 COVID / 2022 熊市峰值的偏离比，给护栏分量②的「极端」阈值做历史锚点）· ㊱ 本地提醒中心（进入 RED 时四重本地提醒：桌面通知 + 提示音 + 标题闪烁 + 告警时间轴，零配置、零外部账号、告警不出本机；默认关闭，需主动开启）· 数据源: Bybit / CoinLore / DefiLlama / blockchain.info / alternative.me / mempool.space / CoinMetrics / Yahoo Finance / NY Fed / U.S. Treasury / Japan MOF / Forex Factory<br>
     仅供研究与教育，不构成投资建议。加密资产风险极高，请独立判断。
   </div>
 </div>
+
+<div id="alertMask" class="al-mask"></div>
+<div id="alertDrawer" class="al-drawer"></div>
+
 <script src="app.js"></script>
 </body>
 </html>
