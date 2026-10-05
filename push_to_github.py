@@ -109,12 +109,16 @@ try:
     _first = _txt.splitlines()[0].strip()
     if _first.startswith("# "):
         VERSION = _first[2:].strip()
-    # 取**最后一个**「## vX.Y 变更」章节（= 最新版；README 越新版本越靠前，但用 findall
-    # 取末位更稳：旧版 re.search(最靠前) 会把 commit message 写成 v3.35 这种过时描述）。
-    _secs = re.findall(r"^##\s+(v[\d.]+\s*变更[^\n]*)\n(.*?)(?=^##\s|\Z)", _txt, re.S | re.M)
+    # 取**版本号数值最大**的「## vX.Y 变更」章节。
+    # README 的章节顺序并非严格按版本降序（v3.12 混在 v3.26/v3.25 之间，v3.40 排在 v3.38 之后），
+    # 所以「取最前」会拿到 v3.35、「取末位」会拿到 v3.3 —— 都错，必须按版本号数值比大小。
+    def _vkey(h):
+        m = re.match(r"v(\d+)\.(\d+)", h)
+        return (int(m.group(1)), int(m.group(2))) if m else (-1, -1)
+    _secs = [(h, b) for h, b in re.findall(r"^##\s+(v[\d.]+\s*变更[^\n]*)\n(.*?)(?=^##\s|\Z)", _txt, re.S | re.M)]
     if _secs:
-        VER_H, body = _secs[-1]
-        VERSION = VER_H.split("变更")[0].strip()
+        VER_H, body = max(_secs, key=lambda t: _vkey(t[0]))
+        VERSION = re.match(r"v[\d.]+", VER_H).group(0)
         for _l in body.splitlines():
             _l = _l.strip()
             if not _l:
