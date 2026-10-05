@@ -109,10 +109,13 @@ try:
     _first = _txt.splitlines()[0].strip()
     if _first.startswith("# "):
         VERSION = _first[2:].strip()
-    # 取最靠前的「## vX.Y 变更」章节里的第一条要点
-    _m = re.search(r"^##\s+v[\d.]+\s*变更[^\n]*\n(.*?)(?=^##\s|\Z)", _txt, re.S | re.M)
-    if _m:
-        for _l in _m.group(1).splitlines():
+    # 取**最后一个**「## vX.Y 变更」章节（= 最新版；README 越新版本越靠前，但用 findall
+    # 取末位更稳：旧版 re.search(最靠前) 会把 commit message 写成 v3.35 这种过时描述）。
+    _secs = re.findall(r"^##\s+(v[\d.]+\s*变更[^\n]*)\n(.*?)(?=^##\s|\Z)", _txt, re.S | re.M)
+    if _secs:
+        VER_H, body = _secs[-1]
+        VERSION = VER_H.split("变更")[0].strip()
+        for _l in body.splitlines():
             _l = _l.strip()
             if not _l:
                 continue
