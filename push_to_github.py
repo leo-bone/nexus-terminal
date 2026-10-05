@@ -61,13 +61,16 @@ SKIP = {".DS_Store"}
 files = []
 for dp, dns, fns in os.walk(ROOT):
     rel_dp = os.path.relpath(dp, ROOT)
-    dns[:] = [d for d in dns if d not in (".workbuddy", ".git", "node_modules", ".wrangler", "archive")]
+    dns[:] = [d for d in dns if d not in (".workbuddy", ".git", "node_modules", ".wrangler", "archive", "__pycache__")]
     for fn in fns:
         if fn in SKIP:
             continue
+        # 排除 Python 字节码/缓存（py_compile 等产生，纯属构建残留）
+        if fn.endswith((".pyc", ".pyo")):
+            continue
         full = os.path.join(dp, fn)
         rel = os.path.relpath(full, ROOT).replace(os.sep, "/")
-        if rel.startswith(".git/"):
+        if rel.startswith(".git/") or rel.startswith("__pycache__/"):
             continue
         files.append((rel, full))
 files.sort()
