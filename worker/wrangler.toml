@@ -7,3 +7,13 @@ account_id = "72450e08e207045ce0dc313447dcb5e3"
 routes = [
   { pattern = "nexus-api.uichain.org", custom_domain = true }
 ]
+
+# KV 绑定（离线告警存储 + FRED 缓存）：scheduled/alerts 离线护栏依赖此绑定。
+# 未绑定 NEXUS_KV 时自动降级，不影响现有接口。
+kv_namespaces = [
+  { binding = "NEXUS_KV", id = "5fa9ecc66f5c49f1bcef11587be59848" }
+]
+
+# 定时触发：每 30 分钟跑一次 scheduled()（CF 边缘若可达 FRED/交易所则写入 KV，不可达则静默跳过）
+[triggers]
+crons = ["*/30 * * * *"]

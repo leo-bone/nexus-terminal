@@ -885,6 +885,38 @@ async function fetchOIHist() {
   return { ts: rows.map(x => x.t), closes: rows.map(x => x.c) };
 }
 
+/* v3.40 BTC 现货价格日线（真实价格，供 crypto 哨兵算「回撤/动量」）。
+ * 关键教训：不能用 premium-index-price-kline —— 实测其 open/close 是**溢价基差**
+ *   （量级 ~1e-4、1000 根里 862 根为负，在 0 上下震荡）。在基差上算回撤会得到
+ *   3188% 之类的假值 + 假 RED，且真实暴跌时反而算不出（漏报）。正确源 = 现货 kline close（~6-8 万 USD）。
+ * 长缓存 6h / 失败 30min 冷却（同 bybitHistWithCache 模式）。 */
+const BYBIT_SPOT_KEY = 'https://nexus-cache.internal/bybit-spot-btc-v2';
+async function bybitSpotWithCache() {
+  const cache = caches.default, key = new Request(BYBIT_SPOT_KEY);
+  try { const hit = await cache.match(key); if (hit) { const j = await hit.json(); return j.failed ? null : j; } } catch (e) {}
+  try {
+    const r = await fetch('https://api.bybit.com/v5/market/kline?category=spot&symbol=BTCUSDT&interval=D&limit=200',
+      { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NexusTerminal/3.40)' } });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    if (d.retCode !== 0) throw new Error('bybit spot ' + d.retMsg);
+    const list = (d.result && d.result.list) || [];
+    /* 现货 kline 行 = [ts, open, high, low, close, volume, turnover] → 取 close(x[4])。
+     * 过滤非正/非有限（脏数据防御），按时间升序。 */
+    const rows = list.map(x => ({ t: +x[0], c: +x[4] }))
+      .filter(x => isFinite(x.t) && isFinite(x.c) && x.c > 0)
+      .sort((a, b) => a.t - b.t);
+    if (rows.length < 60) throw new Error('spot short: ' + rows.length);
+    const out = { ts: rows.map(x => x.t), closes: rows.map(x => x.c) };
+    await cache.put(key, new Response(JSON.stringify(out), { headers: { 'Cache-Control': 'public, max-age=21600' } }));
+    return out;
+  } catch (e) {
+    console.warn('bybit spot fail (cooldown 30min):', e && e.message);
+    await cache.put(key, new Response(JSON.stringify({ failed: true, err: e.message, t: Date.now() }), { headers: { 'Cache-Control': 'public, max-age=1800' } }));
+    return null;
+  }
+}
+
 /* ---------- v3.12: Deribit 期权原生指标（crypto 恐惧温度计）----------
  * 本地沙箱出口受限，Deribit 必须由 CF Worker 抓取（与 Yahoo/Bybit 同路径）。
  *   DVOL  Deribit 波动率指数（VIX 同款，隐含波动率预期），日频，~2020 起
@@ -1508,26 +1540,91 @@ export default {
 
     /* v3.32 宏观真值：一次拿全 WALCL(H.4.1实时) + 5 个 FRED 系列(线上尝试→兜底) */
     if (url.pathname === '/api/truths') {
+      /* v3.35 增强（部署就绪）：scheduled() 若成功从 FRED 拉到值会写入 KV(fred-live)。
+       * 这里优先用 KV 缓存（仅当比嵌入兜底更新时才采用），避免每次请求都浪费一次 CF 520 往返。
+       * KV 未绑定时 fredLiveCache 为 null，useKv 为 false —— 行为与改造前完全一致。 */
+      const kv = env && env.NEXUS_KV;
+      let fredLiveCache = null;
+      if (kv) { try { fredLiveCache = await kv.get('fred-live', { type: 'json' }); } catch (e) {} }
+      const useKv = !!(fredLiveCache && fredLiveCache.generatedOn && fredLiveCache.generatedOn > FALLBACK_GENERATED_ON);
       const out = {}; const errs = {};
       try { out.WALCL = await fetchFedH41(); out.WALCL.live = true; } catch (e) { errs.WALCL = e.message; }
       /* v3.33：这两个源在 CF 边缘实测 200（与 FRED 的 520 不同），直接取真值 */
       try { out.ONCHAIN_USD = await fetchOnChainUsd(); out.ONCHAIN_USD.live = true; } catch (e) { errs.ONCHAIN_USD = e.message; }
       try { out.SPX_EY = await fetchMultplEY(); out.SPX_EY.live = true; } catch (e) { errs.SPX_EY = e.message; }
       const ids = ['UNRATE', 'CPIAUCSL', 'PAYEMS', 'ICSA', 'PCEPILFE'];
-      const live = await fredReachable();
-      await Promise.all(ids.map(async function (id) {
-        if (live) {
-          try {
-            const r = await fetchFred(id, 3);
-            if (r.v != null) { out[id] = { asof: r.asof, v: r.v, prev: r.prev, src: 'FRED实时', live: true }; return; }
-          } catch (e) { errs[id] = e.message; }
-        }
-        const f = FRED_FALLBACK[id];
-        if (f) out[id] = { asof: f.asof, v: f.v, prev: f.prev, src: 'FRED兜底(CF不可达)', live: false };
-        else errs[id] = 'no fallback';
-      }));
-      return jsonResp({ ok: Object.keys(out).length > 0, fredLive: live, fallbackGeneratedOn: FALLBACK_GENERATED_ON, series: out, errors: errs, ts: Date.now() }, 200,
+      let live = false;
+      if (useKv) {
+        ids.forEach(function (id) {
+          const r = fredLiveCache.series[id];
+          if (r) out[id] = { asof: r.asof, v: r.v, prev: r.prev, src: 'FRED实时(KV缓存)', live: true };
+        });
+        live = true;
+      } else {
+        live = await fredReachable();
+        await Promise.all(ids.map(async function (id) {
+          if (live) {
+            try {
+              const r = await fetchFred(id, 3);
+              if (r.v != null) { out[id] = { asof: r.asof, v: r.v, prev: r.prev, src: 'FRED实时', live: true }; return; }
+            } catch (e) { errs[id] = e.message; }
+          }
+          const f = FRED_FALLBACK[id];
+          if (f) out[id] = { asof: f.asof, v: f.v, prev: f.prev, src: 'FRED兜底(CF不可达)', live: false };
+          else errs[id] = 'no fallback';
+        }));
+      }
+      return jsonResp({ ok: Object.keys(out).length > 0, fredLive: live, fredLiveCache: !!useKv, fallbackGeneratedOn: FALLBACK_GENERATED_ON, series: out, errors: errs, ts: Date.now() }, 200,
         { 'Cache-Control': 'public, max-age=1800' });
+    }
+
+    /* v3.35 增强（部署就绪）：跨会话告警存储 —— 前端检测到 RED 护栏时 POST 事件，Worker 持久化到 KV；
+     * 用户重开页面时 GET 取回「离线期间漏看的 RED」。KV 未绑定时优雅降级 503，不影响其它接口。 */
+    if (url.pathname === '/api/alerts') {
+      const kv = env && env.NEXUS_KV;
+      if (!kv) return jsonResp({ ok: false, error: 'alerts store not configured (need NEXUS_KV binding)' }, 503);
+      if (request.method === 'GET') {
+        try {
+          const raw = (await kv.get('guardrail-alerts', { type: 'json' })) || [];
+          const since = url.searchParams.get('since');
+          const filt = since ? raw.filter(a => a.t > Number(since)) : raw;
+          return jsonResp({ ok: true, count: filt.length, alerts: filt }, 200, { 'Cache-Control': 'no-store' });
+        } catch (e) { return jsonResp({ ok: false, error: e.message }, 500); }
+      }
+      if (request.method === 'POST') {
+        try {
+          const body = await request.json().catch(function () { return {}; });
+          const text = String(body.text || '').slice(0, 2000);
+          if (!text) return jsonResp({ ok: false, error: 'empty text' }, 400);
+          const entry = { t: Date.now(), level: body.level || 'RED', text: text, src: body.src || 'client',
+            payload: (body.payload && typeof body.payload === 'object') ? body.payload : null };
+          const cur = ((await kv.get('guardrail-alerts', { type: 'json' })) || []);
+          cur.push(entry);
+          await kv.put('guardrail-alerts', JSON.stringify(cur.slice(-200)), { expirationTtl: 60 * 60 * 24 * 30 });
+          return jsonResp({ ok: true, stored: entry }, 200);
+        } catch (e) { return jsonResp({ ok: false, error: e.message }, 500); }
+      }
+      return new Response('method not allowed', { status: 405, headers: CORS });
+    }
+
+    /* v3.38 服务端哨兵快照：scheduled() 每 30 分钟写入 KV(guard-live)（宏观 + crypto 合并），
+     * 前端可拉取「服务端最近一次压力评估」，与本地护栏互补（本地关页即停，服务端仍跑）。 */
+    if (url.pathname === '/api/guard-live') {
+      const kv = env && env.NEXUS_KV;
+      if (!kv) return jsonResp({ ok: false, error: 'guard-live store not configured (need NEXUS_KV binding)' }, 503);
+      try {
+        const raw = await kv.get('guard-live', { type: 'json' });
+        const now = Date.now();
+        /* v3.39：按需兜底刷新 —— 快照为空或超 40 分钟（cron 抖动/边缘延迟）就现场算一份并缓存。
+         * 既保证哨兵「打开页面即有数据」，又能在 cron 偶发失败时兜底，不依赖单一触发路径。 */
+        const stale = !raw || typeof raw !== 'object' || !raw.ts || (now - raw.ts) > 40 * 60 * 1000;
+        if (stale) {
+          const built = await this.buildGuardSnapshot();
+          await kv.put('guard-live', JSON.stringify(built.guard), { expirationTtl: 60 * 60 * 24 * 60 });
+          return jsonResp({ ok: true, guard: built.guard, refreshed: true }, 200, { 'Cache-Control': 'no-store' });
+        }
+        return jsonResp({ ok: true, guard: raw }, 200, { 'Cache-Control': 'no-store' });
+      } catch (e) { return jsonResp({ ok: false, error: e.message }, 500); }
     }
 
     /* v3.30 护栏 RED 通知：前端把告警文本发到这里，Worker 转发到群机器人 Webhook。
@@ -1557,9 +1654,173 @@ export default {
     }
 
     if (url.pathname === '/' || url.pathname === '/health') {
-      return jsonResp({ name: 'nexus-proxy', version: '3.33', status: 'ok', source: 'yahoo+stooq+nyfed+treasury+mof+coinlore+finforexfactory+bitcoin-data+bybit+deribit+fred+proxy', universe: Object.keys(UNIVERSE).reduce(function(a,c){return a+Object.keys(UNIVERSE[c]).length;},0), symbols: Object.keys(SIMPLE).concat(['EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'JGB10Y', 'DVOL', 'DVHV']) });
+      return jsonResp({ name: 'nexus-proxy', version: '3.40', status: 'ok', source: 'yahoo+stooq+nyfed+treasury+mof+coinlore+finforexfactory+bitcoin-data+bybit+bybit-spot+deribit+fred+proxy', universe: Object.keys(UNIVERSE).reduce(function(a,c){return a+Object.keys(UNIVERSE[c]).length;},0), symbols: Object.keys(SIMPLE).concat(['EFFR', 'UST2Y', 'T10Y2Y', 'REAL10Y', 'BEI10', 'JGB10Y', 'DVOL', 'DVHV']) });
     }
 
     return new Response('Not Found', { status: 404, headers: CORS });
+  },
+
+  /* v3.37 服务端宏观压力哨兵（无人值守 · 宏观侧）：从 FRED 5 系列计算宏观压力，
+   * 与「关页面无关」地运行。crypto 侧 RED 仍依赖客户端（CF 边缘拉交易所可达性未验证），
+   * 故这里只覆盖宏观；RED 时写入 guardrail-alerts，实现「页面关闭期间」也能记录宏观压力。
+   * 纯函数，输入 FRED 系列 {v, prev}，输出 {status, score, drivers}；全部 guarded。 */
+  computeMacroSentinel(series) {
+    const g = (id) => series && series[id] ? series[id] : null;
+    const mom = (x) => { if (!x || !isFinite(x.v) || !isFinite(x.prev) || x.prev === 0) return null; return (x.v - x.prev) / Math.abs(x.prev); };
+    const drv = [];
+    let score = 0;
+    // 失业率上行 → 压力
+    const ur = mom(g('UNRATE')); if (ur != null) { const l = ur > 0.05 ? 2 : ur > 0.02 ? 1 : 0; score += l; if (l) drv.push({ id: 'UNRATE', level: l, note: '失业率 MoM ' + (ur * 100).toFixed(1) + '%' }); }
+    // CPI 同比近似（用 MoM 累计感）：月环比高 → 通胀压力
+    const cpi = mom(g('CPIAUCSL')); if (cpi != null) { const l = cpi > 0.005 ? 2 : cpi > 0.003 ? 1 : 0; score += l; if (l) drv.push({ id: 'CPIAUCSL', level: l, note: 'CPI MoM ' + (cpi * 100).toFixed(2) + '%' }); }
+    // 非农：新增就业为负 → 压力（单位千人）
+    const pay = g('PAYEMS'); if (pay && isFinite(pay.v) && isFinite(pay.prev)) { const d = pay.v - pay.prev; const l = d < 0 ? 2 : d < 50 ? 1 : 0; score += l; if (l) drv.push({ id: 'PAYEMS', level: l, note: '非农 ' + (d >= 0 ? '+' : '') + d.toFixed(0) + 'k' }); }
+    // 初请上行 → 压力
+    const icsa = mom(g('ICSA')); if (icsa != null) { const l = icsa > 0.10 ? 2 : icsa > 0.05 ? 1 : 0; score += l; if (l) drv.push({ id: 'ICSA', level: l, note: '初请 MoM ' + (icsa * 100).toFixed(1) + '%' }); }
+    // 核心 PCE 月环比高 → 通胀压力
+    const pce = mom(g('PCEPILFE')); if (pce != null) { const l = pce > 0.003 ? 2 : pce > 0.002 ? 1 : 0; score += l; if (l) drv.push({ id: 'PCEPILFE', level: l, note: '核心PCE MoM ' + (pce * 100).toFixed(2) + '%' }); }
+    const status = score >= 6 ? 2 : score >= 3 ? 1 : 0;
+    return { status, score, drivers: drv, asof: g('UNRATE') ? g('UNRATE').asof : null };
+  },
+
+  /* v3.38 服务端 crypto 哨兵（无人值守 · crypto 侧）：紧凑镜像前端护栏三分量
+   * （DVOL 体制 / 极端偏离 / 加速度），复用 worker 自有数据原语（deribitWithCache / bybitHistWithCache），
+   * 不搬运上千行客户端护栏（避免分叉风险，遵循 v3.30 纪律）。
+   * 纯函数，输入：dstat={z60,pctTrailing1y}(DVOL) / dvol10(DVOL近10日变化) /
+   *   btc={closes,ts}(**现货真实价格**序列) / dvolTs(DVOL时间戳)。返回 {status,drivers,...} 或 null。 */
+  computeCryptoSentinel(dstat, dvol10, btc, dvolTs) {
+    if (!dstat || !isFinite(dstat.z60) || !isFinite(dstat.pctTrailing1y)) return null;
+    const z60 = dstat.z60, pct = dstat.pctTrailing1y;
+    let volLv = 0;
+    if (z60 >= 2.0 || pct >= 0.93) volLv = 2;
+    else if (z60 >= 1.0 || pct >= 0.80) volLv = 1;
+    /* v3.40：BTC 回撤/动量一律用**现货真实价格** series（bybit spot kline close）。
+     *   旧版误用 premium-index（实为基差 ~1e-4、多数为负）算回撤 → 3188% 假值 + 假 RED，
+     *   且真实暴跌时反而算不出（漏报）。此处同时做非正/非有限值防御 + d 钳 [0,1]。 */
+    let extLv = 0, dd = 0, btc10 = 0;
+    const bc = (btc && btc.closes && btc.closes.length >= 30) ? btc.closes : null;
+    if (bc) {
+      const w = bc.slice(Math.max(0, bc.length - 60));
+      let peak = -Infinity, mdd = 0;
+      for (let i = 0; i < w.length; i++) {
+        const v = w[i];
+        if (!(isFinite(v) && v > 0)) continue;
+        if (v > peak) peak = v;
+        const d = (peak - v) / peak;
+        if (d > mdd) mdd = d;
+      }
+      dd = Math.min(1, Math.max(0, mdd));
+      if (dd >= 0.30) extLv = 2; else if (dd >= 0.18) extLv = 1;
+      if (bc.length >= 11) {
+        const a = bc[bc.length - 11], b = bc[bc.length - 1];
+        if (isFinite(a) && isFinite(b) && a > 0 && b > 0) btc10 = b / a - 1;
+      }
+    }
+    let accLv = 0;
+    if (dvol10 >= 0.25 || btc10 <= -0.18) accLv = 2;
+    else if (dvol10 >= 0.12 || btc10 <= -0.08) accLv = 1;
+    const status = Math.max(volLv, extLv, accLv);
+    const drivers = [];
+    if (volLv) drivers.push({ id: 'DVOL', level: volLv, note: '波动率体制 z60=' + z60.toFixed(2) + (volLv === 2 ? '(危)' : '(警)') });
+    if (extLv) drivers.push({ id: 'BTC_DD', level: extLv, note: 'BTC近端回撤 ' + (dd * 100).toFixed(0) + '%' + (extLv === 2 ? '(危)' : '(警)') });
+    if (accLv) drivers.push({ id: 'ACCEL', level: accLv, note: '加速度 dvol10=' + (dvol10 * 100).toFixed(0) + '%/btc10=' + (btc10 * 100).toFixed(0) + '%' + (accLv === 2 ? '(危)' : '(警)') });
+    const asof = dvolTs || (btc && btc.ts && btc.ts.length ? btc.ts[btc.ts.length - 1] : null);
+    return { status, score: status === 2 ? 10 : status === 1 ? 4 : 0, drivers, volLv, extLv, accLv, dvolZ60: z60, dvolPct: pct, btcDD: dd, dvol10, btc10, asof };
+  },
+
+  /* v3.40 crypto 哨兵异步包装——拉 deribit(DVOL) + bybit 现货(BTC 真实价格) 缓存，算三分量。
+   *   波动率体制来自 DVOL；回撤/动量来自**现货价格**（不再用 premium 基差，见 bybitSpotWithCache 注释）。
+   * 全部 guarded：任一源拉不到 → 返回 null，scheduled 静默跳过。 */
+  async cryptoSentinel() {
+    try {
+      const drb = await deribitWithCache();
+      const spot = await bybitSpotWithCache();
+      if (!drb || !drb.DVOL || !drb.DVOL.closes || drb.DVOL.closes.length < 60) return null;
+      const closes = drb.DVOL.closes, ts = drb.DVOL.ts || [], n = closes.length;
+      const last = closes[n - 1];
+      const w = Math.min(365, n);
+      const win = closes.slice(n - w);
+      const pct = win.filter(function (x) { return x <= last; }).length / win.length;
+      const zwin = closes.slice(Math.max(0, n - 60));
+      const mean = zwin.reduce(function (a, b) { return a + b; }, 0) / zwin.length;
+      const sd = Math.sqrt(zwin.reduce(function (a, b) { return a + (b - mean) * (b - mean); }, 0) / zwin.length);
+      const z60 = sd > 1e-9 ? (last - mean) / sd : 0;
+      const dvol10 = n >= 11 ? (last / closes[n - 11] - 1) : 0;
+      const dvolTs = ts.length ? ts[ts.length - 1] : null;
+      return this.computeCryptoSentinel({ z60: z60, pctTrailing1y: pct }, dvol10, spot, dvolTs);
+    } catch (e) { return null; }
+  },
+
+  /* v3.35 增强（部署就绪）：每 30 分钟由 [triggers].crons 触发。
+   * ① 尽力刷新 FRED 5 系列：CF 边缘若可达则写入 KV(fred-live)，供 /api/truths 粘性复用，
+   *    不再每次请求都浪费一次 520 往返；若不可达则静默跳过（继续用嵌入兜底）。
+   * ② 离线护栏已落地（v3.37 宏观 + v3.38 crypto）：scheduled 计算宏观/crypto 双哨兵写入 guard-live，
+   *    任一 RED 追加到 guardrail-alerts（带 6h 去重），实现「页面关闭期间」也能记录 RED（详见 README）。
+   * KV 未绑定时直接返回，绝不抛错影响 Worker 其它功能。 */
+  /* v3.39 哨兵快照构建（宏观 + crypto 合并）：抽离自 scheduled()，供 cron 与 /api/guard-live 按需刷新复用。
+   * · 宏观：先试 FRED 实时（边缘可达则用），失败/不可达自动回退 FRED_FALLBACK 嵌入值 ——
+   *   彻底去掉 v3.38「FRED 一挂就全不写」的早期返回，边缘 520 也不空。
+   * · crypto：复用 deribit/bybit 缓存，独立计算，不受 FRED 影响。
+   * 返回 { guard, macroSeries }：macroSeries 仅含「实时」项（src==='live'），供 scheduled 写 fred-live。 */
+  async buildGuardSnapshot() {
+    const ids = ['UNRATE', 'CPIAUCSL', 'PAYEMS', 'ICSA', 'PCEPILFE'];
+    const series = {};
+    await Promise.all(ids.map(async (id) => {
+      try { const r = await fetchFred(id, 3); if (r && r.v != null) { series[id] = { asof: r.asof, v: r.v, prev: r.prev, src: 'live' }; return; } } catch (e) {}
+      const f = FRED_FALLBACK[id];
+      if (f && f.v != null) series[id] = { asof: f.asof, v: f.v, prev: f.prev, src: 'fallback' };
+    }));
+    const macro = this.computeMacroSentinel(series);
+    let crypto = null;
+    try { crypto = await this.cryptoSentinel(); } catch (e) { crypto = null; }
+    const guard = {
+      ts: Date.now(),
+      status: Math.max(macro ? macro.status : 0, crypto ? crypto.status : 0),
+      macro: macro ? { status: macro.status, score: macro.score, drivers: macro.drivers, asof: macro.asof } : { status: 0, note: 'unavailable' },
+      crypto: crypto ? { status: crypto.status, score: crypto.score, drivers: crypto.drivers, dvolZ60: crypto.dvolZ60, btcDD: crypto.btcDD, asof: crypto.asof } : { status: 0, note: 'unavailable' },
+      src: 'server-sentinel',
+    };
+    return { guard, macroSeries: series };
+  },
+
+  /* v3.35 增强（部署就绪）：每 30 分钟由 [triggers].crons 触发。
+   * ① 尽力刷新 FRED 实时（仅边缘可达时写 KV(fred-live)，供 /api/truths 复用；不可达静默跳过）。
+   * ② 离线护栏（v3.37 宏观 + v3.38 crypto）：buildGuardSnapshot 算宏观/crypto 双哨兵写入 guard-live；
+   *    宏观用实时+兜底（v3.39 修：FRED 边缘 520 不再导致整段跳过），crypto 独立。
+   * ③ 任一 RED 追加 guardrail-alerts（6h 去重）。
+   * KV 未绑定时直接返回，绝不抛错影响 Worker 其它功能。 */
+  async scheduled(event, env) {
+    const kv = env && env.NEXUS_KV;
+    if (!kv) return;
+    try {
+      const built = await this.buildGuardSnapshot();
+      const guard = built.guard;
+      // 仅把「实时」宏观项写入 fred-live（兜底项不冒充实时）
+      const liveSeries = {};
+      Object.keys(built.macroSeries).forEach(function (id) {
+        const s = built.macroSeries[id];
+        if (s.src === 'live') liveSeries[id] = { asof: s.asof, v: s.v, prev: s.prev };
+      });
+      if (Object.keys(liveSeries).length) {
+        await kv.put('fred-live', JSON.stringify({ generatedOn: new Date().toISOString().slice(0, 10), series: liveSeries }), { expirationTtl: 60 * 60 * 24 * 60 });
+      }
+      await kv.put('guard-live', JSON.stringify(guard), { expirationTtl: 60 * 60 * 24 * 60 });
+      // RED 回收：宏观 / crypto 任一 RED 都追加到 guardrail-alerts（带 6h 去重，避免每 30 分钟刷屏）
+      const alertBodies = [];
+      if (guard.macro && guard.macro.status === 2) alertBodies.push({ level: 'RED', text: '【服务端宏观压力哨兵 RED】驱动：' + (guard.macro.drivers.length ? guard.macro.drivers.map(function (d) { return d.id + ' ' + d.note; }).join(' · ') : '多指标共振'), src: 'server-macro-sentinel', payload: guard.macro });
+      if (guard.crypto && guard.crypto.status === 2) alertBodies.push({ level: 'RED', text: '【服务端 crypto 哨兵 RED】驱动：' + (guard.crypto.drivers.length ? guard.crypto.drivers.map(function (d) { return d.id + ' ' + d.note; }).join(' · ') : '波动率/回撤/加速度共振'), src: 'server-crypto-sentinel', payload: guard.crypto });
+      if (alertBodies.length) {
+        const cur = ((await kv.get('guardrail-alerts', { type: 'json' })) || []);
+        const now = Date.now();
+        alertBodies.forEach(function (ab) {
+          const recent = cur.filter(function (x) { return x.src === ab.src && (now - (x.t || 0)) < 6 * 3600 * 1000; });
+          if (recent.length) return;
+          cur.push({ t: now, level: ab.level, text: ab.text, src: ab.src, payload: ab.payload });
+        });
+        await kv.put('guardrail-alerts', JSON.stringify(cur.slice(-200)), { expirationTtl: 60 * 60 * 24 * 30 });
+      }
+    } catch (e) {
+      /* 静默：scheduled 失败不影响线上请求 */
+    }
   },
 };

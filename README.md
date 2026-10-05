@@ -81,6 +81,117 @@ v3.32~v3.34 把宏观真值（WALCL / 失业率 / CPI / 非农 / 初请 / 核心
 
 刷新操作本身幂等且可追溯：重跑 `python3 tools/refresh_truths.py --write` 即更新 `FRED_FALLBACK` + `FALLBACK_GENERATED_ON`，无需手改。
 
+### v3.35 优化补丁（追加 · 全面优化）
+
+针对已知短板做的收敛，全部不破坏现有请求流；未部署部分已在代码层就绪，等待授权部署即生效。
+
+1. **Worker 版本号对齐**：健康端点 `/health` 的 `version` 此前一直写死 `3.33`，与项目实际版本不符 → 改为 `3.35`，线上巡检一眼可辨。
+2. **FRED 兜底刷新加固**（`tools/refresh_truths.py`）：原逻辑单系列失败会中断整体写入；现改为**部分写入**——只覆盖本次成功拉到的系列，失败的保留 Worker 已有兜底值（不空覆盖真值）；新增 `--check` 模式输出本机 FRED 可达性 + 兜底距今天数，可接 cron 判定「是否该提醒人工刷新」。已本机实跑 `--write`，5 个系列与实时值一致（月频数据未出新值，确认新鲜）。
+3. **离线告警基础设施（部署就绪 · 默认关闭）**：新增 Worker `scheduled()` 钩子（每 30 分钟，`wrangler.toml` 加 `[triggers] crons`）+ KV 绑定预留（`NEXUS_KV`，wrangler.toml 注释示例）。`scheduled()` 在 CF 边缘若可达 FRED 就把最新值写入 KV(`fred-live`)，供 `/api/truths` **粘性复用**——不再每次请求都浪费一次 520 往返；不可达则静默跳过。`/api/alerts` GET/POST 用 KV 持久化 RED 事件。**关键点：v3.34 的「纯本地、零外发」核心承诺保持不变**——云同步默认关闭，仅当用户在设置里勾选「☁️ 云同步」时才在 RED 触发时 best-effort POST、并每 5 分钟 GET 合并进提醒中心抽屉，实现**跨会话/跨设备回收离线期间漏看的 RED**；关闭时一行外发都没有（回归测试 X 段强制校验）。KV 未绑定时即便开启也**优雅降级**（503 / 跳过），不影响现有接口。
+4. **诚实边界（重申）**：完整「页面关闭期间自动监控 + 推送」仍依赖服务端镜像护栏逻辑或一个推送通道（Webhook/邮件，此前用户已选纯本地方案）。本次把**数据层盲区**堵上（Worker 能记录、用户重开能回收），推送侧保持现状；若要彻底离线推送，部署后需在 `scheduled()` 里镜像 `guardrail()` 或接入推送通道。
+5. **清理废弃脚本**：删除 `tools/patch_v334_*.py` 四个一次性改造脚本（已落实进源文件、全仓库无引用）。
+
+### v3.36 变更（本会话 · 六人视角优化）
+
+用户要求以马斯克 / 黄仁勋 / CZ / 对冲基金 / 罗杰斯 / 索罗斯六个视角审视项目优缺点与「能否引领未来」，并据批判做全面优化。分析见 `NEXUS_PERSPECTIVES.md`。
+
+针对共性短板落地的代码优化（纯本地、不破坏现有评分逻辑、零外发默认不变）：
+1. **模型谦逊徽标（索罗斯 / 罗杰斯）**：新增 `regimeConfidence()`——按因子方向**幅度加权支撑度**给置信度 HIGH/MED/LOW；分歧大时分数旁标注「置信 低（支撑 XX%）」，把「平均值」主动降级为「不确定」，不在因子打架时假装下判断。
+2. **风险度量矩阵（对冲基金）**：新增 `riskMetrics()` 纯函数——Sortino（下行波动）、VaR95、CVaR95；回测面板新增 **索提诺 / VaR95% / CVaR95% / 卡玛比率** 四指标（卡玛 = CAGR / 最大回撤）。回测本就含手续费率（默认 6bps），非玩具。
+3. **波动目标仓位（对冲基金）**：新增 `volTargetWeight(realizedVol, targetVol)`——风险纪律优先，给出 0~2x 目标仓位权重。
+4. **本地解释器 + 程序化 API（黄仁勋 / CZ 平台化）**：新增 `explainScore()` 规则式自然语言解释（无外部 API、零外发），把分数 + 主导因子翻译成一句话；暴露 `window.Nexus` 内核（getScore / getFactors / confidence / risk / volTarget / explain），agent / 开发者 / 控制台可直接查询，把单体 app 变成可组合内核。
+5. **诚实边界重申**：不擅自新增外部源（遵守「本机可达 ≠ CF 边缘可达」）；无人值守 / 移动端留作部署期项（v3.35 已就绪 scheduled + /api/alerts + opt-in 云同步）。
+
+验证：`tests/v336_metrics.test.js` 全绿（regimeConfidence / riskMetrics / volTargetWeight / explainScore / window.Nexus 共 23 项）；`smoke.js` + `regression.js` 全绿无回归。未部署（git 损坏 + 未授权）。
+
+---
+
+### v3.37 变更（本会话 · 缺陷全面修复）
+
+针对六人视角分析遗留的「真实缺陷」做修复（仍纯本地代码 + 测试，未部署）：
+
+1. **告警归因（对冲基金 / 索罗斯：RED 必须说清 why）**：新增 `buildAlertPayload(G)`——结构化输出 `score / 置信 / 幅度加权支撑度 / Top4 驱动因子（含方向）`；`maybeAlertGuardrail` 在 RED 触发时把 payload 透传进告警时间轴（本地 `pushAlertLog` 与跨会话 `pushAlertServer` 均带）；提醒中心每条 RED 下展示「为何触发：因子名 利多/利空 +贡献（支撑XX%）」。**纯本地字段，不多发一个字节。**
+2. **服务端宏观压力哨兵（无人值守 · 宏观侧）**：`worker.scheduled()` 在 FRED 刷新后，用 5 个 FRED 系列（失业率 / CPI / 非农 / 初请 / 核心PCE）计算宏观压力，与「页面关没关」无关地运行；RED 时写入 KV(`guard-live`) 并追加到 `guardrail-alerts`，实现「关闭期间」也能记录**宏观**压力（crypto 侧 RED 仍依赖客户端，CF 边缘拉交易所可达性未验证，故只覆盖宏观，诚实标注）。新增 `/api/guard-live` GET 供前端拉取服务端最近一次宏观评估。全部 guarded：KV 未绑定 → 静默跳过，不影响线上。
+3. **回测稳健性 + 诚实披露（对冲基金：方向假设是样本内的）**：新增 `stabilityOf(returns)`（正收益周期占比）；回测面板新增「稳健性(胜期占比)」指标；面板加一行诚实说明——因子方向为样本内假设、夏普/VaR 按本段历史估计会漂移。
+4. **程序化 API 扩展（黄仁勋 / CZ）**：`window.Nexus` 新增 `guard()`（当前护栏摘要）、`lastAlert()`（最近带 payload 的本地告警）、`alertPayload()`（构建归因），`version` → `3.37`；`/api/alerts` POST 持久化 `payload` 字段。
+
+### v3.37 诚实边界（重要）
+- 无人值守**只覆盖宏观侧**。crypto 侧 RED 要真正离线，需在 `scheduled()` 镜像 `guardrail()` 或接推送通道；当前 crypto 因子依赖客户端拉交易所，CF 边缘可达性未实测，故不擅自把 crypto 哨兵写进服务端（避免「本机可达 ≠ 边缘可达」的假可用）。
+- 不新增任何外部数据源（Binance / 商品长周期等，罗杰斯/CZ 提的）——同样遵守可达性边界，列为部署期实测项。
+
+验证：`tests/v337.test.js`（app.js 侧 12 项：stabilityOf / buildAlertPayload / pushAlertLog透传 / window.Nexus 扩展）、`tests/v337_worker.test.js`（worker 侧 9 项：哨兵 RED/GREEN 映射 / scheduled 写 fred-live+guard-live+RED追加 / /api/guard-live 读写 + 无 KV→503）；`smoke.js` + `regression.js` 全绿无回归。
+
+---
+
+## v3.38 变更（上一版 · 服务端哨兵首版，**含两处关键缺陷，见 v3.40 修复**）
+
+**主题：把"关页面也能监控"从宏观扩到 crypto（真正的无人值守），并补齐一键部署编排。**
+
+### 1. 服务端 crypto 哨兵（无人值守 · crypto 侧）—— v3.37 遗留项落地
+- `worker.scheduled()` 在拉完 FRED 后，**额外**复用 Worker 自有缓存数据原语（`deribitWithCache` 的 DVOL 波动率指数 + `bybitHistWithCache` 的 BTC 溢价/持仓）计算 **crypto 三分量**（紧凑镜像前端护栏，不搬运上千行客户端护栏，遵循 v3.30 避免分叉纪律）：
+  - **① 波动率体制（DVOL）**：近 60 日 z 分数 ≥2.0 或近 1 年分位 ≥93% → 危；≥1.0 / ≥80% → 警。
+  - **② 极端偏离（BTC 近端回撤）**：过去 60 日最大回撤 ≥30% → 危；≥18% → 警。
+  - **③ 加速度（DVOL 10 日变化 / BTC 10 日动量）**：波动 10 日涨 ≥25% 或 BTC 10 日跌 ≥18% → 危；≥12% / ≥8% → 警。
+- `scheduled()` 合并 **宏观 + crypto** 双哨兵写入 KV(`guard-live`)（status 取两者高者）；任一 RED 追加到 `guardrail-alerts`（带 **6 小时去重**，避免每 30 分钟刷屏），src 分别标 `server-macro-sentinel` / `server-crypto-sentinel`。
+- `/api/guard-live` 现返回**合并快照**（含 `macro` / `crypto` 两个子块）。
+- **诚实边界更新**：v3.37 标注的"crypto 侧离线靠客户端"已被本版补齐——crypto 源（deribit/bybit/coinlore）本就是项目主源，在 CF 边缘比 FRED 更可能可达，**真正 24/7 的 crypto 监控现在服务端就有**。FRED（宏观）仍受"CF 边缘 520"约束，但不可达时静默跳过、不影响 crypto 哨兵。
+- 纯函数 `computeCryptoSentinel()` 已抽离，便于确定性测试。
+
+### 2. 一键部署编排（把"部署前的一切"做到位）
+- 新增 `tools/deploy.sh`：自动校验登录 → 创建并注入 `NEXUS_KV` namespace id → `wrangler deploy` 两个 Worker（nexus-proxy / nexus-frontend）→ 可选配置 `NOTIFY_WEBHOOK` 外部推送 → 验证 health。用法：`bash tools/deploy.sh`。
+- 环境侧：`wrangler@4.147.0` 已装入本机托管 node workspace（macOS 版本警告仅影响本地预览，不影响 `wrangler deploy` 推云端）。
+- **部署状态（2026-10-05 已上线 ✅）**：
+  - 数据 Worker `nexus-proxy` → **https://nexus-api.uichain.org** ，`/health` 返回 `version: 3.38`，KV(`NEXUS_KV` id `5fa9ecc66f5c49f1bcef11587be59848`) 已绑定，`*/30 * * * *` cron 已激活。
+  - 前端 Worker `nexus-frontend`（Workers Assets）→ **https://nexus.uichain.org** ，HTTP 200 正常托管 `index.html`/`app.js`。
+  - 边缘实拉 `/api/truths`：`errors: {}`，CPI/失业/非农/核心PCE/联储资产负债表等**真实宏观数据**到位（FRED 在 CF 边缘当前可达，原"520 陷阱"暂未复现，cron 每 30 分钟会写 `fred-live`+`guard-live`）。
+  - 认证方式：本机已存 OAuth 登录（`/Users/leo/.wrangler/config/default.toml`，账号 `72450e08e207045ce0dc313447dcb5e3`）。用户另给的 `cfk_…` 字符串**无法认证**（API Token 报 9109 invalid），未使用，建议核查来源并旋转。
+- **部署踩坑（已修进 `tools/deploy.sh`，重跑即顺）**：① wrangler **v4 已移除 `kv namespace create --json`**（v3 才有）→ 改用 `--binding NEXUS_KV --update-config`；② `kv_namespaces` 必须放在 `[triggers]` **之前**作顶层字段，否则会被 TOML 解析进 triggers 表导致 `Unexpected fields: kv_namespaces` 且 KV 实际未绑定。
+
+### 验证（全绿）
+- `tests/v338_worker.test.js`（新增 13 项：crypto 纯函数 RED/GREEN / 真实 fetch 路径 status=2 / scheduled 合并宏观+crypto / 6h 去重 / /api/guard-live 合并）—— 含**真实 deribit+bybit 合成数据**跑通 `cryptoSentinel()`。
+- `smoke.js` + `regression.js` + `v337*.test.js` 全绿无回归（`worker/worker.js` 升级到 v3.38）。
+- **线上冒烟**：`/health` 200 + 版本 3.38；前端 200；`/api/alerts` 200 返回 `[]`（KV 已绑定）；`/api/truths` 200 带真实宏观数据（`errors:{}`）。
+
+---
+
+## v3.40 变更（当前版 · 修复 v3.38 两处关键缺陷，哨兵真正落地）
+
+**主题：上线实测发现 v3.38 的服务端哨兵其实一直没在跑，且 crypto 回撤算在错误的数据上。本版逐一修复并线上验证。**
+
+### 1. 缺陷 A：`scheduled()` 的"早期返回"让 `guard-live` 永远写不进去（真·24/7 是假的）
+- **现象**：v3.38 上线数小时后，`/api/guard-live` 恒为 `null`、cron 触发器却在 CF 上确确实实注册了（`GET /workers/scripts/nexus-proxy/schedules` 确认 `*/30 * * * *` 在册）。
+- **根因**：`scheduled()` 原本第一行是 `if (!Object.keys(series).length) return;` —— 而 FRED 的 CSV 域（`fred.stlouisfed.org`）**在 CF 边缘被挡（520）**，`fetchFred` 必失败 → `series` 恒空 → 直接 return，**连 crypto 哨兵都被一起跳过**。这与 v3.38 初衷（"FRED 挂了 crypto 也要跑"）正好相反。
+- **修复**：
+  - 抽 `buildGuardSnapshot()` 供 cron 与 `/api/guard-live` 复用；**去掉"series 空就 return"的早期返回**。
+  - 宏观哨兵改为**实时 FRED + `FRED_FALLBACK` 兜底**：边缘拉不到实时值时用已嵌入的兜底值算状态，宏观不再"永远 unavailable"。
+  - `/api/guard-live` GET 增加**按需兜底刷新**：快照为空或超 40 分钟就现场算一份并缓存（返回 `refreshed:true`）。既保证"打开页面即有数据"，又抗 cron 抖动。
+
+### 2. 缺陷 B（更严重·概念级）：crypto"BTC 回撤/动量"算在了**溢价基差**上
+- **现象**：修好 A 后，crypto 一度报出 `BTC近端回撤 3188%` 的荒谬值 + 假 RED。
+- **根因**：v3.38 用 bybit `premium-index-price-kline` 当"BTC 价格"，但**实测它的 open/close 字段是"溢价基差"**：量级仅 ~`1e-4`、1000 根里 **862 根为负**，在 0 上下震荡。在其上算回撤：peak≈1.9e-5、遇 v=-4.6e-4 → `(peak−v)/peak`≈25～32 → 3188%。更危险的是——**BTC 真暴跌时这个"回撤"仍≈0，哨兵会漏报**。v3.38 的 `accLv` 里 `btc10` 同样建立在基差上却被标成"BTC 动量"。
+- **修复**：
+  - 新增 `bybitSpotWithCache()`：取 bybit **现货日 K `close`（真实价格，~6–8 万 USD）**，6h 缓存 / 失败 30min 冷却。
+  - `computeCryptoSentinel` 的"回撤/动量"一律基于**现货真实价格**；DVOL 分量不变。回撤/动量同时做**非正/非有限值防御 + d 钳 [0,1]**，脏数据不再造出离谱值。
+  - 诚实结论：真实当前 BTC 近 60 日最大回撤 **6.92%**、10 日动量 **+2.36%** → crypto 分量判定为**绿（status 0）**，与"无极端压力"一致。3188% 假 RED 消失。
+- **测试同步修正**：`tests/v338_worker.test.js` 原先把 premium 字段伪装成价格（`70000→48400`）来凑 RED，**掩盖了这个 bug**。已改为注入真实现货价格序列，并新增"基差离群值不会造出 >100% 回撤"的回归断言。
+
+### 3. 诚实边界 / 排查记录
+- **FRED 在 CF 边缘仍 520**：宏观哨兵因此常态走 `FRED_FALLBACK` 兜底（`asof` 随兜底值月份），前端仍会如实标注"兜底/非实时"。
+- **bybit 限流**：调试期反复强制重算会触发 bybit 限流，导致现货抓取偶发返回 null（30min 冷却）。生产无碍——现货 6h 缓存一次，一天最多 4 次请求，远低于限额。失败仅 `console.warn`，不影响 DVOL 独立出分。
+- **CF OAuth token 会过期**（约 8h）：过期后手动 `wrangler`/CF API 调用会静默返回 `Authentication error`(10000)。`wrangler whoami` 可自动续期。仅影响本机手动操作，不影响线上 Worker（用自身绑定）。
+
+### 验证（全绿 + 线上实测）
+- `tests/v338_worker.test.js` 扩到 **15 项**（含现货价格 RED/GREEN、基差防御回归、scheduled 合并、6h 去重、/api/guard-live）；`v337_worker` 9/0、`v337 app` 12/0、`smoke` PASSED、`regression` 全部断言通过。
+- **线上实测**：`/health` → `version 3.40`；`/api/guard-live` → `refreshed:true`，宏观 status 1（FRED 兜底）、crypto status 0、真实 `btcDD=6.92%`；临时 debug 端点已移除（404）。
+
+---
+
+## 如何部署（速查）
+1. 本机装 wrangler：`npm i -g wrangler`（或用本机托管路径 `~/.workbuddy/binaries/node/workspace/node_modules/.bin/wrangler`）。
+2. 登录 Cloudflare：`wrangler login`（浏览器授权）或设 `CF_API_TOKEN`。
+3. 一键发布：`bash tools/deploy.sh`。脚本会自动建 KV、注入 id、部署两个 Worker、验证 health。
+4. 部署后验证：打开 https://nexus.uichain.org ，在设置勾选 ☁️云同步 + 🔔 RED 提醒；关掉页面 30 分钟后重开，提醒中心应能看到服务端记录的宏观/crypto RED。
+
 ---
 
 ## v3.34 变更（上一版）

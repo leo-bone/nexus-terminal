@@ -45,6 +45,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
 .al-item.lv0{border-left-color:var(--blue)}
 .al-it{font-size:9px;color:var(--dim);font-family:'JetBrains Mono',monospace;letter-spacing:.3px}
 .al-ib{font-size:10.5px;color:var(--text2);line-height:1.55;white-space:pre-wrap;margin-top:2px;font-family:'JetBrains Mono',monospace}
+.al-why{font-size:10px;color:var(--dim);line-height:1.5;margin-top:3px;padding:3px 6px;background:rgba(255,61,110,.07);border-radius:4px}
 
 .ticker-strip{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin-bottom:10px}
 .ticker{background:var(--bg1);border:1px solid var(--border);border-radius:8px;padding:11px 14px;transition:border-color .2s,box-shadow .2s}
@@ -96,6 +97,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
 .fscore-ring{position:relative;width:52px;height:52px;margin-left:auto}.fscore-ring svg{transform:rotate(-90deg)}
 .fscore-center{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center}
 .fscore-n{font-size:15px;font-weight:800;color:var(--text4);line-height:1}.fscore-l{font-size:7px;color:var(--dim)}
+.nx-conf{margin:2px 0 6px;font-weight:600}.nx-conf.c-high{color:var(--green)}.nx-conf.c-med{color:var(--gold)}.nx-conf.c-low{color:var(--red)}
 .fgrid{display:grid;grid-template-columns:repeat(5,1fr);gap:6px}
 .fnote{font-size:9px;color:var(--dim);line-height:1.7;margin-bottom:9px;padding:0 1px}
 @media(max-width:1100px){.fgrid{grid-template-columns:repeat(4,1fr)}.ta-grid{grid-template-columns:repeat(3,1fr)}}
@@ -130,6 +132,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
 .btgrid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:1px;background:var(--border)}
 .btmet{background:var(--bg1);padding:9px 10px}.btmet-name{font-size:8px;color:var(--dim);letter-spacing:1px;text-transform:uppercase;margin-bottom:3px}
 .btmet-val{font-size:16px;font-weight:700;font-family:'JetBrains Mono',monospace;color:var(--text3)}
+.bt-note{font-size:10px;color:var(--dim);line-height:1.6;margin:9px 0 4px;border-top:1px dashed var(--border);padding-top:7px}
 #btCanvas{display:block;width:100%;height:120px;background:var(--bg)}
 .bt-msg{font-size:10px;color:var(--dim);line-height:1.6;margin-top:8px}
 .bt-msg:empty{display:none}
@@ -339,6 +342,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
       <span id="lastUpd" class="last-upd">—</span>
       <button id="refreshBtn" class="refresh-btn">⟳ 刷新</button>
       <label class="notify-toggle" style="display:inline-flex;align-items:center;gap:4px;font-size:12px;color:#9fb3c8;cursor:pointer;margin-left:8px" title="护栏进入 RED 时本地提醒：桌面通知 + 提示音 + 标题闪烁 + 告警时间轴。零配置、不出本机"><input type="checkbox" id="notifyChk" style="cursor:pointer"> 🔔 RED 提醒</label>
+      <label class="notify-toggle" style="display:inline-flex;align-items:center;gap:4px;font-size:12px;color:#9fb3c8;cursor:pointer;margin-left:8px" title="跨会话云同步（可选·默认关）：把离线期间的 RED 事件存到服务端 KV，重开页面时回收。需部署 NEXUS_KV 才生效；关闭时仍是纯本地、零外发"><input type="checkbox" id="cloudSyncChk" style="cursor:pointer"> ☁️ 云同步</label>
       <button id="notifyTestBtn" class="refresh-btn" style="margin-left:6px" title="立刻发一条本地提醒，验证桌面通知/提示音/标题闪烁是否可用">🔔 测试</button>
       <button id="alertLogBtn" class="refresh-btn" style="margin-left:6px" title="提醒中心：上次看到 vs 现在 + 告警时间轴 + 提醒设置">📋 提醒中心</button>
       <span id="notifyStat" style="font-size:11px;color:#6b8299;margin-left:6px"></span>
@@ -400,6 +404,7 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
         </div>
       </div>
       <div id="nxCal" class="fnote" style="display:none;margin:-2px 0 6px"></div>
+      <div id="nxConf" class="nx-conf">—</div>
       <div class="fnote">每个因子先算 z（相对自身历史的偏离），再乘方向 dir 得到多空贡献：<b style="color:var(--green)">绿=利多</b> · <b style="color:var(--red)">红=利空</b> · 灰「仅展示」不参与评分。悬停卡片可看权重与原始 z。</div>
       <div id="factorGrid" class="fgrid"></div>
       <div class="sub2" style="margin-top:2px">
@@ -655,10 +660,16 @@ html,body{background:var(--bg);color:var(--text);font-family:'Inter','JetBrains 
           <div class="btmet"><div class="btmet-name">年化收益</div><div id="btCagr" class="btmet-val">—</div></div>
           <div class="btmet"><div class="btmet-name">夏普比率</div><div id="btSharpe" class="btmet-val">—</div></div>
           <div class="btmet"><div class="btmet-name">最大回撤</div><div id="btDD" class="btmet-val">—</div></div>
+          <div class="btmet"><div class="btmet-name">索提诺比率</div><div id="btSortino" class="btmet-val">—</div></div>
+          <div class="btmet"><div class="btmet-name">VaR 95%</div><div id="btVar" class="btmet-val">—</div></div>
+          <div class="btmet"><div class="btmet-name">CVaR 95%</div><div id="btCvar" class="btmet-val">—</div></div>
+          <div class="btmet"><div class="btmet-name">卡玛比率</div><div id="btCalmar" class="btmet-val">—</div></div>
           <div class="btmet"><div class="btmet-name">胜率 (已平仓)</div><div id="btWin" class="btmet-val">—</div></div>
           <div class="btmet"><div class="btmet-name">盈亏比</div><div id="btPF" class="btmet-val">—</div></div>
           <div class="btmet"><div class="btmet-name">交易次数</div><div id="btTrades" class="btmet-val">—</div></div>
+          <div class="btmet"><div class="btmet-name">稳健性(胜期占比)</div><div id="btStab" class="btmet-val">—</div></div>
         </div>
+        <div class="bt-note">因子方向为样本内假设、非样本外验证；夏普/VaR 按本段历史估计，换个行情区间会漂移。稳健性=正收益周期占比，比单个夏普更不易被一段趋势美化。</div>
         <div class="bthead"><span>📈 净值曲线</span><span class="bt-scope">绿=策略 · 灰虚线=买入持有 · 深色=本金线</span></div>
         <canvas id="btCanvas"></canvas>
         <div class="bthead"><span>🧾 最近成交</span></div>

@@ -1723,6 +1723,7 @@ function btRun(k, sig, opts) {
   const sd = rr.length > 1 ? Math.sqrt(rr.reduce((a, b) => a + (b - mean) ** 2, 0) / rr.length) : 0;
   const bpy = BT_BARS_PER_YEAR[opts.interval] || 365;
   const sharpe = sd ? mean / sd * Math.sqrt(bpy) : 0;
+  const rm = riskMetrics(rr, bpy);            // v3.36：Sortino / VaR95 / CVaR95
   const years = eq.length / bpy;
   const cagr = (years > 0.02 && finalEq > 0) ? (Math.pow(finalEq / cap, 1 / years) - 1) * 100 : 0;
 
@@ -1733,8 +1734,11 @@ function btRun(k, sig, opts) {
   const al = losses.length ? Math.abs(losses.reduce((a, b) => a + b.pnl, 0) / losses.length) : 0;
   const pf = al ? aw / al : (aw ? Infinity : 0);
 
+  const calmar = (maxDD > 0 && isFinite(cagr)) ? (cagr / 100) / maxDD : 0;   // v3.36：Calmar = CAGR / MaxDD
+  const stab = stabilityOf(rr);                                              // v3.37：正收益周期占比（稳健性读数）
   return {
     ret, bhRet, excess: ret - bhRet, cagr, sharpe, dd: maxDD * 100,
+    sortino: rm.sortino, var95: rm.var95 * 100, cvar95: rm.cvar95 * 100, calmar: calmar, stability: stab,
     win: closed.length ? wins.length / closed.length * 100 : 0,
     tradeCount: closed.length, hasOpen: list.some(t => t.open),
     pf, avgBars: closed.length ? holdBars / closed.length : 0,
@@ -1776,9 +1780,14 @@ async function renderBacktest() {
     set('btCagr', (r.cagr >= 0 ? '+' : '') + r.cagr.toFixed(1) + '%', col(r.cagr));
     set('btSharpe', r.sharpe.toFixed(2), col(r.sharpe));
     set('btDD', '-' + r.dd.toFixed(1) + '%', 'var(--red)');
+    set('btSortino', r.bars ? r.sortino.toFixed(2) : '—', col(r.sortino));       // v3.36：下行波动-adjusted
+    set('btVar', r.bars ? r.var95.toFixed(2) + '%' : '—', 'var(--red)');         // v3.36：5% VaR（单周期）
+    set('btCvar', r.bars ? r.cvar95.toFixed(2) + '%' : '—', 'var(--red)');       // v3.36：CVaR（尾部均值）
+    set('btCalmar', r.bars ? r.calmar.toFixed(2) : '—', r.calmar >= 1 ? 'var(--green)' : 'var(--orange)'); // v3.36
     set('btWin', r.tradeCount ? r.win.toFixed(0) + '%' : '—', r.win >= 50 ? 'var(--green)' : 'var(--orange)');
     set('btPF', r.tradeCount ? (isFinite(r.pf) ? r.pf.toFixed(2) : '∞') : '—', r.pf >= 1 ? 'var(--green)' : 'var(--orange)');
     set('btTrades', r.tradeCount + (r.hasOpen ? ' +1持仓' : ''), 'var(--text3)');
+    set('btStab', r.bars ? (r.stability * 100).toFixed(0) + '%' : '—', col(r.stability - 0.5));   // v3.37：稳健性=正收益周期占比
 
     const scope = $('btScope');
     if (scope) {
@@ -2059,6 +2068,16 @@ function renderFactors() {
   const ring = $('nxRing'); if (ring) { ring.setAttribute('stroke-dasharray', `${score * 2.51} 251`); ring.setAttribute('stroke', score > 60 ? '#00e5a0' : score < 40 ? '#ff3d6e' : '#ffc107'); }
   if ($('nxScore')) $('nxScore').textContent = score;
   if ($('nxSig')) { const s = score > 60 ? '偏多' : score < 40 ? '偏空' : '中性'; $('nxSig').textContent = s; $('nxSig').className = 'fscore-l ' + (score > 60 ? 'up' : score < 40 ? 'dn' : 'n'); }
+  /* v3.36 模型谦逊徽标：因子方向一致性 → 置信度；分歧大时主动降级，不把平均值当判断 */
+  {
+    const conf = regimeConfidence(res);
+    const confEl = $('nxConf');
+    if (confEl) {
+      const txt = conf.level === 'HIGH' ? '置信 高' : conf.level === 'MED' ? '置信 中' : '置信 低';
+      confEl.textContent = txt + '（支撑 ' + Math.round(conf.support * 100) + '%）';
+      confEl.className = 'nx-conf ' + (conf.level === 'HIGH' ? 'c-high' : conf.level === 'MED' ? 'c-med' : 'c-low');
+    }
+  }
   /* v3.24 ㉘：实时评分旁挂一个「标尺校正后」的分数。σ 来自回放末端，
    * 没跑过回放就整块不显示 —— 编一个 σ 等于编一个结论。 */
   {
@@ -3692,6 +3711,15 @@ function bindUI() {
       }
       saveAlertCfg(); updateAlertUI(); renderAlertDrawer();
     });
+    /* v3.35：跨会话云同步（默认关，开启才外发；关闭时仍是纯本地、零外发） */
+    const csc = $('cloudSyncChk');
+    if (csc) { if (!state.alert) state.alert = loadAlertCfg(); csc.checked = !!state.alert.cloudSync; }
+    if (csc) csc.addEventListener('change', function () {
+      if (!state.alert) state.alert = loadAlertCfg();
+      state.alert.cloudSync = csc.checked;
+      saveAlertCfg(); updateAlertUI(); renderAlertDrawer();
+      if (csc.checked) syncServerAlerts();
+    });
     updateAlertUI();
   }
   /* v3.34 提醒中心抽屉 */
@@ -3741,6 +3769,12 @@ window.addEventListener('load', async () => {
   bindUI();
   await refreshAll();
   setInterval(refreshAll, CONFIG.REFRESH_MS);
+  /* v3.35：跨会话告警回收 —— 仅当用户开启「云同步」时才拉取服务端持久化的离线 RED 事件 */
+  if (!state.alert) state.alert = loadAlertCfg();
+  if (state.alert.cloudSync) {
+    syncServerAlerts();
+    setInterval(syncServerAlerts, 5 * 60 * 1000);
+  }
   window.addEventListener('resize', () => {
     renderChart();
     try { renderSystemic(); } catch (e) { /* ignore */ }
@@ -9211,8 +9245,8 @@ function loadAlertCfg() {
   try {
     const s = JSON.parse(localStorage.getItem(ALERT.LS_CFG) || '{}');
     return { enabled: !!s.enabled, sound: s.sound !== false, desktop: s.desktop !== false,
-             lastTs: s.lastTs || 0, lastResult: s.lastResult || null };
-  } catch (e) { return { enabled: false, sound: true, desktop: true, lastTs: 0, lastResult: null }; }
+             cloudSync: s.cloudSync === true, lastTs: s.lastTs || 0, lastResult: s.lastResult || null };
+  } catch (e) { return { enabled: false, sound: true, desktop: true, cloudSync: false, lastTs: 0, lastResult: null }; }
 }
 function saveAlertCfg() {
   try { if (state.alert) localStorage.setItem(ALERT.LS_CFG, JSON.stringify(state.alert)); } catch (e) {}
@@ -9225,11 +9259,49 @@ function saveAlertLog(a) {
   try { localStorage.setItem(ALERT.LS_LOG, JSON.stringify((a || []).slice(-ALERT.MAX_LOG))); } catch (e) {}
 }
 /* 写一条：只追加真实发生过的提醒。不补记、不臆造关闭期间的条目。 */
-function pushAlertLog(lv, title, body) {
+/* v3.37 告警归因：日志条目可携带结构化 payload（score / 置信 / 主导因子），
+ * 让 RED 不只报「状态」，还报「为什么」。纯本地字段，不外发任何额外数据。 */
+function pushAlertLog(lv, title, body, payload) {
   const a = loadAlertLog();
-  a.push({ ts: Date.now(), lv: lv, title: String(title || ''), body: String(body || '') });
+  a.push({ ts: Date.now(), lv: lv, title: String(title || ''), body: String(body || ''),
+           payload: (payload && typeof payload === 'object') ? payload : null });
   saveAlertLog(a);
   return a;
+}
+
+/* v3.35：跨会话告警 —— RED 事件 best-effort 推到 Worker（/api/alerts，KV 持久化）。
+ * 关页面期间或换设备发生的 RED 也能在重开时回收；服务端未绑 KV 时静默失败，不影响本地提醒。 */
+/* v3.37：RED 推送时一并带上结构化 payload（驱动因子），服务端 KV 原样存储。 */
+function pushAlertServer(level, text, payload) {
+  try {
+    if (typeof fetch !== 'function') return;
+    fetch('/api/alerts', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ level: level || 'RED', text: String(text || ''), src: 'client',
+        payload: (payload && typeof payload === 'object') ? payload : null }) }).catch(function () {});
+  } catch (e) {}
+}
+/* 拉取服务端持久化的离线 RED 事件，合并进本地提醒日志（按 ts 去重，避免与本会话自己推的重复）。 */
+let _serverAlertsSynced = 0;
+async function syncServerAlerts() {
+  try {
+    if (typeof fetch !== 'function') return;
+    const r = await fetch('/api/alerts');
+    if (!r.ok) return;
+    const j = await r.json().catch(function () { return null; });
+    if (!j || !Array.isArray(j.alerts) || !j.alerts.length) return;
+    const log = loadAlertLog();
+    const seenTs = new Set(log.map(function (x) { return Math.floor((x.ts || 0) / 10000); }));
+    let added = 0, maxT = _serverAlertsSynced;
+    j.alerts.forEach(function (a) {
+      const t = a.t || 0; if (t <= _serverAlertsSynced) return;
+      if (seenTs.has(Math.floor(t / 10000))) return;
+      log.push({ ts: t, lv: (a.level || 'RED').toLowerCase(), title: '云端 RED（离线期间）', body: String(a.text || ''),
+                 payload: (a.payload && typeof a.payload === 'object') ? a.payload : null });
+      added++;
+    });
+    maxT = j.alerts.reduce(function (m, a) { return Math.max(m, a.t || 0); }, maxT);
+    if (added) { saveAlertLog(log); _serverAlertsSynced = maxT; }
+  } catch (e) {}
 }
 
 /* ① 桌面通知权限：不支持 / 已授权 / 已拒绝 / 未询问 —— 如实返回，不美化 */
@@ -9296,10 +9368,10 @@ function alertBlink(on) {
 }
 
 /* 四层一起发：任一层失败不影响其它层 */
-function fireAlert(lv, title, body) {
+function fireAlert(lv, title, body, payload) {
   if (!state.alert) state.alert = loadAlertCfg();
   const cfg = state.alert;
-  pushAlertLog(lv, title, body);
+  pushAlertLog(lv, title, body, payload);
   const got = [];
   try {
     if (cfg.desktop && alertPerm() === 'granted' && typeof Notification !== 'undefined') {
@@ -9317,6 +9389,34 @@ function fireAlert(lv, title, body) {
   saveAlertCfg();
   updateAlertUI();
   return got;
+}
+
+/* v3.37 告警归因：把「为什么 RED」结构化。依赖 computeNexusScore + regimeConfidence（纯函数）。
+ * 输出：score / 置信等级 / 幅度加权支撑度 / 净贡献最大的 Top 因子（含方向）。
+ * 仅读取本地已算好的因子贡献，不发起任何网络请求、不外发。 */
+function buildAlertPayload(G) {
+  let score = null, conf = null, top = [];
+  try {
+    const res = computeNexusScore();
+    score = res.score;
+    conf = regimeConfidence(res);
+    const arr = [];
+    for (const k in res.out) {
+      const r = res.out[k];
+      if (r && r.ok && r.dir && isFinite(r.contribution) && r.contribution !== 0) arr.push({ id: k, c: r.contribution });
+    }
+    arr.sort(function (a, b) { return Math.abs(b.c) - Math.abs(a.c); });
+    const nameOf = function (id) { for (const f of FACTORS) if (f.id === id) return f.name; return id; };
+    top = arr.slice(0, 4).map(function (r) { return { id: r.id, name: nameOf(r.id), contribution: Math.round(r.c * 10) / 10, dir: r.c > 0 ? 1 : -1 }; });
+  } catch (e) {}
+  return {
+    score: score,
+    confidence: conf ? conf.level : null,
+    support: conf ? Math.round(conf.support * 100) : null,
+    topFactors: top,
+    guardStatus: (G && G.status != null) ? G.status : null,
+    ts: Date.now(),
+  };
 }
 
 function buildGuardrailAlertText(G) {
@@ -9407,7 +9507,10 @@ function maybeAlertGuardrail(G) {
       const cooled = (now - (state.alert.lastTs || 0)) > ALERT.COOLDOWN_MS;
       if (freshEdge || cooled) {
         state.alert.lastTs = now;
-        fireAlert(2, 'NEXUS 护栏 RED', buildGuardrailAlertText(G));
+        const payload = buildAlertPayload(G);
+        const text = buildGuardrailAlertText(G);
+        fireAlert(2, 'NEXUS 护栏 RED', text, payload);
+        if (state.alert.cloudSync) pushAlertServer('RED', text, payload);  /* v3.35：跨会话持久化（仅用户开启云同步时外发，v3.37 起带归因 payload） */
       }
     }
     if (!G || G.status !== 2) alertBlink(false);  /* 离开 RED 立刻停闪，不持续打扰 */
@@ -9467,9 +9570,18 @@ function alertDrawerHTML() {
   } else {
     h += '<div class="al-log">';
     log.forEach(function (r) {
+      let why = '';
+      if (r.payload && r.payload.topFactors && r.payload.topFactors.length) {
+        const sup = r.payload.support != null ? '（支撑 ' + r.payload.support + '%）' : '';
+        const drv = r.payload.topFactors.map(function (t) {
+          return t.name + (t.dir > 0 ? ' 利多+' : ' 利空') + t.contribution;
+        }).join('、');
+        why = '<div class="al-why">为何触发：' + drv + sup + '</div>';
+      }
       h += '<div class="al-item lv' + r.lv + '">' +
-        '<div class="al-it">' + new Date(r.ts).toLocaleString() + ' · ' + (ALERT_LV_TXT[r.lv] || '提醒') + '</div>' +
-        '<div class="al-ib">' + (r.body || '').replace(/</g, '&lt;') + '</div></div>';
+        '<div class="al-it">' + new Date(r.ts).toLocaleString() + ' · ' + (ALERT_LV_TXT[r.lv] || '提醒') +
+        (r.payload && r.payload.score != null ? ' · 评分 ' + r.payload.score : '') + '</div>' +
+        '<div class="al-ib">' + (r.body || '').replace(/</g, '&lt;') + '</div>' + why + '</div>';
     });
     h += '</div>';
   }
@@ -10335,4 +10447,141 @@ function renderCompositeInto(S) {
     console.warn('composite fail', e && e.message);
     node.innerHTML = '<span class="rg-r">分类合成计算失败：' + (e && e.message ? e.message : '未知错误') + '</span>';
   }
+}
+
+/* =====================================================================
+ *  v3.36 新模块：模型谦逊 / 风险度量 / 本地解释 / 程序化 API
+ *  —— 对应 NEXUS_PERSPECTIVES.md 中索罗斯/罗杰斯/对冲基金/黄仁勋/CZ 的批判。
+ *  全部为纯函数（无 DOM 依赖），可在浏览器与 Node(vm) 中直接调用与测试。
+ *  设计约束：不破坏现有评分逻辑；不擅自新增外部数据源；零外发默认不变。
+ * ===================================================================== */
+
+/* ---------------------------------------------------------------------
+ *  ① 模型谦逊（regimeConfidence）—— 索罗斯「可错性」+ 罗杰斯「少即是多」
+ *  分数永远给一个确定值，但因子可能互相打架：此时分数是「平均值」而非「判断」。
+ *  本函数量化「方向一致性」，并据此给出置信度，让 UI 在分歧大时主动降级。
+ * ------------------------------------------------------------------- */
+function regimeConfidence(res) {
+  const out = res && res.out;
+  if (!out) return { total: 0, agree: 0, pct: 0, support: 0, level: 'LOW', netSign: 0 };
+  const net = (res.c || 0);
+  let total = 0, agree = 0, totalW = 0, agreeW = 0;
+  for (const k in out) {
+    const r = out[k];
+    if (!r || !r.ok || !r.dir) continue;            // 只看有数据、有方向、参与评分的因子
+    if (!isFinite(r.contribution) || r.contribution === 0) continue;
+    total++; totalW += Math.abs(r.contribution);
+    if (Math.sign(r.contribution) === Math.sign(net)) { agree++; agreeW += Math.abs(r.contribution); }
+  }
+  const pct = total ? agree / total : 0;             // 计数一致度（展示用）
+  const support = totalW ? agreeW / totalW : 0;      // 幅度加权支撑度（定级用：少数大因子不能虚抬共识）
+  const decisive = Math.abs(net) >= 0.1;            // 净方向接近 0 → 模型本身没表态
+  let level;
+  if (total < 5 || !decisive) level = 'LOW';
+  else if (support >= 0.6) level = 'HIGH';
+  else if (support >= 0.45) level = 'MED';
+  else level = 'LOW';
+  return { total, agree, pct, support, level, netSign: Math.sign(net) };
+}
+
+/* ---------------------------------------------------------------------
+ *  ② 风险度量（riskMetrics）—— 对冲基金视角：回测不能只有夏普/回撤
+ *  补上 Sortino（下行波动）、VaR95 / CVaR95（尾部风险）、Calmar（回撤效率）。
+ *  纯函数：输入逐周期收益率序列 + 年化周期数，输出风险指标。
+ * ------------------------------------------------------------------- */
+function riskMetrics(returns, bpy) {
+  bpy = bpy || 365;
+  const n = returns ? returns.length : 0;
+  if (n < 2) return { sharpe: 0, sortino: 0, var95: 0, cvar95: 0 };
+  let mean = 0; for (let i = 0; i < n; i++) mean += returns[i]; mean /= n;
+  let varc = 0; for (let i = 0; i < n; i++) varc += (returns[i] - mean) * (returns[i] - mean); varc /= n;
+  const sd = Math.sqrt(varc);
+  let dsq = 0; for (let i = 0; i < n; i++) if (returns[i] < 0) dsq += returns[i] * returns[i];
+  const dsd = Math.sqrt(dsq / n);
+  const sharpe = sd ? mean / sd * Math.sqrt(bpy) : 0;
+  const sortino = dsd ? mean / dsd * Math.sqrt(bpy) : 0;
+  const s = returns.slice().sort(function (a, b) { return a - b; });
+  const k = Math.max(0, Math.floor(0.05 * n));     // 5% 分位（最差尾部）
+  const var95 = s[k];
+  let tailSum = 0; for (let i = 0; i <= k; i++) tailSum += s[i];
+  const cvar95 = (k + 1) ? tailSum / (k + 1) : var95;
+  return { sharpe: sharpe, sortino: sortino, var95: var95, cvar95: cvar95 };
+}
+
+/* ---------------------------------------------------------------------
+ *  ②b 回测稳健性（stabilityOf）—— 对冲基金视角：方向假设是样本内的，
+ *  必须给一个诚实的「站着赚钱的时间比例」。输入逐周期收益率，输出正收益占比(0~1)。
+ *  不替代样本外验证，但比单个夏普更不易被一段行情美化。
+ * ------------------------------------------------------------------- */
+function stabilityOf(returns) {
+  const n = returns ? returns.length : 0;
+  if (n === 0) return 0;
+  let pos = 0; for (let i = 0; i < n; i++) if (returns[i] > 0) pos++;
+  return pos / n;
+}
+
+/* ---------------------------------------------------------------------
+ *  ③ 波动目标仓位（volTargetWeight）—— 对冲基金：先有风险纪律再谈收益
+ *  同周期已实现波动率 → 目标波动率 的反比，给出目标仓位权重(0~2)。
+ *  上限 2（即最多 2x），下限 0；波动率为非正时返回 0（不持仓）。
+ * ------------------------------------------------------------------- */
+function volTargetWeight(realizedVol, targetVol) {
+  if (!isFinite(realizedVol) || realizedVol <= 0 || !isFinite(targetVol) || targetVol <= 0) return 0;
+  const w = targetVol / realizedVol;
+  if (!isFinite(w)) return 0;
+  return Math.max(0, Math.min(2, w));
+}
+
+/* ---------------------------------------------------------------------
+ *  ④ 本地解释器（explainScore）—— 黄仁勋「推理层」+ CZ「知道之后要能懂」
+ *  规则式自然语言解释（不使用任何外部 API，纯本地、零外发）。
+ *  把分数 + 置信 + 主导因子翻译成一句话，让数字变成「为什么」。
+ * ------------------------------------------------------------------- */
+function explainScore(res) {
+  if (!res || !res.out) return '暂无评分数据。';
+  const conf = regimeConfidence(res);
+  const arr = [];
+  for (const k in res.out) {
+    const r = res.out[k];
+    if (r && r.ok && r.dir && isFinite(r.contribution)) arr.push({ k: k, c: r.contribution });
+  }
+  arr.sort(function (a, b) { return Math.abs(b.c) - Math.abs(a.c); });
+  const top = arr.slice(0, 3);
+  const dirWord = conf.netSign > 0 ? '偏多' : conf.netSign < 0 ? '偏空' : '中性';
+  const confWord = conf.level === 'HIGH' ? '因子高度一致，结论较可信'
+    : conf.level === 'MED' ? '因子部分分歧，结论中等可信'
+      : '因子明显分歧，本分数仅供参考';
+  const drivers = top.length
+    ? top.map(function (r) { return r.k + (r.c > 0 ? '（利多+' : '（利空') + r.c.toFixed(1) + '）'; }).join('、')
+    : '—';
+  const warn = conf.level === 'LOW' ? ' ⚠️ 模型未形成一致判断，勿据此单边下注。' : '';
+  return '综合评分 ' + res.score + '（' + dirWord + '）· ' + confWord + '（' + conf.agree + '/' + conf.total + ' 因子同向）。主导因子：' + drivers + '。' + warn;
+}
+
+/* ---------------------------------------------------------------------
+ *  ⑤ 程序化 API（window.Nexus）—— 黄仁勋/CZ「平台化 / 可被 agent 调用」
+ *  把单体应用暴露成一个可查询内核：agent、开发者或控制台都能直接拿分数、
+ *  因子、置信、风险与解释，无需解析 DOM。这是把「app」变成「kernel」的第一步。
+ * ------------------------------------------------------------------- */
+if (typeof window !== 'undefined') {
+  window.Nexus = {
+    version: '3.37',
+    getScore: function () { return computeNexusScore(); },
+    getFactors: function () { return computeNexusScore().out; },
+    confidence: function () { return regimeConfidence(computeNexusScore()); },
+    risk: riskMetrics,
+    volTarget: volTargetWeight,
+    explain: function () { return explainScore(computeNexusScore()); },
+    alertPayload: buildAlertPayload,                       // v3.37：构建当前告警归因（含 Top 因子）
+    guard: function () {                                   // v3.37：当前护栏摘要
+      const G = state && state.guardrail;
+      return { ready: !!(G && G.ready), status: (G && G.status != null) ? G.status : null,
+               dvolLevel: G && G.dvolLevel, regimeLevel: G && G.regimeLevel, accelLevel: G && G.accelLevel };
+    },
+    lastAlert: function () {                               // v3.37：最近一条带 payload 的本地告警
+      const log = loadAlertLog().slice().reverse();
+      for (const r of log) if (r.payload) return r.payload;
+      return null;
+    },
+  };
 }
