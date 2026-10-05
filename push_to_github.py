@@ -46,7 +46,12 @@ def req(method, path, data=None):
         r.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(r) as resp:
-            return resp.status, json.loads(resp.read().decode() or "{}")
+            raw = resp.read().decode()
+            # GitHub 对 204/空体返回无 JSON；直接 j.loads 会抛异常并被误当成推送失败
+            try:
+                return resp.status, (json.loads(raw) if raw.strip() else {})
+            except json.JSONDecodeError:
+                return resp.status, {}
     except urllib.error.HTTPError as e:
         print("HTTP", e.code, e.read().decode()[:400])
         raise
@@ -75,6 +80,7 @@ print("BASE_COMMIT", base_commit)
 
 # blobs
 tree = []
+local_sha = {}   # rel -> 本地 git blob sha（用于末尾按**内容**校验，而非只比文件名）
 for rel, full in files:
     with open(full, "rb") as f:
         content = f.read()
@@ -83,6 +89,7 @@ for rel, full in files:
                 {"content": b64, "encoding": "base64"})
     mode = "100755" if rel.endswith(".sh") else "100644"
     tree.append({"path": rel, "mode": mode, "type": "blob", "sha": j["sha"]})
+    local_sha[rel] = j["sha"]
     print("blob", rel, j["sha"][:10])
 
 # tree (fresh full tree, no base_tree)
@@ -123,17 +130,35 @@ commit = jc["sha"]
 print("COMMIT", commit)
 
 # update main (force 覆盖整棵树，GitHub 仅作镜像)
-st, _ = req("PATCH", f"/repos/{OWNER}/{REPO}/git/refs/heads/main",
-            {"sha": commit, "force": True})
-print("PUSHED ref status", st)
+# 注意：PATCH 偶尔会「返回 200 但 ref 实际没动」，故必须回读 ref 确认，失败则重试。
+moved = False
+for attempt in range(1, 4):
+    st, _ = req("PATCH", f"/repos/{OWNER}/{REPO}/git/refs/heads/main",
+                {"sha": commit, "force": True})
+    st2, jref = req("GET", f"/repos/{OWNER}/{REPO}/git/refs/heads/main")
+    now = (jref.get("object") or {}).get("sha")
+    print(f"PUSH attempt {attempt}: http={st} ref_now={now[:12] if now else None}")
+    if now == commit:
+        moved = True
+        break
+if not moved:
+    print("FAIL_REF_NOT_MOVED: main 仍指向", now, "期望", commit)
+    sys.exit(3)
+print("REF_OK main ->", commit)
 
-# verify
-st, jt2 = req("GET", f"/repos/{OWNER}/{REPO}/git/trees/main?recursive=1")
-got = [t["path"] for t in jt2.get("tree", [])]
-print("REMOTE TREE COUNT", len(got))
-for g in sorted(got):
-    print("  ", g)
+# verify：① ref 指向新 commit ② 每个文件的 **blob sha**（内容）与本地一致
+# 旧版只比「文件名是否存在」——路径不变就恒为真，PATCH 失败也会误报 OK_ALL_FILES_PRESENT。
+st, jc2 = req("GET", f"/repos/{OWNER}/{REPO}/git/commits/{commit}")
+if jc2.get("tree", {}).get("sha") != new_tree:
+    print("FAIL_TREE_MISMATCH:", jc2.get("tree", {}).get("sha"), "!=", new_tree)
+    sys.exit(4)
+st, jt2 = req("GET", f"/repos/{OWNER}/{REPO}/git/trees/{commit}?recursive=1")
+got = {t["path"]: t["sha"] for t in jt2.get("tree", [])}
+print("REMOTE FILE COUNT", len(got))
 missing = [f[0] for f in files if f[0] not in got]
 if missing:
-    print("MISSING:", missing); sys.exit(2)
-print("OK_ALL_FILES_PRESENT")
+    print("FAIL_MISSING:", missing); sys.exit(2)
+diff = [p for p, sha in local_sha.items() if got.get(p) != sha]
+if diff:
+    print("FAIL_CONTENT_MISMATCH（远端内容与本地不一致）:", diff); sys.exit(5)
+print("OK_ALL_FILES_PRESENT_AND_CONTENT_VERIFIED", len(local_sha), "files")
